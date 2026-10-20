@@ -4,6 +4,7 @@ use crate::diagnostics::{ModelPhase, ModelPhaseTimer};
 use async_trait::async_trait;
 use reqwest::{Client, redirect::Policy};
 use std::error::Error;
+use std::time::Duration;
 use tokio::time::timeout;
 use url::Url;
 
@@ -74,7 +75,6 @@ impl Transport for HttpTransport {
             } else {
                 &self.client
             };
-            let headers_phase = ModelPhaseTimer::start(ModelPhase::HttpHeaders);
             let request = client
                 .post(url)
                 .bearer_auth(request.bearer_token())
@@ -89,39 +89,63 @@ impl Transport for HttpTransport {
                 outer_timeout_ms = control.timeout().as_millis() as u64,
                 "model HTTP request prepared"
             );
-            let response = client
-                .execute(request)
-                .await
-                .map_err(|error| transport_failure(&error, ModelPhase::HttpHeaders));
-            headers_phase.finish(response.is_ok());
-            let mut response = response?;
-            let status = response.status().as_u16();
-            tracing::info!(http_status = status, "model response headers received");
-            let body_phase = ModelPhaseTimer::start(ModelPhase::FullBody);
-            if response
-                .content_length()
-                .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
-            {
-                return Err(response_too_large());
-            }
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|error| transport_failure(&error, ModelPhase::FullBody))?
-            {
-                if chunk.len() > MAX_RESPONSE_BYTES - bytes.len() {
+            let mut retries = 0;
+            loop {
+                if control.is_cancelled() {
+                    return Err(ProviderError::Cancelled);
+                }
+                let headers_phase = ModelPhaseTimer::start(ModelPhase::HttpHeaders);
+                let outbound = request.try_clone().ok_or_else(|| {
+                    ProviderError::Transport("HTTP request could not be replayed".into())
+                })?;
+                let response = client
+                    .execute(outbound)
+                    .await
+                    .map_err(|error| transport_failure(&error, ModelPhase::HttpHeaders));
+                headers_phase.finish(response.is_ok());
+                let mut response = response?;
+                let status = response.status().as_u16();
+                tracing::info!(http_status = status, "model response headers received");
+                let body_phase = ModelPhaseTimer::start(ModelPhase::FullBody);
+                if response
+                    .content_length()
+                    .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+                {
                     return Err(response_too_large());
                 }
-                bytes.extend_from_slice(&chunk);
+                let mut bytes = Vec::new();
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|error| transport_failure(&error, ModelPhase::FullBody))?
+                {
+                    if chunk.len() > MAX_RESPONSE_BYTES - bytes.len() {
+                        return Err(response_too_large());
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                body_phase.finish(true);
+                // Replay only complete gateway error responses. The outer control
+                // bounds all attempts and delays, preserving this business turn.
+                if matches!(status, 502 | 503) && retries < 2 {
+                    let delay_ms = 250 << retries;
+                    retries += 1;
+                    tracing::info!(
+                        http_status = status,
+                        retry = retries,
+                        delay_ms,
+                        "retrying model gateway response"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+                let decode_phase = ModelPhaseTimer::start(ModelPhase::Decode);
+                let body = String::from_utf8(bytes).map_err(|_| {
+                    ProviderError::InvalidResponse("provider response is not UTF-8".into())
+                })?;
+                decode_phase.finish(true);
+                return Ok(TransportResponse { status, body });
             }
-            body_phase.finish(true);
-            let decode_phase = ModelPhaseTimer::start(ModelPhase::Decode);
-            let body = String::from_utf8(bytes).map_err(|_| {
-                ProviderError::InvalidResponse("provider response is not UTF-8".into())
-            })?;
-            decode_phase.finish(true);
-            Ok(TransportResponse { status, body })
         };
         tokio::select! {
             biased;
@@ -176,7 +200,6 @@ fn response_too_large() -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -273,6 +296,253 @@ mod tests {
             listener.local_addr().unwrap()
         );
         (listener, url)
+    }
+
+    async fn read_request(stream: &mut TcpStream) -> String {
+        let mut request = read_headers(stream).await.into_bytes();
+        let header_end = request
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let body_len: usize = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().unwrap())
+            })
+            .unwrap();
+        let mut buffer = [0; 1024];
+        while request.len() < header_end + body_len {
+            let count = stream.read(&mut buffer).await.unwrap();
+            assert!(count > 0, "request ended before body");
+            request.extend_from_slice(&buffer[..count]);
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    async fn write_response(stream: &mut TcpStream, status: u16, body: &str) {
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn serve_responses(listener: TcpListener, statuses: &[u16], body: &str) -> Vec<String> {
+        let mut requests = Vec::new();
+        for status in statuses {
+            let (mut stream, _) = timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            requests.push(read_request(&mut stream).await);
+            write_response(&mut stream, *status, body).await;
+        }
+        assert!(
+            timeout(Duration::from_millis(40), listener.accept())
+                .await
+                .is_err()
+        );
+        requests
+    }
+
+    #[tokio::test]
+    async fn retries_complete_gateway_errors_with_identical_request_and_tool_results() {
+        let (listener, url) = listen().await;
+        let server =
+            tokio::spawn(async move { serve_responses(listener, &[502, 503, 200], "{}").await });
+        let mut request = request(url);
+        request.body = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "assistant", "tool_calls": [{"id": "test-call", "type": "function", "function": {"name": "test_read", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "test-call", "content": "existing tool result"}
+            ]
+        });
+        let expected_body = serde_json::to_string(&request.body).unwrap();
+        let started = tokio::time::Instant::now();
+        let response = HttpTransport::new()
+            .unwrap()
+            .send(
+                request,
+                RequestControl::new(Duration::from_secs(3)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert!(started.elapsed() >= Duration::from_millis(750));
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+        let (headers, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+        assert!(headers.contains("authorization: Bearer test-only-bearer-value\r\n"));
+        assert_eq!(body, expected_body);
+    }
+
+    #[tokio::test]
+    async fn stops_after_three_gateway_responses_and_returns_last_error() {
+        let (listener, url) = listen().await;
+        let server = tokio::spawn(async move {
+            serve_responses(listener, &[503, 502, 503], "gateway unavailable").await
+        });
+        let response = HttpTransport::new()
+            .unwrap()
+            .send(
+                request(url),
+                RequestControl::new(Duration::from_secs(3)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 503);
+        assert_eq!(response.body, "gateway unavailable");
+        assert_eq!(server.await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_other_statuses_or_invalid_success_json() {
+        for status in [200, 302, 400, 403, 408, 429, 500, 501, 504] {
+            let (listener, url) = listen().await;
+            let server =
+                tokio::spawn(async move { serve_responses(listener, &[status], "not JSON").await });
+            let response = HttpTransport::new()
+                .unwrap()
+                .send(
+                    request(url),
+                    RequestControl::new(Duration::from_secs(2)).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status, status);
+            assert_eq!(response.body, "not JSON");
+            assert_eq!(server.await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_incomplete_or_oversized_gateway_bodies() {
+        for oversized in [false, true] {
+            let (listener, url) = listen().await;
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_request(&mut stream).await;
+                let length = if oversized {
+                    MAX_RESPONSE_BYTES + 1
+                } else {
+                    100
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 502 Test\r\nContent-Length: {length}\r\nConnection: close\r\n\r\npartial"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                drop(stream);
+                assert!(
+                    timeout(Duration::from_millis(400), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let error = HttpTransport::new()
+                .unwrap()
+                .send(
+                    request(url),
+                    RequestControl::new(Duration::from_secs(2)).unwrap(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                if oversized {
+                    response_too_large()
+                } else {
+                    ProviderError::Transport("HTTP response failed".into())
+                }
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_gateway_retry_delay() {
+        let (listener, url) = listen().await;
+        let (responded_tx, responded_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            write_response(&mut stream, 502, "gateway unavailable").await;
+            drop(stream);
+            responded_tx.send(()).unwrap();
+            assert!(
+                timeout(Duration::from_millis(400), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let control = RequestControl::new(Duration::from_secs(2)).unwrap();
+        let cancellation = control.clone();
+        let task = tokio::spawn(async move {
+            HttpTransport::new()
+                .unwrap()
+                .send(request(url), control)
+                .await
+        });
+        responded_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!task.is_finished());
+        cancellation.cancel();
+        let error = timeout(Duration::from_millis(150), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error, ProviderError::Cancelled);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn gateway_attempts_and_delays_share_original_timeout() {
+        let (listener, url) = listen().await;
+        let server = tokio::spawn(async move {
+            for status in [502, 503] {
+                let (mut stream, _) = timeout(Duration::from_secs(2), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                read_request(&mut stream).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                write_response(&mut stream, status, "gateway unavailable").await;
+            }
+            assert!(
+                timeout(Duration::from_millis(550), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let error = timeout(
+            Duration::from_millis(900),
+            HttpTransport::new().unwrap().send(
+                request(url),
+                RequestControl::new(Duration::from_millis(600)).unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error, ProviderError::Timeout);
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -493,6 +763,12 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             read_headers(&mut stream).await;
             // Closing before the response is an actual request transport error.
+            drop(stream);
+            assert!(
+                timeout(Duration::from_millis(400), listener.accept())
+                    .await
+                    .is_err()
+            );
         });
         let private_url = format!("{url}?credential=synthetic-private-value");
         let error = HttpTransport::new()
