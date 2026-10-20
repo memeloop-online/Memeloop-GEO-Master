@@ -14,7 +14,49 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  docs-scope:
+    name: Detect documentation-only pull request
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs == 'true' && steps.filter.outputs.runtime == 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Resolve pull request merge base
+        id: merge-base
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          merge_base="$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA")"
+          printf 'sha=%s\n' "$merge_base" >> "$GITHUB_OUTPUT"
+
+      - name: Classify the entire pull request
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          # Git comparison includes removed inputs when code is renamed to docs.
+          token: ""
+          base: ${{ steps.merge-base.outputs.sha }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          predicate-quantifier: every
+          # Root Markdown retains its existing formatting checks in Linux.
+          filters: |
+            docs:
+              - 'docs/**/*.md'
+            runtime:
+              - '**'
+              - '!docs/**/*.md'
+
   linux:
+    needs: docs-scope
+    # Unknown or failed classification keeps the full suite; cancellation stops it.
+    if: ${{ !cancelled() && (needs.docs-scope.result != 'success' || needs.docs-scope.outputs.docs_only != 'true') }}
     name: Linux Rust/V8 + frontend (5-minute milestone)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -356,7 +398,7 @@ jobs:
 
           - Scope classification and local workspace tests passed.
           - The entire pull request changes only allowlisted browser JavaScript or Markdown documentation.
-          - Windows Rust/V8 setup, build, tests, and native artifacts were skipped; Linux checks remain unchanged.
+          - Windows Rust/V8 setup, build, tests, and native artifacts were skipped; Linux checks use their own documentation scope.
           "@ | Add-Content $env:GITHUB_STEP_SUMMARY
 
       - name: Set up Rust
