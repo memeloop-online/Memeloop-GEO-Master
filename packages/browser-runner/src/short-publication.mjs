@@ -6,6 +6,7 @@ const ORIGIN = "https://www.zhihu.com";
 const FORM = ".WritePinV2-Form";
 const EDITOR = '.public-DraftEditor-content[contenteditable="true"]';
 const MENU = ".Popover-content.PinToolbar-menuContainer:visible";
+const DELETE_TITLE = "你确定要删除自己的想法吗？";
 
 function normalized(text) {
   return text.replace(/\s+/gu, " ").trim();
@@ -123,6 +124,14 @@ async function item(page, url, expected, account, config) {
     .waitFor({ state: "visible", timeout: config.timeout });
   if ((await cards.count()) !== 1) return null;
   const card = cards.first();
+  const links = await card
+    .locator("a.ContentItem-time[href]")
+    .evaluateAll((nodes) => nodes.map((node) => node.href));
+  if (
+    !links.length ||
+    links.some((href) => pinUrl(href, config.origin) !== url)
+  )
+    return null;
   const authors = card.locator(".PinItem-authorInfo a.UserLink-link[href]");
   const hrefs = await authors.evaluateAll((links) =>
     links.map((link) => link.href),
@@ -321,6 +330,9 @@ export async function withdrawShortPost(page, payload, network = {}) {
   if (!expected || !config)
     return result("unsupported", "invalid_content_payload", "withdraw");
   let attempted = false;
+  const evidence = [];
+  let publicContext;
+  let captureRequest;
   try {
     const account = await owner(page, config);
     if (!account)
@@ -337,6 +349,11 @@ export async function withdrawShortPost(page, payload, network = {}) {
       return result("unknown", "account_ownership_unverified", "withdraw");
     if ((await page.locator(MENU).count()) !== 0)
       return result("unsupported", "short_post_menu_ambiguous", "withdraw");
+    const confirmation = page.locator(".ConfirmModal:visible").filter({
+      has: page.getByText(DELETE_TITLE, { exact: true }),
+    });
+    if ((await confirmation.count()) !== 0)
+      return result("unknown", "short_post_confirmation_ambiguous", "withdraw");
     await card
       .locator(
         '.PinToolbar-actions button[aria-label="设置"][aria-haspopup="true"]',
@@ -352,27 +369,140 @@ export async function withdrawShortPost(page, payload, network = {}) {
         "withdraw",
       );
     attempted = true;
+    const attempt = {
+      kind: "withdrawal_attempt",
+      external_id: expected.external_id,
+      url,
+      placement_slot: "short_post",
+      expected_sha256: hash(expected.body),
+      observed_at: new Date().toISOString(),
+      delete_clicked: true,
+      confirmation_clicked: false,
+      withdrawal_verified: false,
+    };
+    evidence.push(attempt);
     await remove.click({ timeout: config.timeout });
-    // The known item-local command may itself delete or open a confirmation.
-    // Its confirmation and authoritative deletion receipt are not yet proven.
-    // Never guess a second destructive control or claim success from absence.
-    return result(
-      "unknown",
-      "short_post_withdrawal_confirmation_unverified",
-      "withdraw",
-      [
-        {
-          kind: "withdrawal_attempt",
-          external_id: expected.external_id,
-          url,
-          placement_slot: "short_post",
-          expected_sha256: hash(expected.body),
-          observed_at: new Date().toISOString(),
-          delete_clicked: true,
-          withdrawal_verified: false,
-        },
-      ],
-    );
+    await confirmation
+      .first()
+      .waitFor({ state: "visible", timeout: config.timeout });
+    const confirm = confirmation.getByRole("button", {
+      name: "确认",
+      exact: true,
+    });
+    if (
+      (await confirmation.count()) !== 1 ||
+      (await confirmation.getByText(DELETE_TITLE, { exact: true }).count()) !==
+        1 ||
+      (await confirm.count()) !== 1
+    )
+      return result(
+        "unknown",
+        "short_post_confirmation_ambiguous",
+        "withdraw",
+        evidence,
+      );
+    if (!sameOwner(account, await owner(page, config)))
+      return result(
+        "unknown",
+        "account_ownership_unverified",
+        "withdraw",
+        evidence,
+      );
+
+    // Match the request created by this confirmation, not a pre-existing response.
+    const deleteUrl = `${config.origin}/api/v4/pins/${expected.external_id}`;
+    let deleteRequest;
+    let requestCount = 0;
+    captureRequest = (request) => {
+      if (
+        request.method() === "DELETE" &&
+        request.url() === deleteUrl &&
+        request.frame() === page.mainFrame()
+      ) {
+        requestCount++;
+        deleteRequest ??= request;
+      }
+    };
+    page.on("request", captureRequest);
+    const pendingResponse = page
+      .waitForResponse((receipt) => receipt.request() === deleteRequest, {
+        timeout: config.timeout,
+      })
+      .catch(() => null);
+    attempt.confirmation_clicked = true;
+    const [, receipt] = await Promise.all([
+      confirm.click({ timeout: config.timeout }),
+      pendingResponse,
+    ]);
+    if (!receipt)
+      return result(
+        "unknown",
+        "short_post_delete_response_unverified",
+        "withdraw",
+        evidence,
+      );
+    evidence.push({
+      kind: "withdrawal_response",
+      external_id: expected.external_id,
+      url: deleteUrl,
+      method: "DELETE",
+      http_status: receipt.status(),
+      observed_at: new Date().toISOString(),
+    });
+    if (requestCount !== 1 || !receipt.ok())
+      return result(
+        "unknown",
+        "short_post_delete_response_unverified",
+        "withdraw",
+        evidence,
+      );
+    if (!sameOwner(account, await owner(page, config)))
+      return result(
+        "unknown",
+        "account_ownership_unverified",
+        "withdraw",
+        evidence,
+      );
+
+    // Optimistic removal and the success toast are not deletion receipts.
+    // Only a correlated successful DELETE permits an anonymous absence check.
+    publicContext = await page
+      .context()
+      .browser()
+      .newContext(config.proxy ? { proxy: config.proxy } : {});
+    const publicPage = await publicContext.newPage();
+    const absent = await publicPage.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: config.timeout,
+    });
+    const verified =
+      pinUrl(publicPage.url(), config.origin) === url &&
+      [404, 410].includes(absent?.status()) &&
+      (await publicPage.locator(".PinItem:visible").count()) === 0 &&
+      requestCount === 1;
+    const observedAt = new Date().toISOString();
+    evidence.push({
+      kind: "public_absence",
+      external_id: expected.external_id,
+      url,
+      http_status: absent?.status() ?? null,
+      absence_verified: verified,
+      observed_at: observedAt,
+    });
+    if (!verified)
+      return result(
+        "unknown",
+        "short_post_absence_unverified",
+        "withdraw",
+        evidence,
+      );
+    attempt.withdrawal_verified = true;
+    return {
+      ...result("completed", null, "withdraw", evidence),
+      external_id: expected.external_id,
+      public_url: url,
+      occurred_at: observedAt,
+    };
   } catch {
     return result(
       attempted ? "unknown" : "unsupported",
@@ -380,6 +510,10 @@ export async function withdrawShortPost(page, payload, network = {}) {
         ? "short_post_withdrawal_outcome_unverified"
         : "short_post_delete_control_unverified",
       "withdraw",
+      evidence,
     );
+  } finally {
+    if (captureRequest) page.off("request", captureRequest);
+    await publicContext?.close();
   }
 }
