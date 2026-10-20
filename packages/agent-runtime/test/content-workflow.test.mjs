@@ -772,17 +772,11 @@ for (const [label, selection] of [
       exact_quote: " ",
     },
   ],
-  ["duplicate chunk", null],
 ]) {
   test(`invalid ${label} selection never writes preparation`, async () => {
-    const valid = {
-      source_version_id: sourceVersionId,
-      chunk_id: "chunk-0",
-      exact_quote: "Source fact 0",
-    };
     const result = await run({
       incomplete: true,
-      select: () => (selection ? [selection] : [valid, valid]),
+      select: () => [selection],
     });
     assert.equal(result.preparations.length, 0);
     assert.equal(result.item.status, "pending");
@@ -796,10 +790,90 @@ for (const [label, selection] of [
             "unknown version": "unknown_source_version",
             "invented quote": "quote_mismatch",
             "blank quote": "blank_quote",
-            "duplicate chunk": "duplicate_chunk",
           }[label],
         },
       ],
+    ]);
+  });
+}
+
+test("repeated chunks retain the first valid quote and count only distinct chunks", async () => {
+  const sourceChunks = Array.from({ length: 24 }, (_, index) => chunk(index));
+  const result = await run({
+    sourceChunks,
+    select: (input) =>
+      input.chunks.flatMap((entry) => [
+        {
+          source_version_id: entry.source_version_id,
+          chunk_id: entry.chunk_id,
+          exact_quote: entry.text,
+        },
+        {
+          source_version_id: entry.source_version_id,
+          chunk_id: entry.chunk_id,
+          exact_quote: entry.text,
+        },
+        {
+          source_version_id: entry.source_version_id,
+          chunk_id: entry.chunk_id,
+          exact_quote: "fact",
+        },
+      ]),
+  });
+  assert.equal(result.item.status, "ready");
+  assert.equal(result.preparations.length, 1);
+  assert.deepEqual(
+    result.preparations[0].evidence,
+    sourceChunks.map((entry) => ({
+      reference: {
+        source_version_id: sourceVersionId,
+        chunk_id: entry.chunk_id,
+        locator: entry.locator,
+      },
+      exact_quote: entry.text,
+    })),
+  );
+  assert.deepEqual(
+    result.events.map(([topic]) => topic),
+    ["content.completed", "distribution.prepared"],
+  );
+});
+
+test("more than 24 distinct selected chunks still fails preparation", async () => {
+  const result = await run({
+    incomplete: true,
+    sourceChunks: Array.from({ length: 25 }, (_, index) => chunk(index)),
+  });
+  assert.equal(result.preparations.length, 0);
+  assert.deepEqual(result.events, [
+    [
+      "content.preparation_failed",
+      { stage: "evidence_validation", reason: "evidence_limit" },
+    ],
+  ]);
+});
+
+for (const [choice, reason] of [
+  [{ exact_quote: "invented" }, "quote_mismatch"],
+  [{ exact_quote: " " }, "blank_quote"],
+  [{ exact_quote: "x".repeat(1601) }, "quote_limit"],
+  [{ exact_quote: null }, "invalid_choice"],
+  [{ source_version_id: "another-version" }, "unknown_source_version"],
+  [{ chunk_id: "missing" }, "unknown_chunk"],
+]) {
+  test(`repeated selection cannot hide ${reason}`, async () => {
+    const valid = {
+      source_version_id: sourceVersionId,
+      chunk_id: "chunk-0",
+      exact_quote: "Source fact 0",
+    };
+    const result = await run({
+      incomplete: true,
+      select: () => [valid, { ...valid, ...choice }],
+    });
+    assert.equal(result.preparations.length, 0);
+    assert.deepEqual(result.events, [
+      ["content.preparation_failed", { stage: "evidence_validation", reason }],
     ]);
   });
 }
@@ -927,6 +1001,52 @@ test("final selection cannot invent a new quote from a candidate", async () => {
             })),
   });
   assert.equal(result.preparations.length, 0);
+});
+
+test("candidate reduction validates repeated choices before retaining one per chunk", async () => {
+  for (const invalid of [false, true]) {
+    const result = await run({
+      incomplete: invalid,
+      sourceChunks: Array.from({ length: 33 }, (_, index) => chunk(index)),
+      select: (input) =>
+        input.candidates
+          ? input.candidates.slice(0, 24).flatMap((entry) => [
+              entry,
+              {
+                ...entry,
+                exact_quote: invalid ? "Source" : entry.exact_quote,
+              },
+            ])
+          : input.chunks
+              .filter((entry) => entry.ordinal < 24 || entry.ordinal === 32)
+              .map((entry) => ({
+                source_version_id: entry.source_version_id,
+                chunk_id: entry.chunk_id,
+                exact_quote: entry.text,
+              })),
+    });
+    assert.equal(result.modelRequests.length, 3);
+    if (invalid) {
+      assert.equal(result.preparations.length, 0);
+      assert.deepEqual(result.events, [
+        [
+          "content.preparation_failed",
+          { stage: "evidence_validation", reason: "quote_mismatch" },
+        ],
+      ]);
+    } else {
+      assert.equal(result.item.status, "ready");
+      assert.equal(result.preparations[0].evidence.length, 24);
+      assert.equal(
+        new Set(
+          result.preparations[0].evidence.map(
+            (entry) => entry.reference.chunk_id,
+          ),
+        ).size,
+        24,
+      );
+    }
+  }
 });
 
 test("prepared replay generates once and ready replay makes no model calls", async () => {
@@ -1148,14 +1268,19 @@ test("partial CSV records and quotes above the limit do not reach preparation", 
       end_column: 2,
     },
   };
-  for (const [source, quote] of [
-    [csv, "Name: Sample"],
-    [chunk(0, "x".repeat(1601)), "x".repeat(1601)],
+  for (const [source, validQuote, quote] of [
+    [csv, csv.text, "Name: Sample"],
+    [chunk(0, "x".repeat(1601)), "x", "x".repeat(1601)],
   ]) {
     const result = await run({
       incomplete: true,
       sourceChunks: [source],
       select: () => [
+        {
+          source_version_id: sourceVersionId,
+          chunk_id: source.chunk_id,
+          exact_quote: validQuote,
+        },
         {
           source_version_id: sourceVersionId,
           chunk_id: source.chunk_id,
