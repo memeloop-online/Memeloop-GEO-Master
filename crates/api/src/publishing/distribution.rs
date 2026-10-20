@@ -632,7 +632,7 @@ impl DistributionService {
             // delegates the same checks to materialize's own transaction.
             let project_guard = self
                 .projects
-                .hold_content_project(scope, manifest.project_id)
+                .hold_content_project(scope, manifest.project_id, false)
                 .await?;
             let knowledge_guard = self
                 .knowledge

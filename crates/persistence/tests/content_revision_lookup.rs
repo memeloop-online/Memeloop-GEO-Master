@@ -294,7 +294,7 @@ async fn scoped_point_and_paged_exact_child_ignore_unrelated_history() {
         "execution": {
             "execution_id": execution_id,
             "project_id": project.id,
-            "cycle_id": accepted.cycle_id,
+            "origin": { "kind": "cycle", "cycle_id": accepted.cycle_id },
             "manifest_id": accepted.document_manifest.manifest_id,
             "manifest_revision": 1,
             "policy_version": "lookup-test",

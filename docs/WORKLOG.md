@@ -2196,3 +2196,10 @@
 - 新增 `scripts/fetch-v8-artifact.ps1`：校验 target 与每个 archive 的 SHA-256 后，仅复制到 `CARGO_HOME\.rusty_v8`。README 已记录 `gh run download` → 校验恢复 → `cargo check` 的本地开发流程。
 - 本机已验证当前锁定 `v8 150.4.0` 的 Windows archive 已落在 `I:\cargo\.rusty_v8`（约 39 MB）；本地 Cargo 可直接复用该缓存。完整 CI artifact 下载链路待下一次 GitHub Actions 成功运行后复核。
 - 加强 V8 artifact 恢复：README 现在按当前 commit 选择成功的 CI run；恢复脚本要求完整 target/V8/rustc 元数据，拒绝空清单、重复或带路径分隔符的 archive，并保留 URL 转义后的 Cargo cache 键。新增 PowerShell 回归覆盖正常恢复、Linux target、哈希篡改和路径穿越拒绝；Windows CI 在上传前从干净 Cargo home 复跑恢复脚本。当前本地 fixture 测试通过，真实 GitHub Actions 下载链路仍需成功 run 后复核。
+
+# 2026-10-20 按需内容生成集成检查
+
+- 新增项目级按需内容入口与 `content_create` 工具，复用现有资产、生成、检查和修正；请求冻结精确来源与文档类型，允许无品牌、无周期的草稿项目。封存按需执行不自动分发。
+- 同步 host v24／53 项、执行来源 DTO、迁移 0067；内容页可查看无周期资产。接口适配见 `on-demand-content.md`。
+- JS 定向测试 75／75、内容页面测试 52／52、前端类型与相关格式检查通过。新增生成 bundle、持久仓库及运行时完成证据回归尚未执行；不能据此声称 Rust、数据库或真实模型验收完成。
+- 后端独立静态审查第一轮未发现阻断问题；前端／完整运行时复核和 CI 继续进行。当前源码未部署。

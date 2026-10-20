@@ -14,10 +14,27 @@ export interface ContentCoverage {
   incomplete: number;
 }
 
+export interface ContentCreateRequest {
+  request_id: string;
+  topic: string;
+  source_version_ids: string[];
+  documents: Array<{
+    key: string;
+    content_type: string;
+    title: string | null;
+    instructions: string | null;
+  }>;
+  language: string;
+  market: string | null;
+  audience: string | null;
+}
+
 export interface ContentExecution {
   execution_id: string;
   project_id: string;
-  cycle_id: string;
+  origin:
+    | { kind: "cycle"; cycle_id: string }
+    | { kind: "on_demand"; request: ContentCreateRequest };
   manifest_id: string;
   manifest_revision: number;
   policy_version: string;
@@ -242,6 +259,13 @@ export function getContentAsset(
   );
 }
 
+export function listContentAssets(tenantId: string, projectId: string) {
+  return apiFetch<ContentAsset[]>(
+    `${projectPath(projectId)}/contents`,
+    scopeOptions(tenantId, projectId),
+  );
+}
+
 export function listContentRevisions(
   tenantId: string,
   projectId: string,
@@ -382,6 +406,24 @@ export function useContentItemsQuery(
   });
 }
 
+export function useContentAssetsQuery(
+  tenantId: string | undefined,
+  projectId: string | undefined,
+) {
+  const { session } = useAuth();
+  const scope =
+    session && tenantId && projectId
+      ? queryScopeFor(session, tenantId, projectId)
+      : undefined;
+  return useQuery({
+    queryKey: scope
+      ? key(scope, "assets")
+      : ["content", "anonymous", tenantId, projectId, "assets"],
+    queryFn: () => listContentAssets(tenantId!, projectId!),
+    enabled: Boolean(scope),
+  });
+}
+
 export function useContentAssetQuery(
   tenantId: string | undefined,
   projectId: string | undefined,
@@ -405,6 +447,7 @@ export function useContentRevisionsQuery(
   tenantId: string | undefined,
   projectId: string | undefined,
   assetId: string | undefined,
+  currentRevisionId?: string,
 ) {
   const { session } = useAuth();
   const scope =
@@ -417,6 +460,13 @@ export function useContentRevisionsQuery(
       : ["content", "anonymous", tenantId, projectId, "revisions", assetId],
     queryFn: () => listContentRevisions(tenantId!, projectId!, assetId!),
     enabled: Boolean(scope && assetId),
+    refetchOnMount: (query) =>
+      currentRevisionId &&
+      !query.state.data?.some(
+        (revision) => revision.revision_id === currentRevisionId,
+      )
+        ? "always"
+        : true,
   });
 }
 

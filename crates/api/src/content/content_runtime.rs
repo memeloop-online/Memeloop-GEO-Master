@@ -7,9 +7,12 @@ use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 use std::{future::Future, pin::Pin};
 
-use geo_domain::{AppError, ErrorCode, TenantScope};
+use geo_domain::{
+    AppError, ContentExecutionOrigin, ContentExecutionStatus, ErrorCode, TenantScope,
+};
 use geo_worker::{
-    HostBridge, HostOp, HostOpBudgets, HostOpLimits, HostOps, HostRuntime, WorkerError,
+    ContentExecutionReadRequest, HostBridge, HostOp, HostOpBudgets, HostOpLimits, HostOps,
+    HostRuntime, WorkerError,
 };
 use uuid::Uuid;
 
@@ -173,8 +176,9 @@ impl EmbeddedContentWorkflowExecutor {
         let bundle = self.bundle;
         let entry = self.entry;
         let capabilities = Arc::clone(&self.capabilities);
+        let read_scope = scope.clone();
         let application = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
+        let events = tokio::task::spawn_blocking(move || {
             let engine = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -194,36 +198,59 @@ impl EmbeddedContentWorkflowExecutor {
                     )
                     .await
                     .map_err(worker_error)?;
-                let completed = runtime.host_state().events.iter().any(|event| {
-                    event.topic == DISTRIBUTION_PREPARED_TOPIC
-                        && serde_json::from_str::<serde_json::Value>(&event.payload)
-                            .ok()
-                            .and_then(|value| {
-                                Some((
-                                    value.get("execution_id")?.as_str()?.to_owned(),
-                                    value.get("cycle_id")?.as_str()?.to_owned(),
-                                    value.get("manifest_id")?.as_str()?.to_owned(),
-                                    value.get("handoff_id")?.as_str()?.to_owned(),
-                                    value.get("targets")?.as_u64()?,
-                                ))
-                            })
-                            .is_some_and(|(id, cycle, manifest, handoff, _)| {
-                                id == execution_id.to_string()
-                                    && [cycle, manifest, handoff]
-                                        .iter()
-                                        .all(|id| Uuid::parse_str(id).is_ok())
-                            })
-                });
-                if !completed {
-                    return Err(runtime_error(
-                        "native workflow did not prepare the distribution handoff",
-                    ));
-                }
-                Ok(())
+                Ok::<_, AppError>(runtime.host_state().events)
             })
         })
         .await
-        .map_err(|error| runtime_error(format!("isolate task failed: {error}")))?
+        .map_err(|error| runtime_error(format!("isolate task failed: {error}")))??;
+        let execution = self
+            .capabilities
+            .content_execution_read(&read_scope, ContentExecutionReadRequest { execution_id })
+            .await
+            .map_err(|error| runtime_error(error.to_string()))?;
+        let Some(handoff_id) = execution.handoff_id else {
+            return Err(runtime_error("content workflow has no persisted handoff"));
+        };
+        if execution.execution_id != execution_id
+            || execution.status != ContentExecutionStatus::Closed
+        {
+            return Err(runtime_error(
+                "content workflow has not closed its execution",
+            ));
+        }
+        let completed = events.iter().any(|event| {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&event.payload) else {
+                return false;
+            };
+            let event_id = |key: &str| value.get(key)?.as_str()?.parse::<Uuid>().ok();
+            if event_id("execution_id") != Some(execution_id)
+                || event_id("handoff_id") != Some(handoff_id)
+            {
+                return false;
+            }
+            match &execution.origin {
+                ContentExecutionOrigin::OnDemand { .. } => {
+                    event.topic == CONTENT_COMPLETION_TOPIC
+                        && value.get("total").and_then(|v| v.as_u64())
+                            == Some(execution.coverage.total)
+                }
+                ContentExecutionOrigin::Cycle { cycle_id } => {
+                    event.topic == DISTRIBUTION_PREPARED_TOPIC
+                        && event_id("cycle_id") == Some(*cycle_id)
+                        && value
+                            .get("manifest_id")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|id| Uuid::parse_str(id).is_ok())
+                        && value.get("targets").and_then(|v| v.as_u64()).is_some()
+                }
+            }
+        });
+        if !completed {
+            return Err(runtime_error(
+                "native workflow did not complete its persisted handoff",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -255,4 +282,253 @@ fn worker_error(error: WorkerError) -> AppError {
 
 fn runtime_error(message: impl Into<String>) -> AppError {
     AppError::new(ErrorCode::Internal, message)
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use crate::{
+        AppState, EventBus, MemoryIdempotencyStore, MemoryOperationStore, RepositoryHostOps,
+    };
+    use geo_domain::{
+        ContentCreateDocument, ContentCreateRequest, ContentItemStatus, ImportItem,
+        KnowledgePurpose, KnowledgeRepository, MemoryAuthRepository, MemoryKnowledgeRepository,
+        MemoryProjectRepository, ProjectCreate, ProjectRepository, ProjectSettings, SourceKind,
+    };
+
+    const CLOSED: &[(&str, &str)] = &[(
+        CONTENT_WORKFLOW_ENTRY,
+        r#"
+        export async function main(input) {
+            const handoff = JSON.parse(await Deno.core.ops.op_host_content_close_v1(JSON.stringify(input)));
+            Deno.core.ops.op_host_emit('content.completed', JSON.stringify(handoff));
+        }
+    "#,
+    )];
+    const NO_HANDOFF: &[(&str, &str)] = &[(
+        CONTENT_WORKFLOW_ENTRY,
+        r#"
+        export async function main(input) {
+            Deno.core.ops.op_host_emit('content.completed', JSON.stringify({
+                execution_id: input.execution_id,
+                handoff_id: '00000000-0000-4000-8000-000000000001', total: 1
+            }));
+        }
+    "#,
+    )];
+    const WRONG_HANDOFF: &[(&str, &str)] = &[(
+        CONTENT_WORKFLOW_ENTRY,
+        r#"
+        export async function main(input) {
+            const handoff = JSON.parse(await Deno.core.ops.op_host_content_close_v1(JSON.stringify(input)));
+            handoff.handoff_id = '00000000-0000-4000-8000-000000000001';
+            Deno.core.ops.op_host_emit('content.completed', JSON.stringify(handoff));
+        }
+    "#,
+    )];
+    const NO_EVENT: &[(&str, &str)] = &[(
+        CONTENT_WORKFLOW_ENTRY,
+        r#"
+        export async function main(input) {
+            await Deno.core.ops.op_host_content_close_v1(JSON.stringify(input));
+        }
+    "#,
+    )];
+
+    async fn on_demand_fixture() -> (AppState, TenantScope, Uuid) {
+        let tenant = TenantScope::new(Uuid::new_v4().into(), Uuid::new_v4().into(), None);
+        let projects = Arc::new(MemoryProjectRepository::default());
+        let project = projects
+            .create(
+                &tenant,
+                ProjectCreate {
+                    slug: None,
+                    display_name: "Runtime content".into(),
+                    settings: ProjectSettings::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let scope = TenantScope {
+            project_id: Some(project.id),
+            ..tenant
+        };
+        let knowledge = Arc::new(MemoryKnowledgeRepository::default());
+        let imported = knowledge
+            .import_batch(
+                &scope,
+                vec![ImportItem {
+                    client_item_id: "runtime-source".into(),
+                    kind: SourceKind::Text,
+                    name: "Runtime source".into(),
+                    purpose: KnowledgePurpose::Public,
+                    text: Some("A documented fact".into()),
+                    url: None,
+                    object_id: None,
+                    knowledge_release_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let state = AppState::with_stores_and_auth_and_projects_and_knowledge(
+            Arc::new(MemoryOperationStore::default()),
+            Arc::new(MemoryIdempotencyStore::default()),
+            Arc::new(MemoryAuthRepository::development_with_password("unused")),
+            projects,
+            knowledge,
+            EventBus::default(),
+            false,
+        );
+        let execution = state
+            .content_service()
+            .create_on_demand(
+                &scope,
+                ContentCreateRequest {
+                    request_id: Uuid::new_v4(),
+                    topic: "A documented topic".into(),
+                    source_version_ids: vec![
+                        imported.items[0]
+                            .source_version
+                            .as_ref()
+                            .unwrap()
+                            .source_version_id,
+                    ],
+                    documents: vec![ContentCreateDocument {
+                        key: "article".into(),
+                        content_type: "article".into(),
+                        title: None,
+                        instructions: None,
+                    }],
+                    language: "en".into(),
+                    market: None,
+                    audience: None,
+                },
+            )
+            .await
+            .unwrap();
+        // A classified branch is a legitimate terminal result. Completion
+        // does not imply that every requested document became a ready asset.
+        let repository = state.content_service().repository();
+        let item = repository
+            .list_items(&scope, execution.execution_id)
+            .await
+            .unwrap()
+            .remove(0);
+        repository
+            .classify(
+                &scope,
+                execution.execution_id,
+                item.item_id,
+                ContentItemStatus::Blocked,
+                "The selected source does not support this requested document",
+            )
+            .await
+            .unwrap();
+        (state, scope, execution.execution_id)
+    }
+
+    #[tokio::test]
+    async fn on_demand_runtime_requires_the_persisted_closed_handoff() {
+        let (state, scope, execution_id) = on_demand_fixture().await;
+        let capabilities = Arc::new(
+            RepositoryHostOps::new(state.knowledge_repository()).with_content(state.clone()),
+        );
+        EmbeddedContentWorkflowExecutor::with_bundle(CLOSED, CONTENT_WORKFLOW_ENTRY, capabilities)
+            .run(scope.clone(), execution_id)
+            .await
+            .unwrap();
+        let execution = state
+            .content_service()
+            .repository()
+            .get_execution(&scope, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.status, ContentExecutionStatus::Closed);
+        assert!(execution.handoff_id.is_some());
+        assert!(matches!(
+            execution.origin,
+            ContentExecutionOrigin::OnDemand { .. }
+        ));
+        assert_eq!(execution.coverage.blocked, 1);
+    }
+
+    #[tokio::test]
+    async fn on_demand_completion_event_cannot_replace_a_missing_persisted_handoff() {
+        let (state, scope, execution_id) = on_demand_fixture().await;
+        let capabilities = Arc::new(
+            RepositoryHostOps::new(state.knowledge_repository()).with_content(state.clone()),
+        );
+        let error = EmbeddedContentWorkflowExecutor::with_bundle(
+            NO_HANDOFF,
+            CONTENT_WORKFLOW_ENTRY,
+            capabilities,
+        )
+        .run(scope.clone(), execution_id)
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("no persisted handoff"));
+        let execution = state
+            .content_service()
+            .repository()
+            .get_execution(&scope, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.status, ContentExecutionStatus::Running);
+        assert_eq!(execution.handoff_id, None);
+    }
+
+    #[tokio::test]
+    async fn on_demand_completion_event_must_match_the_persisted_handoff() {
+        let (state, scope, execution_id) = on_demand_fixture().await;
+        let capabilities = Arc::new(
+            RepositoryHostOps::new(state.knowledge_repository()).with_content(state.clone()),
+        );
+        let error = EmbeddedContentWorkflowExecutor::with_bundle(
+            WRONG_HANDOFF,
+            CONTENT_WORKFLOW_ENTRY,
+            capabilities,
+        )
+        .run(scope.clone(), execution_id)
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("did not complete its persisted handoff")
+        );
+        assert_eq!(
+            state
+                .content_service()
+                .repository()
+                .get_execution(&scope, execution_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ContentExecutionStatus::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn on_demand_persisted_handoff_alone_does_not_complete_the_runtime() {
+        let (state, scope, execution_id) = on_demand_fixture().await;
+        let capabilities = Arc::new(
+            RepositoryHostOps::new(state.knowledge_repository()).with_content(state.clone()),
+        );
+        let error = EmbeddedContentWorkflowExecutor::with_bundle(
+            NO_EVENT,
+            CONTENT_WORKFLOW_ENTRY,
+            capabilities,
+        )
+        .run(scope, execution_id)
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("did not complete its persisted handoff")
+        );
+    }
 }

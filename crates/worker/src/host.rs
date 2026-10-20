@@ -29,13 +29,13 @@ use uuid::Uuid;
 // The canonical domain vocabulary the surface speaks.  Re-exported so an
 // implementation of [`HostOps`] needs one import path, and so the worker never
 // grows a parallel set of types for the same concepts.
-pub use geo_domain::ContentRequestDeferral;
 pub use geo_domain::TenantScope;
 use geo_domain::{
     AppError, AttachmentReference, ContentCoverage, ContentExecutionStatus, ContentItemStatus,
     DistributionTargetStatus, ImportStatus, KnowledgePurpose, PublicationLookupFinding,
     ReportPreview, ReportPreviewKind, ReportSnapshot,
 };
+pub use geo_domain::{ContentCreateRequest, ContentExecutionOrigin, ContentRequestDeferral};
 pub use geo_domain::{CreateQuestionSet, QuestionReference, ReviseQuestionSet};
 pub use geo_domain::{ToolCallIdentity, ToolCallOutcome};
 
@@ -661,7 +661,7 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v23";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v24";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1129,11 +1129,13 @@ pub enum HostOp {
     SerpReparse,
     /// Import one public webpage through the scoped knowledge repository.
     KnowledgeImportUrl,
+    /// Freeze and dispatch a manually requested, project-scoped content run.
+    ContentCreate,
 }
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 52;
+    pub const COUNT: usize = 53;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -1189,6 +1191,7 @@ impl HostOp {
         Self::SerpRead,
         Self::SerpReparse,
         Self::KnowledgeImportUrl,
+        Self::ContentCreate,
     ];
 
     /// The JS-visible name.  The trailing version is part of the contract.
@@ -1246,6 +1249,7 @@ impl HostOp {
             Self::SerpRead => "serp.read.v1",
             Self::SerpReparse => "serp.reparse.v1",
             Self::KnowledgeImportUrl => "knowledge.import_url.v1",
+            Self::ContentCreate => "content.create.v1",
         }
     }
 
@@ -1304,6 +1308,7 @@ impl HostOp {
             Self::SerpRead => "op_host_serp_read_v1",
             Self::SerpReparse => "op_host_serp_reparse_v1",
             Self::KnowledgeImportUrl => "op_host_knowledge_import_url_v1",
+            Self::ContentCreate => "op_host_content_create_v1",
         }
     }
 
@@ -1422,6 +1427,7 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(15_000, 32),  // bounded saved search reads
                 HostOpLimits::new(30_000, 8),   // local saved-response parsing
                 HostOpLimits::new(120_000, 16), // scoped single-page knowledge import
+                HostOpLimits::new(30_000, 4),   // on-demand content acceptance
             ],
         }
     }
@@ -2101,6 +2107,17 @@ pub trait HostOps: Send + Sync {
         ))
     }
 
+    async fn content_create(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentCreateRequest,
+    ) -> Result<ContentExecutionRef, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentCreate,
+            "on-demand content dispatch is not configured",
+        ))
+    }
+
     async fn content_media_list(
         &self,
         _scope: &TenantScope,
@@ -2350,8 +2367,9 @@ pub struct ContentExecutionReadRequest {
 #[serde(deny_unknown_fields)]
 pub struct ContentExecutionRef {
     pub execution_id: Uuid,
-    pub cycle_id: Uuid,
+    pub origin: ContentExecutionOrigin,
     pub status: ContentExecutionStatus,
+    pub handoff_id: Option<Uuid>,
     pub coverage: ContentCoverage,
 }
 
@@ -2625,7 +2643,7 @@ pub struct ContentItemRef {
 #[serde(deny_unknown_fields)]
 pub struct ContentContext {
     pub objective: Option<String>,
-    pub brand_name: String,
+    pub brand_name: Option<String>,
     pub product_name: Option<String>,
     pub target_audience: Option<String>,
     pub question_clusters: Vec<String>,
@@ -5258,6 +5276,8 @@ mod tests {
             (HostOp::KnowledgeImportStatus, 15_000, 16),
             (HostOp::KnowledgeImportUrl, 120_000, 16),
             (HostOp::SerpReparse, 30_000, 8),
+            (HostOp::ContentStart, 30_000, 4),
+            (HostOp::ContentCreate, 30_000, 4),
         ] {
             assert_eq!(
                 budgets.limits(op),
@@ -5289,6 +5309,8 @@ mod tests {
         assert_eq!(budgets.limits(HostOp::ContentRepairBegin).max_calls, 4_096);
         assert_eq!(budgets.limits(HostOp::ContentClose).max_calls, 4);
         assert_eq!(budgets.limits(HostOp::ContentStart).max_calls, 4);
+        assert_eq!(HostOp::KnowledgeImportUrl.index(), 51);
+        assert_eq!(HostOp::ContentCreate.index(), 52);
         assert_eq!(budgets.limits(HostOp::DistributionStart).max_calls, 4);
         assert_eq!(
             budgets.limits(HostOp::DistributionTargetsRead).max_calls,

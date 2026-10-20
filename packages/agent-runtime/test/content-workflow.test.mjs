@@ -26,6 +26,7 @@ const chunk = (ordinal, text = `Source fact ${ordinal}`) => ({
 });
 
 async function run({
+  origin = { kind: "cycle", cycle_id: cycleId },
   checks = [],
   initial = "pending",
   count = 0,
@@ -77,8 +78,16 @@ async function run({
     ...item,
     item_id: index ? `second-${itemId}` : itemId,
     document_key: `synthetic-document-${index}`,
+    ...(origin.kind === "on_demand"
+      ? {
+          content_type: origin.request.documents[index].content_type,
+          market: origin.request.market,
+          language: origin.request.language,
+        }
+      : {}),
   }));
   const calls = [];
+  const events = [];
   const sourceReads = [];
   const modelRequests = [];
   const generationRequests = [];
@@ -158,7 +167,7 @@ async function run({
   const host = {
     executionRead: async () => ({
       execution_id: executionId,
-      cycle_id: cycleId,
+      origin,
     }),
     itemsRead: async () => ({
       execution_id: executionId,
@@ -233,10 +242,10 @@ async function run({
           document_key: requested(request).document_key,
           brief_title: "Frozen brief",
           brief_objective: "Frozen objective",
-          content_type: "faq",
-          market: "synthetic-market",
-          language: "en",
-          brand_name: "Synthetic brand",
+          content_type: requested(request).content_type,
+          market: requested(request).market,
+          language: requested(request).language,
+          brand_name: context.brand_name,
           question_clusters: ["synthetic-topic"],
           evidence: quotesFor(request),
         },
@@ -369,7 +378,9 @@ async function run({
         next_ordinal: null,
       };
     },
-    async emit() {},
+    async emit(topic, payload) {
+      events.push([topic, payload]);
+    },
   };
   globalThis.__GEO_CONTENT_TEST_HOST__ = host;
   try {
@@ -381,6 +392,7 @@ async function run({
     }
     return {
       calls,
+      events,
       item: read(),
       items,
       sourceReads,
@@ -415,6 +427,107 @@ test("bounded factual repair checks each persisted revision and continues to dis
   assert.equal(result.item.status, "ready");
   assert.equal(result.item.automatic_repair_count, 2);
   assert.ok(result.calls.includes("distributionTargetsRead"));
+});
+
+test("on-demand article and FAQ close their persisted branches without distribution", async () => {
+  const secondSourceVersionId = "00000000-0000-4000-8000-000000000009";
+  const request = {
+    request_id: "00000000-0000-4000-8000-000000000008",
+    topic: "Equipment maintenance",
+    source_version_ids: [sourceVersionId, secondSourceVersionId],
+    documents: [
+      {
+        key: "synthetic-document-0",
+        content_type: "article",
+        title: "Maintenance guide",
+        instructions: "Explain supported upkeep",
+      },
+      {
+        key: "synthetic-document-1",
+        content_type: "faq",
+        title: null,
+        instructions: "Answer common maintenance questions",
+      },
+    ],
+    language: "en",
+    market: null,
+    audience: "Equipment owners",
+  };
+  const result = await run({
+    origin: { kind: "on_demand", request },
+    itemCount: 2,
+    sourceRefs: [
+      { source_id: sourceId, source_version_id: sourceVersionId },
+      {
+        source_id: "00000000-0000-4000-8000-000000000010",
+        source_version_id: secondSourceVersionId,
+      },
+    ],
+    checks: [true, false, false],
+    context: {
+      objective: request.topic,
+      brand_name: null,
+      product_name: null,
+      target_audience: request.audience,
+      question_clusters: [],
+    },
+  });
+  assert.deepEqual(
+    result.items.map((item) => item.status),
+    ["ready", "ready"],
+  );
+  assert.equal(result.calls.filter((call) => call === "generate").length, 2);
+  assert.ok(result.calls.includes("repair"));
+  assert.equal(result.calls.at(-1), "close");
+  assert.ok(!result.calls.some((call) => call.startsWith("distribution")));
+  assert.deepEqual(result.events, [
+    [
+      "content.completed",
+      {
+        execution_id: executionId,
+        handoff_id: handoffId,
+        total: 2,
+        failed_steps: 0,
+      },
+    ],
+  ]);
+  assert.deepEqual(
+    new Set(result.sourceReads.map((entry) => entry.source_version_id)),
+    new Set(request.source_version_ids),
+  );
+  for (const modelRequest of result.modelRequests) {
+    const input = JSON.parse(modelRequest.prompt);
+    assert.equal(input.task_context.brand_name, null);
+    assert.equal(input.task_context.topic, request.topic);
+    assert.deepEqual(
+      input.task_context.document_request,
+      request.documents.find((document) => document.key === input.document_key),
+    );
+    assert.deepEqual(
+      input.task_context.source_version_ids,
+      request.source_version_ids,
+    );
+    assert.ok(
+      input.chunks.every((chunk) =>
+        request.source_version_ids.includes(chunk.source_version_id),
+      ),
+    );
+  }
+  for (const modelRequest of result.generationRequests) {
+    assert.equal(JSON.parse(modelRequest.prompt).document.brand_name, null);
+    assert.deepEqual(
+      JSON.parse(modelRequest.prompt).evidence.map(
+        (entry) => entry.source_version_id,
+      ),
+      request.source_version_ids,
+    );
+  }
+  assert.deepEqual(
+    result.generationRequests
+      .map((entry) => JSON.parse(entry.prompt).document.content_type)
+      .sort(),
+    ["article", "faq"],
+  );
 });
 
 test("explicit evidence reads every source page and selects a nonprefix quote after chunk 24", async () => {
@@ -550,7 +663,7 @@ test("chunk and candidate selection receive the same frozen semantic task contex
 test("evidence selection preserves absent optional task context without inventing a brief", async () => {
   const context = {
     objective: null,
-    brand_name: "Synthetic brand",
+    brand_name: null,
     product_name: null,
     target_audience: null,
     question_clusters: [],
@@ -1028,7 +1141,7 @@ test("unresolved needs_repair cannot close or prepare distribution", async () =>
   globalThis.__GEO_CONTENT_TEST_HOST__ = {
     executionRead: async () => ({
       execution_id: executionId,
-      cycle_id: cycleId,
+      origin: { kind: "cycle", cycle_id: cycleId },
     }),
     itemsRead: async () => ({
       execution_id: executionId,
@@ -1066,7 +1179,7 @@ test("no-progress check cannot spin or prepare distribution", async () => {
   globalThis.__GEO_CONTENT_TEST_HOST__ = {
     executionRead: async () => ({
       execution_id: executionId,
-      cycle_id: cycleId,
+      origin: { kind: "cycle", cycle_id: cycleId },
     }),
     itemsRead: async () => ({
       execution_id: executionId,

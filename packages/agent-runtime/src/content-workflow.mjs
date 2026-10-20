@@ -101,6 +101,15 @@ async function selectEvidence(
         content_type: item.content_type,
         market: item.market,
         language: item.language,
+        ...(context.on_demand_request
+          ? {
+              topic: context.on_demand_request.topic,
+              document_request: context.on_demand_request.documents.find(
+                (document) => document.key === item.document_key,
+              ),
+              source_version_ids: context.on_demand_request.source_version_ids,
+            }
+          : {}),
       },
       ...(fromCandidates
         ? {
@@ -279,7 +288,7 @@ async function readEvidence(item, context, executionId, capability, ctx) {
 function validateDistribution(manifest, execution, handoff, previous) {
   if (
     typeof manifest?.manifest_id !== "string" ||
-    manifest.cycle_id !== execution.cycle_id ||
+    manifest.cycle_id !== execution.origin.cycle_id ||
     manifest.content_execution_id !== execution.execution_id ||
     manifest.content_handoff_id !== handoff.handoff_id ||
     !Number.isSafeInteger(manifest.expected_count) ||
@@ -301,7 +310,7 @@ function validateDistribution(manifest, execution, handoff, previous) {
 
 async function prepareDistribution(execution, handoff, capability, ctx) {
   let manifest = validateDistribution(
-    await capability.distributionStart({ cycle_id: execution.cycle_id }),
+    await capability.distributionStart({ cycle_id: execution.origin.cycle_id }),
     execution,
     handoff,
   );
@@ -395,7 +404,7 @@ async function prepareDistribution(execution, handoff, capability, ctx) {
   }
   await capability.emit("distribution.prepared", {
     execution_id: execution.execution_id,
-    cycle_id: execution.cycle_id,
+    cycle_id: execution.origin.cycle_id,
     handoff_id: handoff.handoff_id,
     manifest_id: manifest.manifest_id,
     targets: observed,
@@ -641,9 +650,13 @@ export async function contentWorkflow(ctx) {
   });
   if (
     execution.execution_id !== executionId ||
-    typeof execution.cycle_id !== "string"
+    (execution.origin?.kind !== "on_demand" &&
+      !(
+        execution.origin?.kind === "cycle" &&
+        typeof execution.origin.cycle_id === "string"
+      ))
   ) {
-    throw new Error("Content execution has no immutable cycle binding.");
+    throw new Error("Content execution has no immutable origin binding.");
   }
   let cursor;
   let total;
@@ -688,7 +701,18 @@ export async function contentWorkflow(ctx) {
         group.map((item) =>
           TERMINAL.has(item.status)
             ? item.status
-            : processItem(item, page.context, executionId, capability, ctx),
+            : processItem(
+                item,
+                {
+                  ...page.context,
+                  ...(execution.origin.kind === "on_demand"
+                    ? { on_demand_request: execution.origin.request }
+                    : {}),
+                },
+                executionId,
+                capability,
+                ctx,
+              ),
         ),
       );
       observed += results.length;
@@ -720,10 +744,14 @@ export async function contentWorkflow(ctx) {
     total,
     failed_steps: failed,
   });
-  await prepareDistribution(execution, handoff, capability, ctx);
-  ctx.finish(
-    `Content execution ${executionId} and distribution preparation completed.`,
-  );
+  if (execution.origin.kind === "cycle") {
+    await prepareDistribution(execution, handoff, capability, ctx);
+    ctx.finish(
+      `Content execution ${executionId} and distribution preparation completed.`,
+    );
+  } else {
+    ctx.finish(`Content execution ${executionId} completed.`);
+  }
 }
 
 export async function workflowMain(input) {

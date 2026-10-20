@@ -1,7 +1,7 @@
 use chrono::{Duration, Utc};
 use geo_domain::{
-    ContentBlock, ContentBlockKind, ContentCoverage, ContentExecution, ContentExecutionStatus,
-    ContentHandoff, ContentHandoffItem, ContentItemStatus, ContentRevision,
+    ContentBlock, ContentBlockKind, ContentCoverage, ContentExecution, ContentExecutionOrigin,
+    ContentExecutionStatus, ContentHandoff, ContentHandoffItem, ContentItemStatus, ContentRevision,
     DistributionDeferralReason, DistributionRepository, DistributionTargetStatus, DocumentManifest,
     DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
     DocumentManifestState, ErrorCode, FreezeDistribution, IntentVerification,
@@ -58,7 +58,7 @@ fn fixture(
     let content_execution = ContentExecution {
         execution_id,
         project_id: scope.project_id.unwrap(),
-        cycle_id,
+        origin: ContentExecutionOrigin::Cycle { cycle_id },
         manifest_id,
         manifest_revision: 1,
         policy_version: "test".into(),

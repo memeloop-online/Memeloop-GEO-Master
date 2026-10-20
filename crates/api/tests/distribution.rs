@@ -855,7 +855,9 @@ async fn publication_target_resolves_original_across_cycles_without_mutation_or_
             FreezeDistribution {
                 cycle_id: later_cycle,
                 content_execution: geo_domain::ContentExecution {
-                    cycle_id: later_cycle,
+                    origin: geo_domain::ContentExecutionOrigin::Cycle {
+                        cycle_id: later_cycle,
+                    },
                     ..execution
                 },
                 document_manifest: documents,

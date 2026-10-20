@@ -218,7 +218,7 @@ async fn drafted_content(
         planner_version: manifest.planner_version.clone(),
         source_version_ids: vec![source_version_id],
         evidence: quotes.clone(),
-        brand_name: "Fixture".into(),
+        brand_name: Some("Fixture".into()),
         product_name: None,
         target_audience: None,
         objective: None,

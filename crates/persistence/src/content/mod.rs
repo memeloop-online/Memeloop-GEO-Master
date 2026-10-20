@@ -8,11 +8,12 @@ pub(crate) use media::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, ContentAsset, ContentBrief, ContentCheck, ContentExecution, ContentFinding,
-    ContentHandoff, ContentItem, ContentItemStatus, ContentRepository, ContentReuseBinding,
-    ContentReuseDecision, ContentReuseRequest, ContentRevision, ContentSemanticDescriptor,
-    ContentState, ContentStep, DocumentManifest, ErrorCode, MediaObjectKey, StepLease,
-    StructuredDocument, TenantScope, start_content_state,
+    AppError, ContentAsset, ContentBrief, ContentCheck, ContentCreateRequest, ContentExecution,
+    ContentExecutionOrigin, ContentFinding, ContentHandoff, ContentItem, ContentItemStatus,
+    ContentRepository, ContentReuseBinding, ContentReuseDecision, ContentReuseRequest,
+    ContentRevision, ContentSemanticDescriptor, ContentState, ContentStep, DocumentManifest,
+    ErrorCode, MediaObjectKey, StepLease, StructuredDocument, TenantScope, start_content_state,
+    start_content_state_with_origin,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -77,7 +78,7 @@ fn affected_media_keys(old: &ContentState, next: &ContentState) -> Vec<MediaObje
 // intent is a closed-stage dispatch candidate. Unknown/sent intents and
 // permanently unsupported cells must not cause hot-loop rescans.
 const CLOSED_WORK_ELIGIBLE: &str = "\
-    (NOT EXISTS (SELECT 1 FROM distribution_execution_manifests d WHERE \
+    (c.origin_kind='cycle' AND (NOT EXISTS (SELECT 1 FROM distribution_execution_manifests d WHERE \
       (d.operator_id,d.tenant_id,d.project_id,d.cycle_id)= \
       (c.operator_id,c.tenant_id,c.project_id,c.cycle_id)) \
      OR EXISTS (SELECT 1 FROM distribution_execution_manifests d WHERE \
@@ -89,7 +90,7 @@ const CLOSED_WORK_ELIGIBLE: &str = "\
            (d.operator_id,d.tenant_id,d.project_id,d.manifest_id) \
          AND (t.current_body->>'status'='pending' \
               OR (t.current_body->>'status'='deferred' AND t.current_body->>'reason' IN \
-                ('account_unassigned','source_unavailable','source_changed','content_unsupported')))))))";
+                ('account_unassigned','source_unavailable','source_changed','content_unsupported'))))))))";
 
 #[derive(Debug, Clone)]
 pub struct ContentDispatchCandidate {
@@ -179,7 +180,8 @@ impl PgContentRepository {
              FROM content_executions c JOIN projects p \
                ON p.operator_id=c.operator_id AND p.tenant_id=c.tenant_id AND p.project_id=c.project_id \
              WHERE ($1::uuid IS NULL OR c.execution_id>$1) \
-               AND c.state->'execution'->>'status'='running' AND p.status='active' \
+               AND c.state->'execution'->>'status'='running' \
+               AND (p.status='active' OR (c.origin_kind='on_demand' AND p.status IN ('draft','paused'))) \
                AND (c.dispatch_expires_at IS NULL OR c.dispatch_expires_at<=$2) \
                AND (c.dispatch_retry_after IS NULL OR c.dispatch_retry_after<=$2) \
              ORDER BY c.execution_id LIMIT $3",
@@ -264,7 +266,7 @@ impl PgContentRepository {
             "SELECT c.state,c.dispatch_expires_at,c.dispatch_retry_after FROM content_executions c \
              JOIN projects p ON p.operator_id=c.operator_id AND p.tenant_id=c.tenant_id AND p.project_id=c.project_id \
              WHERE c.operator_id=$1 AND c.tenant_id=$2 AND c.project_id=$3 AND c.execution_id=$4 \
-               AND p.status='active' FOR UPDATE OF c",
+               AND (p.status='active' OR (c.origin_kind='on_demand' AND p.status IN ('draft','paused'))) FOR UPDATE OF c",
         )
         .bind(scope.operator_id.as_uuid())
         .bind(scope.tenant_id.as_uuid())
@@ -355,7 +357,8 @@ impl PgContentRepository {
                AND dispatch_token=$6 AND dispatch_expires_at>$7 \
                AND state->'execution'->>'status' IN ('running','closed') \
                AND EXISTS (SELECT 1 FROM projects p WHERE p.operator_id=$2 AND p.tenant_id=$3 \
-                   AND p.project_id=$4 AND p.status='active')",
+                   AND p.project_id=$4 AND (p.status='active' OR \
+                       (content_executions.origin_kind='on_demand' AND p.status IN ('draft','paused'))))",
         )
         .bind(now + ttl)
         .bind(lease.scope.operator_id.as_uuid())
@@ -458,12 +461,18 @@ impl PgContentRepository {
         let project = scope
             .project_id
             .ok_or_else(|| AppError::invalid_request("project scope required"))?;
-        let active: bool = sqlx::query_scalar(
-            "SELECT status='active' FROM projects WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3",
+        let eligible: bool = sqlx::query_scalar(
+            "SELECT p.status='active' OR (c.origin_kind='on_demand' AND p.status IN ('draft','paused')) \
+             FROM projects p JOIN content_executions c \
+               ON (c.operator_id,c.tenant_id,c.project_id)=(p.operator_id,p.tenant_id,p.project_id) \
+             WHERE p.operator_id=$1 AND p.tenant_id=$2 AND p.project_id=$3 AND c.execution_id=$4",
         ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+            .bind(execution_id)
             .fetch_one(&mut **tx).await.map_err(db)?;
-        if !active {
-            return Err(AppError::conflict("content requires an active project"));
+        if !eligible {
+            return Err(AppError::conflict(
+                "content project is not eligible for execution",
+            ));
         }
         let release: Option<Uuid> = sqlx::query_scalar(
             "SELECT mi.knowledge_release_id FROM content_executions c \
@@ -929,15 +938,6 @@ impl ContentRepository for PgContentRepository {
             .ok_or_else(|| AppError::invalid_request("project scope required"))?;
         let mut tx = self.transaction(scope).await?;
         Self::lock_project(&mut tx, scope).await?;
-        let active: bool = sqlx::query_scalar(
-            "SELECT status='active' FROM projects WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3",
-        ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
-            .fetch_one(&mut *tx).await.map_err(db)?;
-        if !active {
-            return Err(AppError::conflict(
-                "content reuse requires an active project",
-            ));
-        }
         let json: Option<serde_json::Value> = sqlx::query_scalar(
             "SELECT state FROM content_executions WHERE operator_id=$1 AND tenant_id=$2 \
              AND project_id=$3 AND execution_id=$4 FOR UPDATE",
@@ -1267,6 +1267,125 @@ impl ContentRepository for PgContentRepository {
             s.fork_reused_item(item_id, base_revision_id, &origin, document)
         })
         .await
+    }
+    async fn start_on_demand(
+        &self,
+        scope: &TenantScope,
+        request: ContentCreateRequest,
+        manifest: DocumentManifest,
+        policy_version: &str,
+    ) -> Result<ContentExecution, AppError> {
+        request.validate()?;
+        let project = scope
+            .project_id
+            .ok_or_else(|| AppError::invalid_request("project scope required"))?;
+        let mut tx = self.transaction(scope).await?;
+        Self::lock_project(&mut tx, scope).await?;
+        // The project lock serializes same-key submissions before either can
+        // insert. Replays read their original frozen input before considering
+        // a newer release, model policy, or source availability.
+        let existing: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT state FROM content_executions WHERE operator_id=$1 AND tenant_id=$2 \
+             AND project_id=$3 AND origin_kind='on_demand' AND request_id=$4 FOR UPDATE",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(request.request_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        if let Some(existing) = existing {
+            let stored = decode(existing)?;
+            if !matches!(&stored.execution.origin, ContentExecutionOrigin::OnDemand { request: previous } if previous == &request)
+            {
+                return Err(AppError::conflict("content request replay inputs differ"));
+            }
+            tx.commit().await.map_err(db)?;
+            return Ok(stored.execution);
+        }
+        let eligible: bool = sqlx::query_scalar(
+            "SELECT status IN ('draft','active','paused') FROM projects \
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+        if !eligible {
+            return Err(AppError::conflict(
+                "project is not available for content creation",
+            ));
+        }
+        let canonical = geo_domain::KnowledgeRepository::get_document_manifest(
+            &crate::PgKnowledgeRepository::new(self.pool.clone()),
+            scope,
+            manifest.manifest_id,
+        )
+        .await?
+        .ok_or_else(|| AppError::not_found("document manifest not found"))?;
+        if canonical != manifest {
+            return Err(AppError::conflict("manifest differs from frozen storage"));
+        }
+        let state = start_content_state_with_origin(
+            scope,
+            ContentExecutionOrigin::OnDemand {
+                request: request.clone(),
+            },
+            &manifest,
+            policy_version,
+        )?;
+        let linked: Option<i32> = sqlx::query_scalar(
+            "SELECT revision FROM document_manifests WHERE operator_id=$1 AND tenant_id=$2 \
+             AND project_id=$3 AND manifest_id=$4 AND cycle_id IS NULL \
+             AND origin_kind='on_demand' AND sealed=true FOR SHARE",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(manifest.manifest_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        if linked != Some(manifest.revision) {
+            return Err(AppError::conflict(
+                "manifest is not sealed for on-demand content",
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO content_executions \
+             (execution_id,operator_id,tenant_id,project_id,cycle_id,origin_kind,request_id,\
+              manifest_id,manifest_revision,policy_version,input_hash,state) \
+             VALUES ($1,$2,$3,$4,NULL,'on_demand',$5,$6,$7,$8,$9,$10)",
+        )
+        .bind(state.execution.execution_id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project.as_uuid())
+        .bind(request.request_id)
+        .bind(manifest.manifest_id)
+        .bind(manifest.revision)
+        .bind(policy_version)
+        .bind(&state.execution.input_hash)
+        .bind(serde_json::to_value(&state).map_err(encode)?)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        for item in &state.items {
+            Self::validate_frozen_sources(
+                &mut tx,
+                scope,
+                state.execution.execution_id,
+                &item.document_key,
+                &item.source_version_refs,
+                &[],
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(state.execution)
     }
     async fn start(
         &self,

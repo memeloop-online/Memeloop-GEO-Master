@@ -2396,6 +2396,151 @@ impl KnowledgeRepository for PgKnowledgeRepository {
         Ok(Some(manifest))
     }
 
+    async fn save_on_demand_manifest(
+        &self,
+        scope: &TenantScope,
+        manifest: DocumentManifest,
+    ) -> Result<DocumentManifest, AppError> {
+        let project_id = Self::project_id(scope)?;
+        if manifest.operator_id != scope.operator_id
+            || manifest.tenant_id != scope.tenant_id
+            || manifest.project_id != project_id
+        {
+            return Err(AppError::forbidden("manifest is outside project scope"));
+        }
+        if !manifest.sealed
+            || manifest.state != DocumentManifestState::Ready
+            || manifest.revision != 1
+            || manifest.expected_count != Some(manifest.items.len() as i64)
+            || manifest.items.is_empty()
+            || manifest.planner_version != geo_domain::ON_DEMAND_DOCUMENT_PLANNER_VERSION
+        {
+            return Err(AppError::invalid_request(
+                "sealed on-demand manifest required",
+            ));
+        }
+        let mut transaction = self.transaction(scope).await?;
+        crate::PgContentRepository::lock_project(&mut transaction, scope).await?;
+        let existing: Option<(String, String)> = sqlx::query_as(
+            "SELECT origin_kind,scope_hash FROM document_manifests WHERE operator_id=$1 \
+             AND tenant_id=$2 AND project_id=$3 AND manifest_id=$4 FOR UPDATE",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .bind(manifest.manifest_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if let Some((origin, scope_hash)) = existing {
+            if origin != "on_demand" || scope_hash != manifest.scope_hash {
+                return Err(AppError::conflict("content request replay inputs differ"));
+            }
+            transaction.commit().await.map_err(database_error)?;
+            return self
+                .get_document_manifest(scope, manifest.manifest_id)
+                .await?
+                .ok_or_else(|| AppError::not_found("document manifest not found"));
+        }
+        let mut refs = Vec::new();
+        let mut keys = std::collections::HashSet::new();
+        for item in &manifest.items {
+            if item.manifest_id != manifest.manifest_id
+                || item.knowledge_release_id != manifest.knowledge_release_id
+                || item.state != DocumentManifestItemState::Planned
+                || item.source_version_refs.is_empty()
+                || !keys.insert(&item.document_key)
+            {
+                return Err(AppError::invalid_request(
+                    "inconsistent on-demand manifest item",
+                ));
+            }
+            refs.extend_from_slice(&item.source_version_refs);
+        }
+        refs.sort_unstable();
+        refs.dedup();
+        // Stable ordering prevents source writers and concurrent creators from
+        // acquiring the same selected source set in conflicting orders.
+        for source_version_id in refs {
+            let eligible: Option<bool> = sqlx::query_scalar(
+                "SELECT source.state='active' AND source.purpose='public' \
+                    AND source.current_version_id=version.source_version_id \
+                 FROM knowledge_source_versions version JOIN knowledge_sources source \
+                   ON (source.operator_id,source.tenant_id,source.project_id,source.source_id)= \
+                      (version.operator_id,version.tenant_id,version.project_id,version.source_id) \
+                 JOIN knowledge_release_source_versions link \
+                   ON (link.operator_id,link.tenant_id,link.project_id,link.source_version_id)= \
+                      (version.operator_id,version.tenant_id,version.project_id,version.source_version_id) \
+                 WHERE version.operator_id=$1 AND version.tenant_id=$2 AND version.project_id=$3 \
+                   AND version.source_version_id=$4 AND link.knowledge_release_id=$5 FOR SHARE OF source",
+            )
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project_id.as_uuid())
+            .bind(source_version_id)
+            .bind(manifest.knowledge_release_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if eligible != Some(true) {
+                return Err(AppError::conflict(
+                    "selected source version is not currently public",
+                ));
+            }
+        }
+        sqlx::query(
+            "INSERT INTO document_manifests \
+             (manifest_id,operator_id,tenant_id,project_id,cycle_id,origin_kind,revision,state,\
+              sealed,expected_count,scope_hash,input_refs) \
+             VALUES ($1,$2,$3,$4,NULL,'on_demand',$5,'ready',true,$6,$7,$8)",
+        )
+        .bind(manifest.manifest_id)
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project_id.as_uuid())
+        .bind(manifest.revision)
+        .bind(manifest.expected_count)
+        .bind(&manifest.scope_hash)
+        .bind(json!({
+            "knowledge_release_id": manifest.knowledge_release_id,
+            "planner_version": manifest.planner_version,
+            "scope_hash": manifest.scope_hash,
+        }))
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        for item in &manifest.items {
+            sqlx::query(
+                "INSERT INTO document_manifest_items \
+                 (document_manifest_item_id,operator_id,tenant_id,project_id,manifest_id,\
+                  knowledge_release_id,document_key,content_type,product_id,market,language,\
+                  state,block_reason,dependency_hash,source_version_refs) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'planned',$12,$13,$14)",
+            )
+            .bind(item.document_manifest_item_id)
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project_id.as_uuid())
+            .bind(item.manifest_id)
+            .bind(item.knowledge_release_id)
+            .bind(&item.document_key)
+            .bind(&item.content_type)
+            .bind(item.product_id)
+            .bind(&item.market)
+            .bind(&item.language)
+            .bind(&item.block_reason)
+            .bind(&item.dependency_hash)
+            .bind(serde_json::to_value(&item.source_version_refs).map_err(serialization_error)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        }
+        transaction.commit().await.map_err(database_error)?;
+        self.get_document_manifest(scope, manifest.manifest_id)
+            .await?
+            .ok_or_else(|| AppError::not_found("document manifest not found"))
+    }
+
     async fn plan_document_manifest(
         &self,
         scope: &TenantScope,

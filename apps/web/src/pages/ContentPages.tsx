@@ -18,6 +18,7 @@ import {
 } from "react-router-dom";
 import { ApiError } from "../api/client";
 import {
+  type ContentAsset,
   type ContentItem,
   type ContentRevision,
   type RichNode,
@@ -26,6 +27,7 @@ import {
   exportContentRevisionBundle,
   useAppendContentRevisionMutation,
   useContentAssetQuery,
+  useContentAssetsQuery,
   useContentCycleQuery,
   useContentExecutionActionMutation,
   useContentExecutionsQuery,
@@ -198,7 +200,7 @@ function ItemCard({
   );
 }
 
-function AssetsContent({
+function CycleAssetsContent({
   tenantId,
   projectId,
 }: {
@@ -256,20 +258,7 @@ function AssetsContent({
         onRetry={() => void cycle.refetch()}
       />
     );
-  if (!cycle.data)
-    return (
-      <EmptyState
-        title={t("entryState.emptyContent")}
-        detail={t("entryState.emptyContentHint")}
-        action={
-          <Link
-            to={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/chat`}
-          >
-            {t("entryState.openWorkbench")}
-          </Link>
-        }
-      />
-    );
+  if (!cycle.data) return null;
   if (requestedCycleId && requestedCycleId !== cycle.data.cycle_id)
     return (
       <ErrorState
@@ -494,6 +483,144 @@ function AssetsContent({
         </>
       )}
     </div>
+  );
+}
+
+function SavedAssetCard({
+  asset,
+  tenantId,
+  projectId,
+}: {
+  asset: ContentAsset;
+  tenantId: string;
+  projectId: string;
+}) {
+  const { t } = useTranslation();
+  const history = useContentRevisionsQuery(
+    tenantId,
+    projectId,
+    asset.asset_id,
+    asset.current_revision_id,
+  );
+  const current = history.data?.find(
+    (revision) => revision.revision_id === asset.current_revision_id,
+  );
+  return (
+    <li>
+      <Card className="panel-card">
+        <h3>
+          <Link to={encodeURIComponent(asset.asset_id)}>
+            {current?.document.title ?? t("generatedEditor.savedContent")}
+          </Link>
+        </h3>
+        {current && (
+          <p>
+            {t("generatedEditor.currentVersion", {
+              revision: current.revision,
+            })}
+          </p>
+        )}
+        <p>{formatUiDate(asset.created_at)}</p>
+        {history.isPending && (
+          <LoadingState
+            label={t("generatedEditor.loadingSavedContent")}
+            compact
+          />
+        )}
+        {history.isError && (
+          <ErrorState
+            title={t("generatedEditor.savedContentUnavailable")}
+            detail={history.error.message}
+            onRetry={() => void history.refetch()}
+          />
+        )}
+      </Card>
+    </li>
+  );
+}
+
+function AssetsContent({
+  tenantId,
+  projectId,
+}: {
+  tenantId: string;
+  projectId: string;
+}) {
+  const { t } = useTranslation();
+  const assets = useContentAssetsQuery(tenantId, projectId);
+  const cycle = useContentCycleQuery(tenantId, projectId);
+  const [searchParams] = useSearchParams();
+  const cycleOnly = Boolean(searchParams.get("cycle_id"));
+  const noCycle = cycle.isSuccess && !cycle.data;
+  const workspaceLink = (
+    <Link
+      to={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/chat`}
+    >
+      {t("entryState.openWorkbench")}
+    </Link>
+  );
+  if (noCycle && assets.isSuccess && !assets.data.length)
+    return (
+      <EmptyState
+        title={t("entryState.emptyContent")}
+        detail={t("entryState.emptyContentHint")}
+        action={workspaceLink}
+      />
+    );
+  return (
+    <>
+      {!cycleOnly && (
+        <section
+          className="workbench-page"
+          aria-label={t("generatedEditor.savedContent")}
+        >
+          {assets.isPending && (
+            <LoadingState
+              label={t("generatedEditor.loadingSavedContent")}
+              compact
+            />
+          )}
+          {assets.isError && (
+            <ErrorState
+              title={apiTitle(
+                assets.error,
+                t("generatedEditor.savedContentUnavailable"),
+              )}
+              detail={assets.error.message}
+              onRetry={() => void assets.refetch()}
+            />
+          )}
+          {Boolean(assets.data?.length) && (
+            <>
+              {noCycle ? (
+                <h1>{t("generatedEditor.savedContent")}</h1>
+              ) : (
+                <h2>{t("generatedEditor.savedContent")}</h2>
+              )}
+              <p>{t("generatedEditor.savedContentDescription")}</p>
+              <Button
+                onClick={() => void assets.refetch()}
+                disabled={assets.isFetching}
+              >
+                {t("generatedEditor.refreshSavedContent")}
+              </Button>
+              {workspaceLink}
+              <ul>
+                {assets.data!.map((asset) => (
+                  <SavedAssetCard
+                    key={`${asset.asset_id}/${asset.current_revision_id}`}
+                    asset={asset}
+                    tenantId={tenantId}
+                    projectId={projectId}
+                  />
+                ))}
+              </ul>
+            </>
+          )}
+        </section>
+      )}
+      <CycleAssetsContent tenantId={tenantId} projectId={projectId} />
+    </>
   );
 }
 

@@ -629,7 +629,7 @@ async fn freeze_formal_coverage_with_revision(
                 content_execution: ContentExecution {
                     execution_id,
                     project_id,
-                    cycle_id,
+                    origin: geo_domain::ContentExecutionOrigin::Cycle { cycle_id },
                     manifest_id: document_id,
                     manifest_revision: 1,
                     policy_version: "report-fixture".into(),

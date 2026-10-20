@@ -163,7 +163,7 @@ async fn scoped_semantic_reservation_restarts_and_rechecks_live_source() {
             },
             exact_quote: chunk.text.clone(),
         }],
-        brand_name: "Example".into(),
+        brand_name: Some("Example".into()),
         product_name: None,
         target_audience: None,
         objective: None,

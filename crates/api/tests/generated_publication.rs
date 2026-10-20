@@ -337,6 +337,13 @@ impl KnowledgeRepository for RevokingKnowledge {
     async fn overview(&self, scope: &TenantScope) -> Result<KnowledgeOverview, AppError> {
         self.inner.overview(scope).await
     }
+    async fn save_on_demand_manifest(
+        &self,
+        scope: &TenantScope,
+        manifest: DocumentManifest,
+    ) -> Result<DocumentManifest, AppError> {
+        self.inner.save_on_demand_manifest(scope, manifest).await
+    }
 }
 
 #[derive(Clone, Default)]
@@ -615,7 +622,7 @@ async fn frozen_fixture(fixture: bool) -> FrozenFixture {
                 content_execution: ContentExecution {
                     execution_id,
                     project_id: project.id,
-                    cycle_id,
+                    origin: geo_domain::ContentExecutionOrigin::Cycle { cycle_id },
                     manifest_id: document_id,
                     manifest_revision: 1,
                     policy_version: "fixture".into(),

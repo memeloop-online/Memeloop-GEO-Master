@@ -1,6 +1,9 @@
 //! Scoped content execution and explicit frozen-source reads for the workflow.
 
-use geo_domain::{AppError, ContentExecution, ContentItem, TenantScope, sha256_hex};
+use geo_domain::{
+    AppError, ContentCreateRequest, ContentExecution, ContentExecutionOrigin, ContentItem,
+    TenantScope, sha256_hex,
+};
 use geo_worker::{
     ContentCheckBeginResult, ContentCheckFinishRequest, ContentCloseRequest, ContentContext,
     ContentExecutionReadRequest, ContentExecutionRef, ContentGenerateBeginResult,
@@ -16,7 +19,8 @@ use crate::AppState;
 fn execution_ref(execution: ContentExecution) -> ContentExecutionRef {
     ContentExecutionRef {
         execution_id: execution.execution_id,
-        cycle_id: execution.cycle_id,
+        origin: execution.origin,
+        handoff_id: execution.handoff_id,
         status: execution.status,
         coverage: execution.coverage,
     }
@@ -63,6 +67,24 @@ async fn scoped_execution(
         ));
     }
     Ok(execution)
+}
+
+pub(crate) async fn create(
+    state: &AppState,
+    scope: &TenantScope,
+    request: ContentCreateRequest,
+) -> Result<ContentExecutionRef, AppError> {
+    if !state.content_executor_available() {
+        return Err(AppError::capability_missing(
+            "content workflow executor is not configured",
+        ));
+    }
+    let execution = state
+        .content_service()
+        .create_on_demand(scope, request)
+        .await?;
+    state.dispatch_content_execution(scope.clone(), execution.execution_id)?;
+    Ok(execution_ref(execution))
 }
 
 pub(crate) async fn start(
@@ -157,19 +179,37 @@ pub(crate) async fn items(
     if !(1..=100).contains(&limit) {
         return Err(AppError::invalid_request("limit must be between 1 and 100"));
     }
-    let frozen = state
-        .project_repository()
-        .get_cycle_settings(scope, execution.project_id, execution.cycle_id)
-        .await?
-        .ok_or_else(|| AppError::conflict("frozen cycle configuration unavailable"))?;
-    let mut question_clusters: Vec<_> = frozen
-        .document_scope
-        .question_clusters
-        .into_iter()
-        .map(|cluster| cluster.key)
-        .collect();
-    question_clusters.sort();
-    question_clusters.dedup();
+    let context = match &execution.origin {
+        ContentExecutionOrigin::Cycle { cycle_id } => {
+            let frozen = state
+                .project_repository()
+                .get_cycle_settings(scope, execution.project_id, *cycle_id)
+                .await?
+                .ok_or_else(|| AppError::conflict("frozen cycle configuration unavailable"))?;
+            let mut question_clusters: Vec<_> = frozen
+                .document_scope
+                .question_clusters
+                .into_iter()
+                .map(|cluster| cluster.key)
+                .collect();
+            question_clusters.sort();
+            question_clusters.dedup();
+            ContentContext {
+                objective: frozen.objective,
+                brand_name: Some(frozen.brand_name),
+                product_name: frozen.product_name,
+                target_audience: frozen.target_audience,
+                question_clusters,
+            }
+        }
+        ContentExecutionOrigin::OnDemand { request } => ContentContext {
+            objective: Some(request.topic.clone()),
+            brand_name: None,
+            product_name: None,
+            target_audience: request.audience.clone(),
+            question_clusters: Vec::new(),
+        },
+    };
     let mut items = state
         .content_service()
         .repository()
@@ -190,13 +230,7 @@ pub(crate) async fn items(
     }
     Ok(ContentItemsPage {
         execution_id: execution.execution_id,
-        context: ContentContext {
-            objective: frozen.objective,
-            brand_name: frozen.brand_name,
-            product_name: frozen.product_name,
-            target_audience: frozen.target_audience,
-            question_clusters,
-        },
+        context,
         total: items.len() as u64,
         items: page_items,
         next_cursor,

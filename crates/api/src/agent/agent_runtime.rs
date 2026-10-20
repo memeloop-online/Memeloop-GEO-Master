@@ -1080,6 +1080,15 @@ fn single_article_error(op: HostOp, error: AppError) -> HostOpError {
     }
 }
 
+fn content_create_error(error: AppError) -> HostOpError {
+    let op = HostOp::ContentCreate;
+    if error.code == ErrorCode::Conflict {
+        HostOpError::conflict(op, error.message)
+    } else {
+        worker_error(op, error)
+    }
+}
+
 fn serp_tool_measurement(
     scope: &TenantScope,
     measurement: &geo_domain::SerpMeasurement,
@@ -1610,6 +1619,17 @@ impl HostOps for RepositoryHostOps {
         crate::content_tools::read(self.content_state(op)?, scope, request)
             .await
             .map_err(|error| worker_error(op, error))
+    }
+
+    async fn content_create(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentCreateRequest,
+    ) -> Result<geo_worker::ContentExecutionRef, HostOpError> {
+        let op = HostOp::ContentCreate;
+        crate::content_tools::create(self.content_state(op)?, scope, request)
+            .await
+            .map_err(content_create_error)
     }
 
     async fn content_items_read(
@@ -2508,6 +2528,18 @@ mod tests {
             AppError::conflict("publication account is not ready"),
         );
         assert_eq!(other.code, HostOpErrorCode::Conflict);
+    }
+
+    #[test]
+    fn content_request_conflicts_and_permission_failures_are_typed() {
+        let duplicate = content_create_error(AppError::conflict(
+            "content request ID was already used with different input",
+        ));
+        assert_eq!(duplicate.code, HostOpErrorCode::Conflict);
+        let other = content_create_error(AppError::conflict("content run is unavailable"));
+        assert_eq!(other.code, HostOpErrorCode::Conflict);
+        let denied = content_create_error(AppError::forbidden("project write access required"));
+        assert_eq!(denied.code, HostOpErrorCode::Denied);
     }
 
     #[test]

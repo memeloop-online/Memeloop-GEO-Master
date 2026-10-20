@@ -667,6 +667,13 @@ async fn generated_memeloop_bundle_round_trips_a_native_tool_call_through_rust()
             .any(|tool| tool.function.name == "content_start"
                 && tool.function.parameters["additionalProperties"] == false)
     );
+    assert!(tools.iter().any(|tool| {
+        tool.function.name == "content_create"
+            && tool.function.parameters["additionalProperties"] == false
+            && tool.function.parameters["properties"]
+                .get("cycle_id")
+                .is_none()
+    }));
     assert!(
         tools
             .iter()
