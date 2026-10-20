@@ -1351,7 +1351,6 @@ function createHostProvider(host, configuredModel, toolFailures) {
         model:
           configuredModel === DEFAULT_MODEL_ID ? undefined : configuredModel,
         prompt: promptFromMessages(request.messages),
-        system: systemFromMessages(request.messages),
         messages: request.messages.map(toHostMessage),
         tools: (request.tools ?? []).map((tool) => ({
           type: "function",
@@ -1448,15 +1447,6 @@ function promptFromMessages(messages) {
     .filter((message) => message.role !== "system")
     .map((message) => `${message.role}: ${messageContent(message.content)}`)
     .join("\n\n");
-}
-
-function systemFromMessages(messages) {
-  const system = messages
-    .filter((message) => message.role === "system")
-    .map((message) => messageContent(message.content))
-    .filter((message) => message.length > 0)
-    .join("\n\n");
-  return system.length === 0 ? undefined : system;
 }
 
 function messageContent(content) {

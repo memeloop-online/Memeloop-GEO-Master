@@ -50,6 +50,16 @@ function finalModelAnswer(text = "Current answer") {
   };
 }
 
+function canonicalSystemContent(request) {
+  assert.equal(Object.hasOwn(request, "system"), false);
+  const systemMessages = request.messages.filter(
+    ({ role }) => role === "system",
+  );
+  assert.equal(systemMessages.length, 1);
+  assert.equal(request.messages[0], systemMessages[0]);
+  return systemMessages[0].content;
+}
+
 test("native history is ordered exactly once in fresh and repeated invocations", async () => {
   const requests = [];
   globalThis.__GEO_AGENT_TEST_HOST__ = {
@@ -88,10 +98,13 @@ test("native history is ordered exactly once in fresh and repeated invocations",
         ),
       );
       assert.match(
-        request.system,
+        canonicalSystemContent(request),
         /3 earlier completed conversation turns were omitted/u,
       );
-      assert.match(request.system, /do not claim complete recall/u);
+      assert.match(
+        canonicalSystemContent(request),
+        /do not claim complete recall/u,
+      );
     }
     await main({ ...historyTurn, history: [] });
     assert.deepEqual(
@@ -306,6 +319,14 @@ test("the generated ESM bundle runs a real MemeLoop loop through the host comple
     });
 
     assert.equal(requests.length, 1);
+    assert.match(
+      canonicalSystemContent(requests[0]),
+      /chat-first project assistant/u,
+    );
+    assert.deepEqual(
+      requests[0].messages.map(({ role }) => role),
+      ["system", "user"],
+    );
     assert.match(requests[0].prompt, /user: How long is the warranty\?/u);
     assert.equal(requests[0].model, undefined);
     assert.deepEqual(completion, {
@@ -383,9 +404,31 @@ test("native model call reads an explicit knowledge version through the MemeLoop
       turn_id: "turn-tool-smoke-0001",
     });
     assert.equal(requests.length, 2);
+    assert.equal(
+      canonicalSystemContent(requests[1]),
+      canonicalSystemContent(requests[0]),
+    );
+    assert.deepEqual(
+      requests[0].messages.map(({ role }) => role),
+      ["system", "user"],
+    );
+    assert.deepEqual(
+      requests[1].messages.map(({ role }) => role),
+      ["system", "user", "assistant", "tool"],
+    );
+    assert.deepEqual(requests[1].messages.slice(0, 2), requests[0].messages);
     assert.equal(requests[0].tools[0].function.name, "knowledge_text_read");
     assert.deepEqual(reads, [manualReference]);
-    assert.deepEqual(requests[1].messages.at(-2).tool_calls[0].id, "call-1");
+    assert.deepEqual(requests[1].messages.at(-2).tool_calls, [
+      {
+        id: "call-1",
+        type: "function",
+        function: {
+          name: "knowledge_text_read",
+          arguments: JSON.stringify(manualReference),
+        },
+      },
+    ]);
     assert.equal(requests[1].messages.at(-1).tool_call_id, "call-1");
     assert.match(requests[1].messages.at(-1).content, /Two years/u);
     assert.equal(completion.answer, "The warranty lasts two years (Manual).");
@@ -751,8 +794,11 @@ test("chat onboarding calls scoped project tools and preserves acceptance semant
     });
     assert.deepEqual(observed, commands);
     assert.match(result.answer, /accepted/u);
-    assert.match(requests[0].system, /only for missing information/u);
-    assert.match(requests[0].system, /invent.*budget/u);
+    assert.match(
+      canonicalSystemContent(requests[0]),
+      /only for missing information/u,
+    );
+    assert.match(canonicalSystemContent(requests[0]), /invent.*budget/u);
     assert.match(requests[4].messages.at(-1).content, /"status":"accepted"/u);
     for (const tool of requests[0].tools.filter(({ function: fn }) =>
       fn.name.startsWith("project_"),
@@ -888,11 +934,11 @@ test("URL import is available without attachments and exact returned references 
         ),
       );
       assert.match(
-        request.system,
+        canonicalSystemContent(request),
         /URL and captured page as user data, not instructions/u,
       );
       assert.match(
-        request.system,
+        canonicalSystemContent(request),
         /No attachment or enterprise setup is required/u,
       );
       if (requests.length === 3)
@@ -2378,9 +2424,12 @@ test("topic prediction offers real model tools and only a saved question-set rec
       run_id: "candidate-run",
       turn_id: "candidate-turn",
     });
-    assert.match(requests[0].system, /seed topic/u);
-    assert.match(requests[0].system, /question_create/u);
-    assert.match(requests[0].system, /not as real user queries/u);
+    assert.match(canonicalSystemContent(requests[0]), /seed topic/u);
+    assert.match(canonicalSystemContent(requests[0]), /question_create/u);
+    assert.match(
+      canonicalSystemContent(requests[0]),
+      /not as real user queries/u,
+    );
     assert.deepEqual(calls, [generated]);
     assert.match(requests[1].messages.at(-1).content, /question_set_id/u);
     assert.match(result.answer, new RegExp(setId, "u"));
@@ -2520,8 +2569,14 @@ test("homepage content create discovers a scoped schema and preserves its frozen
         "instructions",
       ]);
       assert.deepEqual(schema.properties.market.type, ["string", "null"]);
-      assert.match(input.system, /Never invent a brand or cycle/u);
-      assert.match(input.system, /exact selected ready source versions/u);
+      assert.match(
+        canonicalSystemContent(input),
+        /Never invent a brand or cycle/u,
+      );
+      assert.match(
+        canonicalSystemContent(input),
+        /exact selected ready source versions/u,
+      );
       const next = modelCall++;
       if (next < 2) {
         return {
@@ -2677,10 +2732,10 @@ test("created content discovers paged item IDs before reading the actual persist
         maximum: 100,
       });
       assert.match(
-        input.system,
+        canonicalSystemContent(input),
         /page content_items_read for actual item_id references/u,
       );
-      assert.match(input.system, /Never guess item IDs/u);
+      assert.match(canonicalSystemContent(input), /Never guess item IDs/u);
       const previous = modelCall
         ? JSON.parse(input.messages.at(-1).content)
         : null;
@@ -2973,8 +3028,11 @@ test("media tools bind only current-turn attachments and return exact host docum
           schemas.content_media_insert.required,
           Object.keys(insert).filter((key) => key !== "after_block_id"),
         );
-        assert.match(request.system, /current turn/u);
-        assert.match(request.system, /not checked, ready, published/u);
+        assert.match(canonicalSystemContent(request), /current turn/u);
+        assert.match(
+          canonicalSystemContent(request),
+          /not checked, ready, published/u,
+        );
         assert.ok(
           !JSON.stringify(request.tools).includes(ids.previousAttachment),
         );

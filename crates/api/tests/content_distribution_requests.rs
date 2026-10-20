@@ -8,24 +8,27 @@ use axum::{
 use chrono::Utc;
 use geo_api::{
     AppState, ChannelService, ContentService, EventBus, MemoryIdempotencyStore,
-    MemoryOperationStore, ModelProviderBridge, router,
+    MemoryOperationStore, ModelProviderBridge, RepositoryHostOps, router,
 };
 use geo_domain::{
     ChannelAccount, ChannelAccountRecord, ChannelOutcome, ChannelOutcomeStatus, ChannelOwnerKind,
-    ChannelRepository, ChannelStatus, ConnectorCapabilityRepository, ConnectorKey,
-    ConnectorSettings, ConnectorVerification, ContentBlock, ContentBlockKind, ContentEvidence,
-    ContentMediaRepository, ContentRepository, ContentStep, DistributionRepository,
-    DocumentManifestPlanRequest, DocumentScope, EvidenceRef, ImportItem, InitialSource,
-    InitialSourceKind, InitialSourceVisibility, KnowledgePurpose, KnowledgeRepository, Membership,
-    MemoryAuthRepository, MemoryChannelRepository, MemoryConnectorCapabilityRepository,
-    MemoryContentMediaRepository, MemoryContentRepository, MemoryDistributionRepository,
-    MemoryKnowledgeRepository, MemoryProjectRepository, ProjectCreate, ProjectRepository,
-    ProjectSettings, ProjectStartCommand, RICH_CHECK_POLICY_VERSION, RICH_MARKDOWN_FORMAT,
-    ReviseSourceTextCommand, RichContent, RichNode, Role, SourceKind, StructuredDocument,
-    TenantScope, UploadSessionCommand, User, VerifiedImage, hash_idempotency_key, settings_hash,
-    start_request_hash,
+    ChannelRepository, ChannelStatus, ChannelTarget, ChannelTargetInput,
+    ConnectorCapabilityRepository, ConnectorKey, ConnectorSettings, ConnectorVerification,
+    ContentBlock, ContentBlockKind, ContentEvidence, ContentMediaRepository, ContentRepository,
+    ContentStep, DistributionRepository, DocumentManifestPlanRequest, DocumentScope, EvidenceRef,
+    ImportItem, InitialSource, InitialSourceKind, InitialSourceVisibility, KnowledgePurpose,
+    KnowledgeRepository, Membership, MemoryAuthRepository, MemoryChannelRepository,
+    MemoryConnectorCapabilityRepository, MemoryContentMediaRepository, MemoryContentRepository,
+    MemoryDistributionRepository, MemoryKnowledgeRepository, MemoryProjectRepository,
+    ProjectCreate, ProjectRepository, ProjectSettings, ProjectStartCommand,
+    RICH_CHECK_POLICY_VERSION, RICH_MARKDOWN_FORMAT, ReviseSourceTextCommand, RichContent,
+    RichNode, Role, SourceKind, StructuredDocument, TenantScope, UploadSessionCommand, User,
+    VerifiedImage, hash_idempotency_key, settings_hash, start_request_hash,
 };
-use geo_worker::{ContentModelOutcome, HostOpError, ModelCompletion, ModelCompletionRequest};
+use geo_worker::{
+    ContentDistributeReadRequest, ContentModelOutcome, HostOpError, HostOps, ModelCompletion,
+    ModelCompletionRequest,
+};
 use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -858,10 +861,115 @@ async fn accepted_request_freezes_revision_and_account_without_claiming_delivery
     assert_eq!(state["attempt_id"], Value::Null);
     assert_eq!(state["outcome"], Value::Null);
     assert_eq!(state["fixture"], Value::Null);
+    assert_eq!(state["public_url"], Value::Null);
+    let ops = RepositoryHostOps::new(f.knowledge.clone()).with_content(f.state.clone());
+    let tool = ops
+        .content_distribute_read(
+            &f.scope,
+            ContentDistributeReadRequest {
+                request_id: Uuid::parse_str(id).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(tool.public_url.is_none());
     let (status, _) = f.get(&Uuid::new_v4().to_string(), id, "").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = f.get(&f.project, &Uuid::new_v4().to_string(), "").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn single_article_host_read_preserves_http_publication_url_and_provenance() {
+    for (outcome, is_fixture, public_url) in [
+        (
+            ChannelOutcomeStatus::Verified,
+            false,
+            Some("https://example.org/articles/100".to_owned()),
+        ),
+        (ChannelOutcomeStatus::Unknown, false, None),
+        (ChannelOutcomeStatus::Unsupported, true, None),
+    ] {
+        let f = fixture().await;
+        f.prove_text_connector().await;
+        let (status, accepted) = f.post(Some("publication-url"), f.body()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+        let request_id = Uuid::parse_str(accepted["request_id"].as_str().unwrap()).unwrap();
+        let intent_id =
+            Uuid::parse_str(accepted["publication_intent_id"].as_str().unwrap()).unwrap();
+        let bundle = f
+            .distribution
+            .get_publication_bundle(&f.scope, intent_id)
+            .await
+            .unwrap();
+        let target_id = bundle.command.command_id;
+        let target = ChannelTarget {
+            target_id,
+            input: ChannelTargetInput::GeneratedPublish {
+                content_revision_id: bundle.revision.revision_id,
+                variant_id: bundle.variant.variant_id,
+                publication_intent_id: intent_id,
+                distribution_target_id: bundle.command.target_id,
+                origin_request_id: Some(request_id),
+                platform: bundle.variant.platform_id.clone(),
+                account_id: f.account_id,
+                title: bundle.variant.title.clone(),
+                body_sha256: geo_domain::sha256_hex(bundle.variant.markdown.as_bytes()),
+                body: bundle.variant.markdown,
+                payload_hash: bundle.variant.payload_hash,
+                evidence: bundle.revision.evidence,
+                rich_payload: bundle.variant.rich_payload,
+            },
+        };
+        let jobs = f.state.channel_job_repository();
+        jobs.insert_generated_target(&f.scope, Uuid::nil(), target_id, target)
+            .await
+            .unwrap();
+        let attempt_id = Uuid::new_v4();
+        jobs.claim(&f.scope, target_id, attempt_id, Utc::now())
+            .await
+            .unwrap();
+        jobs.finish(
+            &f.scope,
+            target_id,
+            attempt_id,
+            ChannelOutcome {
+                status: outcome,
+                detail: None,
+                occurred_at: Utc::now(),
+                raw_answer: None,
+                citations: vec![],
+                public_url: public_url.clone(),
+                screenshot_ref: None,
+                connector_version: Some("synthetic.v1".into()),
+                runner_evidence: vec![],
+                fixture: is_fixture,
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let (status, http) = f
+            .get(&f.project, &request_id.to_string(), "/publication")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{http}");
+        let ops = RepositoryHostOps::new(f.knowledge.clone()).with_content(f.state.clone());
+        let tool = ops
+            .content_distribute_read(&f.scope, ContentDistributeReadRequest { request_id })
+            .await
+            .unwrap();
+        assert_eq!(tool.public_url, public_url);
+        let tool = serde_json::to_value(tool).unwrap();
+        for field in [
+            "channel_target_id",
+            "attempt_id",
+            "outcome",
+            "fixture",
+            "public_url",
+        ] {
+            assert_eq!(tool[field], http[field], "{field}");
+        }
+    }
 }
 
 #[tokio::test]

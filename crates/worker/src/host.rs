@@ -661,7 +661,7 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v24";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v25";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2272,6 +2272,8 @@ pub struct ContentDistributeRef {
     pub attempt_id: Option<Uuid>,
     pub outcome: Option<String>,
     pub fixture: Option<bool>,
+    /// The same trusted publication URL exposed by the HTTP ledger projection.
+    pub public_url: Option<String>,
 }
 
 /// Selectors only: the trusted service freezes handoff, platform capabilities
@@ -5371,12 +5373,27 @@ mod tests {
             attempt_id: None,
             outcome: None,
             fixture: None,
+            public_url: None,
         };
         let legacy = serde_json::to_value(&receipt).unwrap();
         assert!(legacy.get("materialization_deferral").is_none());
         assert_eq!(
             serde_json::from_value::<ContentDistributeRef>(legacy).unwrap(),
             receipt
+        );
+        let mut without_url = serde_json::to_value(&receipt).unwrap();
+        without_url.as_object_mut().unwrap().remove("public_url");
+        assert_eq!(
+            serde_json::from_value::<ContentDistributeRef>(without_url).unwrap(),
+            receipt
+        );
+        let mut with_url = receipt.clone();
+        with_url.public_url = Some("https://example.org/articles/100".into());
+        let serialized = serde_json::to_value(&with_url).unwrap();
+        assert_eq!(serialized["public_url"], "https://example.org/articles/100");
+        assert_eq!(
+            serde_json::from_value::<ContentDistributeRef>(serialized).unwrap(),
+            with_url
         );
 
         let expected_reasons = [
