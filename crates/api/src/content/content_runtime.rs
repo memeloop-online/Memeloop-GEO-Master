@@ -11,8 +11,8 @@ use geo_domain::{
     AppError, ContentExecutionOrigin, ContentExecutionStatus, ErrorCode, TenantScope,
 };
 use geo_worker::{
-    ContentExecutionReadRequest, HostBridge, HostOp, HostOpBudgets, HostOpLimits, HostOps,
-    HostRuntime, WorkerError,
+    ContentExecutionReadRequest, HostBridge, HostEvent, HostOp, HostOpBudgets, HostOpLimits,
+    HostOps, HostRuntime, WorkerError,
 };
 use uuid::Uuid;
 
@@ -21,6 +21,59 @@ const V8_HEAP_LIMIT: usize = 64 * 1024 * 1024;
 pub const CONTENT_WORKFLOW_ENTRY: &str = "memeloop://bundle/content-workflow.mjs";
 pub const CONTENT_COMPLETION_TOPIC: &str = "content.completed";
 pub const DISTRIBUTION_PREPARED_TOPIC: &str = "distribution.prepared";
+
+// This is a diagnostic sample, never a persisted item result or handoff.
+// Decode only fixed codes; neither JS/provider error prose nor event extras
+// may enter operational logs.
+fn preparation_diagnostic(events: &[HostEvent]) -> Option<(&'static str, &'static str)> {
+    events.iter().find_map(|event| {
+        if event.topic != "content.preparation_failed" {
+            return None;
+        }
+        let value: serde_json::Value = serde_json::from_str(&event.payload).ok()?;
+        let stage = match value.get("stage")?.as_str()? {
+            "source_read" => "source_read",
+            "evidence_preparation" => "evidence_preparation",
+            "evidence_model" => "evidence_model",
+            "evidence_validation" => "evidence_validation",
+            "prepare" => "prepare",
+            _ => return None,
+        };
+        let reason = match value.get("reason")?.as_str()? {
+            "invalid_request" => "invalid_request",
+            "capability_missing" => "capability_missing",
+            "denied" => "denied",
+            "not_found" => "not_found",
+            "budget_exceeded" => "budget_exceeded",
+            "deadline_exceeded" => "deadline_exceeded",
+            "cancelled" => "cancelled",
+            "failed" => "failed",
+            "unknown_result" => "unknown_result",
+            "idempotency_conflict" => "idempotency_conflict",
+            "conflict" => "conflict",
+            "internal" => "internal",
+            "unknown" => "unknown",
+            "invalid_completion" => "invalid_completion",
+            "invalid_json" => "invalid_json",
+            "invalid_evidence_shape" => "invalid_evidence_shape",
+            "evidence_limit" => "evidence_limit",
+            "invalid_choice" => "invalid_choice",
+            "unknown_source_version" => "unknown_source_version",
+            "unknown_chunk" => "unknown_chunk",
+            "duplicate_chunk" => "duplicate_chunk",
+            "blank_quote" => "blank_quote",
+            "quote_limit" => "quote_limit",
+            "partial_csv_record" => "partial_csv_record",
+            "quote_mismatch" => "quote_mismatch",
+            "invalid_source_references" => "invalid_source_references",
+            "source_binding_mismatch" => "source_binding_mismatch",
+            "invalid_source_chunks" => "invalid_source_chunks",
+            "source_cursor_stalled" => "source_cursor_stalled",
+            _ => return None,
+        };
+        Some((stage, reason))
+    })
+}
 
 fn workflow_budgets() -> HostOpBudgets {
     // Match the existing finite planner's 10,000-item bound. Interactive-turn
@@ -190,14 +243,29 @@ impl EmbeddedContentWorkflowExecutor {
                 let mut runtime =
                     HostRuntime::new(bundle, bridge, Some(V8_HEAP_LIMIT)).map_err(worker_error)?;
                 runtime.install_heap_limit_guard(Arc::new(AtomicBool::new(false)));
-                runtime
+                let result = runtime
                     .call_main(
                         entry,
                         &serde_json::json!({ "execution_id": execution_id }).to_string(),
                         WORKFLOW_DEADLINE,
                     )
-                    .await
-                    .map_err(worker_error)?;
+                    .await;
+                // Capture the sample before propagating a failed main: its
+                // in-memory events would otherwise be discarded here.
+                if let Some((stage, reason)) = preparation_diagnostic(&runtime.host_state().events)
+                {
+                    tracing::warn!(
+                        stage,
+                        reason,
+                        "content preparation reported a branch failure"
+                    );
+                    if result.is_err() {
+                        return Err(runtime_error(format!(
+                            "content preparation failed: {stage}/{reason}"
+                        )));
+                    }
+                }
+                result.map_err(worker_error)?;
                 Ok::<_, AppError>(runtime.host_state().events)
             })
         })
@@ -285,6 +353,35 @@ fn runtime_error(message: impl Into<String>) -> AppError {
 }
 
 #[cfg(test)]
+mod preparation_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn preparation_diagnostics_accept_only_fixed_codes_and_ignore_private_extras() {
+        let event = |payload: serde_json::Value| HostEvent {
+            topic: "content.preparation_failed".into(),
+            payload: payload.to_string(),
+        };
+        let valid = event(serde_json::json!({
+            "stage": "evidence_validation",
+            "reason": "quote_mismatch",
+            "message": "synthetic private content",
+        }));
+        assert_eq!(
+            preparation_diagnostic(&[valid]),
+            Some(("evidence_validation", "quote_mismatch"))
+        );
+        for payload in [
+            serde_json::json!({ "stage": "private-stage", "reason": "quote_mismatch" }),
+            serde_json::json!({ "stage": "evidence_model", "reason": "private-reason" }),
+            serde_json::json!({ "message": "synthetic private error" }),
+        ] {
+            assert_eq!(preparation_diagnostic(&[event(payload)]), None);
+        }
+    }
+}
+
+#[cfg(test)]
 mod completion_tests {
     use super::*;
     use crate::{
@@ -331,6 +428,18 @@ mod completion_tests {
         r#"
         export async function main(input) {
             await Deno.core.ops.op_host_content_close_v1(JSON.stringify(input));
+        }
+    "#,
+    )];
+    const FAILED_PREPARATION: &[(&str, &str)] = &[(
+        CONTENT_WORKFLOW_ENTRY,
+        r#"
+        export async function main() {
+            Deno.core.ops.op_host_emit('content.preparation_failed', JSON.stringify({
+                stage: 'evidence_validation', reason: 'quote_mismatch',
+                message: 'synthetic private model output'
+            }));
+            throw new Error('synthetic private provider error');
         }
     "#,
     )];
@@ -425,6 +534,27 @@ mod completion_tests {
             .await
             .unwrap();
         (state, scope, execution.execution_id)
+    }
+
+    #[tokio::test]
+    async fn failed_main_preserves_only_the_allowlisted_preparation_diagnostic() {
+        let (state, scope, execution_id) = on_demand_fixture().await;
+        let capabilities = Arc::new(
+            RepositoryHostOps::new(state.knowledge_repository()).with_content(state.clone()),
+        );
+        let error = EmbeddedContentWorkflowExecutor::with_bundle(
+            FAILED_PREPARATION,
+            CONTENT_WORKFLOW_ENTRY,
+            capabilities,
+        )
+        .run(scope, execution_id)
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert_eq!(
+            error.message,
+            "content preparation failed: evidence_validation/quote_mismatch"
+        );
     }
 
     #[tokio::test]
