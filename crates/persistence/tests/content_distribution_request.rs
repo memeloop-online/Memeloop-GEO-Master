@@ -464,7 +464,61 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
 
     // A genuinely independent checked article, with its own current public
     // evidence, must create one intent and one command without a coverage
-    // target. The rest of this test performs no external send.
+    // target, cycle, connector settings or prior proof. The rest of this test
+    // performs no external send.
+    let project = projects
+        .create(
+            &tenant_scope,
+            ProjectCreate {
+                slug: Some(format!("on-demand-{tenant}")),
+                display_name: "On-demand article".into(),
+                settings: ProjectSettings::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let scope = TenantScope::new(operator.into(), tenant.into(), Some(project.id));
+    let execution_id = Uuid::new_v4();
+    let manifest_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO document_manifests (manifest_id,operator_id,tenant_id,project_id,\
+         cycle_id,origin_kind,revision,state,sealed,expected_count,scope_hash,input_refs) \
+         VALUES ($1,$2,$3,$4,NULL,'on_demand',1,'ready',true,1,'test','{}'::jsonb)",
+    )
+    .bind(manifest_id)
+    .bind(operator)
+    .bind(tenant)
+    .bind(project.id.as_uuid())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO content_executions (execution_id,operator_id,tenant_id,project_id,\
+         cycle_id,origin_kind,request_id,manifest_id,manifest_revision,policy_version,input_hash,state) \
+         VALUES ($1,$2,$3,$4,NULL,'on_demand',$5,$6,1,'test','test','{}'::jsonb)",
+    )
+    .bind(execution_id)
+    .bind(operator)
+    .bind(tenant)
+    .bind(project.id.as_uuid())
+    .bind(Uuid::new_v4())
+    .bind(manifest_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let account_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO channel_accounts \
+         (operator_id,tenant_id,project_id,account_id,platform,metadata) \
+         VALUES ($1,$2,$3,$4,'platform','{}'::jsonb)",
+    )
+    .bind(operator)
+    .bind(tenant)
+    .bind(project.id.as_uuid())
+    .bind(account_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
     let source_id = Uuid::new_v4();
     let source_version = Uuid::new_v4();
     let chunk_id = Uuid::new_v4();
@@ -562,6 +616,14 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
         findings: vec![],
         created_at: Utc::now(),
     };
+    sqlx::query("UPDATE content_executions SET state=$1 WHERE execution_id=$2")
+        .bind(
+            serde_json::json!({"items":[{"asset_id":eligible.asset_id,"content_type":"article"}]}),
+        )
+        .bind(execution_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO content_revisions (revision_id,operator_id,tenant_id,project_id,\
          execution_id,asset_id,revision,body,created_at) VALUES ($1,$2,$3,$4,$5,$6,1,$7,$8)",
@@ -612,28 +674,6 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
     .execute(database.pool())
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO connector_capability_settings \
-         (operator_id,platform_id,placement_slot,revision,enabled,content_types) \
-         VALUES ($1,'platform','primary',1,true,$2)",
-    )
-    .bind(operator)
-    .bind(serde_json::json!(["plain_text_article.v1"]))
-    .execute(database.pool())
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO connector_capability_verifications \
-         (verification_id,operator_id,platform_id,placement_slot,connector_version,content_type,\
-          publication_receipt,public_readback,verified_at) \
-         VALUES ($1,$2,'platform','primary','fixture-v1','plain_text_article.v1',\
-          '{}'::jsonb,'{}'::jsonb,now())",
-    )
-    .bind(Uuid::new_v4())
-    .bind(operator)
-    .execute(database.pool())
-    .await
-    .unwrap();
     let first_input = AcceptContentDistributionRequest {
         revision: eligible.clone(),
         account: ready_account.clone(),
@@ -654,8 +694,9 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
             .any(|request| request.request_id == first.request_id)
     );
     sqlx::query(
-        "UPDATE connector_capability_settings SET enabled=false \
-         WHERE operator_id=$1 AND platform_id='platform' AND placement_slot='primary'",
+        "INSERT INTO connector_capability_settings \
+         (operator_id,platform_id,placement_slot,revision,enabled,content_types) \
+         VALUES ($1,'platform','primary',1,false,'[\"plain_text_article.v1\"]'::jsonb)",
     )
     .bind(operator)
     .execute(database.pool())
@@ -703,8 +744,32 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
             .any(|request| request.request_id == second_request.request_id)
     );
     sqlx::query(
-        "UPDATE connector_capability_settings SET enabled=true \
+        "UPDATE connector_capability_settings SET enabled=true,content_types='[\"unrecognized\"]'::jsonb \
          WHERE operator_id=$1 AND platform_id='platform' AND placement_slot='primary'",
+    )
+    .bind(operator)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        repository
+            .materialize(&scope, first.request_id)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    assert!(
+        repository
+            .get(&scope, first.request_id)
+            .await
+            .unwrap()
+            .publication_intent_id
+            .is_none()
+    );
+    sqlx::query(
+        "DELETE FROM connector_capability_settings WHERE operator_id=$1 \
+         AND platform_id='platform' AND placement_slot='primary'",
     )
     .bind(operator)
     .execute(database.pool())
@@ -718,6 +783,29 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
         .unwrap();
     assert!(materialized.materialization_deferral.is_none());
     let first_intent = materialized.publication_intent_id.unwrap();
+    let cycles: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM optimization_cycles WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3",
+    )
+    .bind(operator)
+    .bind(tenant)
+    .bind(project.id.as_uuid())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(cycles, 0);
+    for table in [
+        "connector_capability_settings",
+        "connector_capability_verifications",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {table} WHERE operator_id=$1"
+        ))
+        .bind(operator)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
     // A stale failure writer's scoped, unlinked-only update cannot alter the
     // completed link. This uses the same predicate as record_deferral.
     let stale = sqlx::query(
@@ -749,6 +837,18 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
             .unwrap(),
         materialized
     );
+    let counts: (i64, i64) = sqlx::query_as(
+        "SELECT \
+         (SELECT count(*) FROM distribution_publication_intents WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3), \
+         (SELECT count(*) FROM distribution_publication_commands WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3)",
+    )
+    .bind(operator)
+    .bind(tenant)
+    .bind(project.id.as_uuid())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(counts, (1, 1));
     let distribution = PgDistributionRepository::from_database(&database);
     let bundle = distribution
         .get_publication_bundle(&scope, first_intent)
@@ -815,6 +915,17 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
     let mut next_input = first_input.clone();
     next_input.idempotency_key = "independent-2".into();
     let next = repository.accept(&scope, next_input).await.unwrap();
+    // An explicit recognized semantic type also permits plain-text bootstrap
+    // without requiring a pre-existing publication proof.
+    sqlx::query(
+        "INSERT INTO connector_capability_settings \
+         (operator_id,platform_id,placement_slot,revision,enabled,content_types) \
+         VALUES ($1,'platform','primary',1,true,'[\"article\"]'::jsonb)",
+    )
+    .bind(operator)
+    .execute(database.pool())
+    .await
+    .unwrap();
     let next = repository
         .materialize(&scope, next.request_id)
         .await
@@ -852,8 +963,8 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
             .code,
         ErrorCode::InvalidRequest
     );
-    // A schema-2 request cannot use the otherwise verified plain-text
-    // connector. It needs separate exact rich-format capability evidence.
+    // Rich content needs separate exact-format capability evidence, including
+    // when the same account already bootstrapped a plain-text publication.
     let mut rich_revision = eligible.clone();
     rich_revision.revision_id = Uuid::new_v4();
     rich_revision.asset_id = Uuid::new_v4();

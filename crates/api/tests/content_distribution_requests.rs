@@ -14,16 +14,16 @@ use geo_domain::{
     ChannelAccount, ChannelAccountRecord, ChannelOutcome, ChannelOutcomeStatus, ChannelOwnerKind,
     ChannelRepository, ChannelStatus, ChannelTarget, ChannelTargetInput,
     ConnectorCapabilityRepository, ConnectorKey, ConnectorSettings, ConnectorVerification,
-    ContentBlock, ContentBlockKind, ContentEvidence, ContentMediaRepository, ContentRepository,
-    ContentStep, DistributionRepository, DocumentManifestPlanRequest, DocumentScope, EvidenceRef,
-    ImportItem, InitialSource, InitialSourceKind, InitialSourceVisibility, KnowledgePurpose,
-    KnowledgeRepository, Membership, MemoryAuthRepository, MemoryChannelRepository,
-    MemoryConnectorCapabilityRepository, MemoryContentMediaRepository, MemoryContentRepository,
-    MemoryDistributionRepository, MemoryKnowledgeRepository, MemoryProjectRepository,
-    ProjectCreate, ProjectRepository, ProjectSettings, ProjectStartCommand,
+    ContentBlock, ContentBlockKind, ContentCreateDocument, ContentCreateRequest, ContentEvidence,
+    ContentMediaRepository, ContentRepository, ContentStep, DistributionRepository, DocumentScope,
+    EvidenceRef, ImportItem, InitialSource, InitialSourceKind, InitialSourceVisibility,
+    KnowledgePurpose, KnowledgeRepository, Membership, MemoryAuthRepository,
+    MemoryChannelRepository, MemoryConnectorCapabilityRepository, MemoryContentMediaRepository,
+    MemoryContentRepository, MemoryDistributionRepository, MemoryKnowledgeRepository,
+    MemoryProjectRepository, ProjectCreate, ProjectRepository, ProjectSettings,
     RICH_CHECK_POLICY_VERSION, RICH_MARKDOWN_FORMAT, ReviseSourceTextCommand, RichContent,
     RichNode, Role, SourceKind, StructuredDocument, TenantScope, UploadSessionCommand, User,
-    VerifiedImage, hash_idempotency_key, settings_hash, start_request_hash,
+    VerifiedImage,
 };
 use geo_worker::{
     ContentDistributeReadRequest, ContentModelOutcome, HostOpError, HostOps, ModelCompletion,
@@ -141,6 +141,10 @@ async fn login(app: &axum::Router, name: &str, password: &str) -> (String, Strin
 }
 
 async fn fixture() -> Fixture {
+    fixture_with_settings(true).await
+}
+
+async fn fixture_with_settings(disabled: bool) -> Fixture {
     let auth = Arc::new(MemoryAuthRepository::development_with_password(
         "fixture-pass",
     ));
@@ -194,21 +198,6 @@ async fn fixture() -> Fixture {
         )
         .await
         .unwrap();
-    let hash = settings_hash(&project.settings.clone().validate_start().unwrap()).unwrap();
-    let started = projects
-        .start(
-            &tenant,
-            project.id,
-            ProjectStartCommand {
-                expected_revision: project.revision,
-                idempotency_key_hash: hash_idempotency_key("fixture-start"),
-                request_hash: start_request_hash(project.id, project.revision, &hash),
-                settings_hash: hash,
-                operation_id: Uuid::new_v4(),
-            },
-        )
-        .await
-        .unwrap();
     let scope = TenantScope::new(tenant.operator_id, tenant.tenant_id, Some(project.id));
     let knowledge = Arc::new(MemoryKnowledgeRepository::default());
     let imported = knowledge
@@ -227,24 +216,6 @@ async fn fixture() -> Fixture {
         )
         .await
         .unwrap();
-    let mut document_scope = project.settings.document_scope.clone();
-    document_scope.markets = project.settings.effective_markets();
-    document_scope.languages = project.settings.effective_languages();
-    knowledge
-        .plan_document_manifest(
-            &scope,
-            DocumentManifestPlanRequest {
-                manifest_id: started.document_manifest.manifest_id,
-                knowledge_release_id: imported.items[0]
-                    .release
-                    .as_ref()
-                    .unwrap()
-                    .knowledge_release_id,
-            },
-            document_scope,
-        )
-        .await
-        .unwrap();
     let media = Arc::new(MemoryContentMediaRepository::with_knowledge_repository(
         knowledge.clone(),
     ));
@@ -252,7 +223,32 @@ async fn fixture() -> Fixture {
         media.clone(),
     ));
     let service = ContentService::new(content.clone(), knowledge.clone(), projects.clone());
-    let execution = service.start(&scope, started.cycle_id).await.unwrap();
+    let execution = service
+        .create_on_demand(
+            &scope,
+            ContentCreateRequest {
+                request_id: Uuid::new_v4(),
+                topic: "Public example".into(),
+                source_version_ids: vec![
+                    imported.items[0]
+                        .source_version
+                        .as_ref()
+                        .unwrap()
+                        .source_version_id,
+                ],
+                documents: vec![ContentCreateDocument {
+                    key: "article".into(),
+                    content_type: "faq".into(),
+                    title: None,
+                    instructions: None,
+                }],
+                language: "en".into(),
+                market: None,
+                audience: None,
+            },
+        )
+        .await
+        .unwrap();
     let item = content
         .list_items(&scope, execution.execution_id)
         .await
@@ -368,6 +364,23 @@ async fn fixture() -> Fixture {
     .with_content_media_repository(media.clone())
     .with_channel_service(ChannelService::unconfigured(channels.clone()))
     .with_distribution_repository(distribution.clone());
+    if disabled {
+        state
+            .connector_capability_repository()
+            .configure(
+                scope.operator_id,
+                ConnectorKey {
+                    platform_id: "generic".into(),
+                    placement_slot: "primary".into(),
+                },
+                0,
+                false,
+                vec![],
+                "",
+            )
+            .await
+            .unwrap();
+    }
     let app = router(state.clone());
     let (cookie, csrf) = login(&app, "demo@localhost", "fixture-pass").await;
     Fixture {
@@ -447,7 +460,7 @@ impl Fixture {
             .configure(
                 self.scope.operator_id,
                 key,
-                0,
+                1,
                 true,
                 vec!["faq".into()],
                 "live.v1",
@@ -1028,8 +1041,42 @@ async fn accepted_key_replays_after_account_revocation_and_conflicts_before_auth
 
 #[tokio::test]
 async fn checked_single_article_materializes_one_origin_outbox_without_a_cycle() {
-    let f = fixture().await;
-    f.prove_text_connector().await;
+    let f = fixture_with_settings(false).await;
+    let key = ConnectorKey {
+        platform_id: "generic".into(),
+        placement_slot: "primary".into(),
+    };
+    let registry = f.state.connector_capability_repository();
+    assert!(
+        registry
+            .get(f.scope.operator_id, &key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        registry
+            .history(f.scope.operator_id, &key)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let asset = f
+        .content
+        .get_asset(&f.scope, f.content_asset_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        f.content
+            .get_execution(&f.scope, asset.execution_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .origin
+            .cycle_id()
+            .is_none()
+    );
     let (status, first) = f.post(Some("publish-checked"), f.body()).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{first}");
     let request_id = Uuid::parse_str(first["request_id"].as_str().unwrap()).unwrap();
@@ -1121,32 +1168,18 @@ async fn builder_authority_overrides_are_fresh_without_mutating_sibling_state() 
             .code,
         geo_domain::ErrorCode::Conflict
     );
-    let no_proof = f
+    let no_settings = f
         .state
         .clone()
         .with_connector_capability_repository(Arc::new(
             MemoryConnectorCapabilityRepository::default(),
         ));
-    assert_eq!(
-        no_proof
-            .content_distribution_request_repository()
-            .materialize(&f.scope, id)
-            .await
-            .unwrap_err()
-            .code,
-        geo_domain::ErrorCode::Conflict
-    );
-    assert_eq!(
-        f.state
-            .content_distribution_request_repository()
-            .get(&f.scope, id)
-            .await
-            .unwrap()
-            .materialization_deferral
-            .unwrap()
-            .reason,
-        geo_domain::ContentRequestDeferralReason::ConnectorUnavailable
-    );
+    let no_settings_request = no_settings
+        .content_distribution_request_repository()
+        .materialize(&f.scope, id)
+        .await
+        .unwrap();
+    assert!(no_settings_request.publication_intent_id.is_some());
     let original_distribution = f.state.distribution_repository();
     let fork_distribution = Arc::new(MemoryDistributionRepository::default());
     let fork = f

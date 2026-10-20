@@ -174,16 +174,62 @@ async fn generated_connector_available(
             {
                 return Ok(false);
             }
-            let Some(settings) = state
+            let settings = state
                 .connector_capability_repository()
                 .get(scope.operator_id, &key)
-                .await?
-            else {
-                return Ok(false);
-            };
-            if !settings.enabled {
+                .await?;
+            if settings.as_ref().is_some_and(|settings| !settings.enabled) {
                 return Ok(false);
             }
+            if rich_payload.is_none() {
+                // An explicitly requested first article establishes its own
+                // publication/readback evidence; prior success is not required.
+                let mut matching = connectors.iter().filter(|connector| {
+                    connector.platform == key.platform_id
+                        && connector.placement_slot == key.placement_slot
+                });
+                let Some(connector) = matching.next() else {
+                    return Ok(false);
+                };
+                if matching.next().is_some()
+                    || connector.connector_version.trim().is_empty()
+                    || !["publish", "lookup"].iter().all(|operation| {
+                        connector
+                            .operations
+                            .iter()
+                            .any(|item| item.as_str() == *operation)
+                    })
+                {
+                    return Ok(false);
+                }
+                let Some(settings) = settings else {
+                    return Ok(true);
+                };
+                if settings
+                    .content_types
+                    .iter()
+                    .any(|format| format == geo_domain::PLAIN_TEXT_ARTICLE_FORMAT)
+                {
+                    return Ok(true);
+                }
+                let content = state.content_repository();
+                let Some(asset) = content.get_asset(scope, request.content_asset_id).await? else {
+                    return Ok(false);
+                };
+                return Ok(content
+                    .get_item(scope, asset.execution_id, asset.item_id)
+                    .await?
+                    .is_some_and(|item| {
+                        crate::connector_capabilities::configured_publication_format(
+                            &settings,
+                            &item.content_type,
+                        )
+                        .is_some()
+                    }));
+            }
+            let Some(settings) = settings else {
+                return Ok(false);
+            };
             let content = state.content_repository();
             let semantic =
                 if let Some(asset) = content.get_asset(scope, request.content_asset_id).await? {

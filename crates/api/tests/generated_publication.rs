@@ -9,16 +9,18 @@ use axum::{
 use chrono::Utc;
 use geo_api::{
     AppState, BrowserBridge, CSRF_HEADER, ChannelDispatchDeferred, ChannelDispatchResult,
-    ChannelService, EventBus, MemoryIdempotencyStore, MemoryOperationStore, execute_channel_target,
-    router,
+    ChannelService, ContentService, EventBus, MemoryIdempotencyStore, MemoryOperationStore,
+    execute_channel_target, router,
 };
 use geo_domain::{
-    AppError, ChannelAccount, ChannelAccountRecord, ChannelOutcome, ChannelOutcomeStatus,
-    ChannelOwnerKind, ChannelSecret, ChannelStatus, ChannelTarget, ChannelTargetInput,
-    ChunkLocator, ConnectorKey, ConnectorVerification, ContentBlock, ContentBlockKind,
-    ContentCoverage, ContentExecution, ContentExecutionStatus, ContentHandoff, ContentHandoffItem,
-    ContentItemStatus, ContentRevision, DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID,
-    DocumentManifest, DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
+    AcceptContentDistributionRequest, AppError, ChannelAccount, ChannelAccountRecord,
+    ChannelOutcome, ChannelOutcomeStatus, ChannelOwnerKind, ChannelSecret, ChannelStatus,
+    ChannelTarget, ChannelTargetInput, ChunkLocator, ConnectorCapabilityRepository, ConnectorKey,
+    ConnectorSettings, ConnectorVerification, ContentBlock, ContentBlockKind, ContentCoverage,
+    ContentCreateDocument, ContentCreateRequest, ContentEvidence, ContentExecution,
+    ContentExecutionStatus, ContentHandoff, ContentHandoffItem, ContentItemStatus, ContentRevision,
+    ContentStep, DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, DocumentManifest,
+    DocumentManifestCoverage, DocumentManifestItem, DocumentManifestItemState,
     DocumentManifestPlanRequest, DocumentManifestState, DocumentScope, EvidenceRef, Fact,
     FreezeDistribution, ImportAcceptance, ImportBatchAcceptance, ImportItem, KnowledgeCapability,
     KnowledgeOverview, KnowledgePurpose, KnowledgeRelease, KnowledgeRepository,
@@ -28,6 +30,7 @@ use geo_domain::{
     UploadSessionCommand, sha256_hex,
 };
 use geo_provider::SecretEnvelope;
+use geo_worker::ContentModelOutcome;
 use serde_json::json;
 use std::sync::{
     Arc,
@@ -193,6 +196,17 @@ struct RevokingKnowledge {
 
 #[async_trait]
 impl KnowledgeRepository for RevokingKnowledge {
+    async fn hold_content_evidence<'a>(
+        &'a self,
+        scope: &TenantScope,
+        inputs: &[geo_domain::ContentPublicEligibility],
+    ) -> Result<geo_domain::ContentKnowledgeGuard<'a>, AppError> {
+        if self.revoked.load(Ordering::SeqCst) {
+            return Err(AppError::conflict("source no longer publicly eligible"));
+        }
+        self.inner.hold_content_evidence(scope, inputs).await
+    }
+
     async fn capabilities(&self, scope: &TenantScope) -> Result<KnowledgeCapability, AppError> {
         self.inner.capabilities(scope).await
     }
@@ -352,6 +366,7 @@ struct RunnerCalls {
     revoke_on_complete: Arc<AtomicBool>,
     revoked: Arc<RevokingKnowledge>,
     runner_version: Arc<Mutex<String>>,
+    advertised_connectors: Arc<Mutex<Option<serde_json::Value>>>,
     connector_settings: Arc<Mutex<Option<AppState>>>,
 }
 
@@ -368,12 +383,11 @@ async fn runner(
         ("GET", "/v1/lifecycle") => (StatusCode::OK, Json(json!({"generation":GENERATION}))),
         ("GET", "/v1/capabilities") => {
             let version = calls.runner_version.lock().await.clone();
-            (
-                StatusCode::OK,
-                Json(json!({"connectors":[{"platform":"zhihu",
-                "placement_slot":"primary","connector_version":version,
-                "operations":["publish"],"verified":false}]})),
-            )
+            let connectors = calls.advertised_connectors.lock().await.clone().unwrap_or_else(|| json!([
+                {"platform":"zhihu", "placement_slot":"primary", "connector_version":version,
+                 "operations":["publish", "lookup"], "verified":false}
+            ]));
+            (StatusCode::OK, Json(json!({"connectors":connectors})))
         }
         ("POST", "/v1/sessions") => {
             let input = payload.unwrap().0;
@@ -415,15 +429,22 @@ async fn runner(
                 calls.revoked.revoked.store(true, Ordering::SeqCst);
             }
             if let Some(state) = calls.connector_settings.lock().await.take() {
+                let key = ConnectorKey {
+                    platform_id: "zhihu".into(),
+                    placement_slot: "primary".into(),
+                };
+                let revision = state
+                    .connector_capability_repository()
+                    .get(geo_domain::DEVELOPMENT_OPERATOR_ID, &key)
+                    .await
+                    .unwrap()
+                    .map_or(0, |settings| settings.revision);
                 state
                     .connector_capability_repository()
                     .configure(
                         geo_domain::DEVELOPMENT_OPERATOR_ID,
-                        ConnectorKey {
-                            platform_id: "zhihu".into(),
-                            placement_slot: "primary".into(),
-                        },
-                        1,
+                        key,
+                        revision,
                         false,
                         vec![],
                         "",
@@ -719,6 +740,7 @@ async fn frozen_fixture(fixture: bool) -> FrozenFixture {
         revoke_on_complete: Arc::default(),
         revoked: knowledge.clone(),
         runner_version: Arc::new(Mutex::new("test-live.v1".into())),
+        advertised_connectors: Arc::default(),
         connector_settings: Arc::new(Mutex::new(None)),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -819,6 +841,369 @@ async fn fixture_command_never_opens_a_runner_context_or_claims() {
             .attempts
             .is_empty()
     );
+    fixture.server.abort();
+}
+
+async fn requested_fixture() -> FrozenFixture {
+    // The unused frozen fixture retains the existing coverage tests' setup;
+    // this separate command is a real checked, on-demand content request.
+    let mut fixture = frozen_fixture(true).await;
+    let state = &fixture.state;
+    let scope = &fixture.scope;
+    let source = fixture
+        .knowledge
+        .list_sources(scope)
+        .await
+        .unwrap()
+        .remove(0);
+    let detail = fixture
+        .knowledge
+        .get_source_detail(scope, source.source_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let chunk = &detail.chunks[0];
+    let content = state.content_repository();
+    let service = ContentService::new(
+        content.clone(),
+        fixture.knowledge.clone(),
+        state.project_repository(),
+    );
+    let execution = service
+        .create_on_demand(
+            scope,
+            ContentCreateRequest {
+                request_id: Uuid::new_v4(),
+                topic: "Supported claim".into(),
+                source_version_ids: vec![chunk.source_version_id],
+                documents: vec![ContentCreateDocument {
+                    key: "article".into(),
+                    content_type: "faq".into(),
+                    title: None,
+                    instructions: None,
+                }],
+                language: "en".into(),
+                market: None,
+                audience: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(execution.origin.cycle_id().is_none());
+    let item = content
+        .list_items(scope, execution.execution_id)
+        .await
+        .unwrap()
+        .remove(0);
+    service
+        .prepare(
+            scope,
+            execution.execution_id,
+            item.item_id,
+            vec![ContentEvidence {
+                reference: EvidenceRef {
+                    source_version_id: chunk.source_version_id,
+                    chunk_id: Some(chunk.chunk_id),
+                    locator: chunk.locator.clone(),
+                },
+                exact_quote: chunk.text.clone(),
+            }],
+        )
+        .await
+        .unwrap();
+    let (token, _) = service
+        .begin_generate(scope, execution.execution_id, item.item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let revision = service
+        .finish_generate(
+            scope,
+            execution.execution_id,
+            item.item_id,
+            token,
+            ContentModelOutcome::Completed {
+                text: json!({"schema_version":2,"title":"Requested document","blocks":[{
+                    "kind":"paragraph","text":chunk.text,"citation_ids":[chunk.chunk_id],"items":[]
+                }]})
+                .to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    let lease = content
+        .claim(
+            scope,
+            execution.execution_id,
+            item.item_id,
+            ContentStep::Check,
+            geo_domain::RICH_CHECK_POLICY_VERSION,
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    content.complete_check(scope, &lease, vec![]).await.unwrap();
+    let account_id = match state
+        .channel_job_repository()
+        .get_target(scope, fixture.command_id)
+        .await
+        .unwrap()
+        .target
+        .input
+    {
+        ChannelTargetInput::GeneratedPublish { account_id, .. } => account_id,
+        _ => unreachable!(),
+    };
+    let account = state
+        .channel_service()
+        .repository
+        .get_account(scope, account_id)
+        .await
+        .unwrap()
+        .account;
+    let accepted = state
+        .content_distribution_request_repository()
+        .accept(
+            scope,
+            AcceptContentDistributionRequest {
+                revision: revision.clone(),
+                account,
+                placement_slot: "primary".into(),
+                format: geo_domain::TEXT_DISTRIBUTION_FORMAT.into(),
+                idempotency_key: "first-article".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let linked = state
+        .content_distribution_request_repository()
+        .materialize(scope, accepted.request_id)
+        .await
+        .unwrap();
+    let bundle = state
+        .distribution_repository()
+        .get_publication_bundle(scope, linked.publication_intent_id.unwrap())
+        .await
+        .unwrap();
+    let command_id = bundle.command.command_id;
+    let target = ChannelTarget {
+        target_id: command_id,
+        input: ChannelTargetInput::GeneratedPublish {
+            content_revision_id: revision.revision_id,
+            variant_id: bundle.variant.variant_id,
+            publication_intent_id: bundle.intent.intent_id,
+            distribution_target_id: Uuid::nil(),
+            origin_request_id: Some(accepted.request_id),
+            platform: "zhihu".into(),
+            account_id,
+            title: bundle.variant.title,
+            body_sha256: sha256_hex(bundle.variant.markdown.as_bytes()),
+            body: bundle.variant.markdown,
+            payload_hash: bundle.variant.payload_hash,
+            evidence: revision.evidence.clone(),
+            rich_payload: None,
+        },
+    };
+    state
+        .channel_job_repository()
+        .insert_generated_target(scope, Uuid::nil(), command_id, target)
+        .await
+        .unwrap();
+    fixture.command_id = command_id;
+    fixture.revision = revision;
+    fixture
+}
+
+#[tokio::test]
+async fn first_requested_plaintext_send_needs_no_settings_or_previous_success() {
+    let fixture = requested_fixture().await;
+    let key = ConnectorKey {
+        platform_id: "zhihu".into(),
+        placement_slot: "primary".into(),
+    };
+    let registry = fixture.state.connector_capability_repository();
+    assert!(
+        registry
+            .get(fixture.scope.operator_id, &key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        registry
+            .history(fixture.scope.operator_id, &key)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let result = execute_channel_target(&fixture.state, &fixture.scope, fixture.command_id)
+        .await
+        .unwrap();
+    let ChannelDispatchResult::Executed(view) = result else {
+        panic!("first requested article must dispatch");
+    };
+    assert_eq!(view.attempts.len(), 1);
+    let outcome = view.attempts[0].outcome.as_ref().unwrap();
+    assert_eq!(outcome.status, ChannelOutcomeStatus::Unsupported);
+    assert!(outcome.fixture);
+    assert_eq!(fixture.calls.sends.lock().await.len(), 1);
+    assert!(
+        registry
+            .history(fixture.scope.operator_id, &key)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        execute_channel_target(&fixture.state, &fixture.scope, fixture.command_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.calls.sends.lock().await.len(), 1);
+    fixture.server.abort();
+}
+
+#[tokio::test]
+async fn requested_plaintext_requires_one_versioned_publish_and_lookup_adapter() {
+    for connectors in [
+        json!([]),
+        json!([{"platform":"zhihu","placement_slot":"primary","connector_version":"test-live.v1","operations":["publish"]}]),
+        json!([{"platform":"zhihu","placement_slot":"primary","connector_version":"test-live.v1","operations":["lookup"]}]),
+        json!([{"platform":"zhihu","placement_slot":"primary","connector_version":" ","operations":["publish","lookup"]}]),
+        json!([{"platform":"other","placement_slot":"primary","connector_version":"test-live.v1","operations":["publish","lookup"]}]),
+        json!([{"platform":"zhihu","placement_slot":"secondary","connector_version":"test-live.v1","operations":["publish","lookup"]}]),
+        json!([
+            {"platform":"zhihu","placement_slot":"primary","connector_version":"test-live.v1","operations":["publish","lookup"]},
+            {"platform":"zhihu","placement_slot":"primary","connector_version":"test-live.v1","operations":[]}
+        ]),
+    ] {
+        let fixture = requested_fixture().await;
+        *fixture.calls.advertised_connectors.lock().await = Some(connectors);
+        assert!(matches!(
+            execute_channel_target(&fixture.state, &fixture.scope, fixture.command_id)
+                .await
+                .unwrap(),
+            ChannelDispatchResult::Deferred(ChannelDispatchDeferred::ConnectorUnavailable)
+        ));
+        assert!(fixture.calls.sends.lock().await.is_empty());
+        assert!(
+            fixture
+                .state
+                .channel_job_repository()
+                .get_target(&fixture.scope, fixture.command_id)
+                .await
+                .unwrap()
+                .attempts
+                .is_empty()
+        );
+        fixture.server.abort();
+    }
+}
+
+#[tokio::test]
+async fn requested_plaintext_honors_operator_format_and_disable_settings_without_proof() {
+    for (enabled, formats, allowed) in [
+        (
+            false,
+            vec![geo_domain::PLAIN_TEXT_ARTICLE_FORMAT.into()],
+            false,
+        ),
+        (true, vec![geo_domain::RICH_MARKDOWN_FORMAT.into()], false),
+        (true, vec!["company_profile".into()], false),
+        (
+            true,
+            vec![geo_domain::PLAIN_TEXT_ARTICLE_FORMAT.into()],
+            true,
+        ),
+        (true, vec!["faq".into()], true),
+    ] {
+        let mut fixture = requested_fixture().await;
+        fixture.state =
+            fixture
+                .state
+                .with_connector_capability_repository(Arc::new(SettingsOnlyCapability {
+                    settings: ConnectorSettings {
+                        key: ConnectorKey {
+                            platform_id: "zhihu".into(),
+                            placement_slot: "primary".into(),
+                        },
+                        revision: 1,
+                        enabled,
+                        content_types: formats,
+                    },
+                }));
+        let result = execute_channel_target(&fixture.state, &fixture.scope, fixture.command_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            matches!(result, ChannelDispatchResult::Executed(_)),
+            allowed
+        );
+        assert_eq!(fixture.calls.sends.lock().await.len(), usize::from(allowed));
+        fixture.server.abort();
+    }
+}
+
+/// A stored operator policy can outlive its proof history. Dispatch applies
+/// that policy without treating it as evidence of a prior publication.
+struct SettingsOnlyCapability {
+    settings: ConnectorSettings,
+}
+
+#[async_trait]
+impl ConnectorCapabilityRepository for SettingsOnlyCapability {
+    async fn get(
+        &self,
+        _: geo_domain::OperatorId,
+        key: &ConnectorKey,
+    ) -> Result<Option<ConnectorSettings>, AppError> {
+        Ok((key == &self.settings.key).then(|| self.settings.clone()))
+    }
+    async fn list(&self, _: geo_domain::OperatorId) -> Result<Vec<ConnectorSettings>, AppError> {
+        Ok(vec![self.settings.clone()])
+    }
+    async fn history(
+        &self,
+        _: geo_domain::OperatorId,
+        _: &ConnectorKey,
+    ) -> Result<Vec<ConnectorVerification>, AppError> {
+        Ok(vec![])
+    }
+    async fn configure(
+        &self,
+        _: geo_domain::OperatorId,
+        _: ConnectorKey,
+        _: i32,
+        _: bool,
+        _: Vec<String>,
+        _: &str,
+    ) -> Result<ConnectorSettings, AppError> {
+        Err(AppError::capability_missing("test policy is read-only"))
+    }
+    async fn insert_verification(
+        &self,
+        _: geo_domain::OperatorId,
+        _: ConnectorVerification,
+    ) -> Result<(), AppError> {
+        Err(AppError::capability_missing(
+            "test policy cannot record proof",
+        ))
+    }
+}
+
+#[tokio::test]
+async fn requested_plaintext_revoked_during_preflight_keeps_attempt_without_sending() {
+    let fixture = requested_fixture().await;
+    *fixture.calls.connector_settings.lock().await = Some(fixture.state.clone());
+    let result = execute_channel_target(&fixture.state, &fixture.scope, fixture.command_id)
+        .await
+        .unwrap();
+    let ChannelDispatchResult::Executed(view) = result else {
+        panic!("revocation must retain claimed attempt");
+    };
+    assert_eq!(view.attempts.len(), 1);
+    assert!(fixture.calls.sends.lock().await.is_empty());
     fixture.server.abort();
 }
 
