@@ -405,6 +405,7 @@ test("the current Rust op registration starts the bundle and serves explicit sou
   const opNames = registeredOps.match(/op_host_\w+/gu);
   assert.ok(opNames.includes("op_host_knowledge_text_read_v1"));
   assert.ok(opNames.includes("op_host_content_create_v1"));
+  assert.ok(opNames.includes("op_host_content_items_read_v1"));
   assert.ok(!opNames.includes("op_host_knowledge_search_v1"));
   const ops = Object.fromEntries(
     opNames.map((name) => [
@@ -455,6 +456,21 @@ test("the current Rust op registration starts the bundle and serves explicit sou
       status: "running",
     });
   };
+  ops.op_host_content_items_read_v1 = async (payload) => {
+    calls.push(["content_items_read", JSON.parse(payload)]);
+    return JSON.stringify({
+      execution_id: contentReference.execution_id,
+      total: 1,
+      items: [
+        {
+          item_id: contentReference.item_id,
+          document_key: "guide",
+          status: "ready",
+        },
+      ],
+      next_cursor: null,
+    });
+  };
   ops.op_host_model_complete_v1 = async (payload) => {
     const request = JSON.parse(payload);
     requests.push(request);
@@ -467,6 +483,10 @@ test("the current Rust op registration starts the bundle and serves explicit sou
       ["knowledge_text_read", manualReference],
       ["content_document_read", contentReference],
       ["content_create", contentRequest],
+      [
+        "content_items_read",
+        { execution_id: contentReference.execution_id, limit: 25 },
+      ],
     ][requests.length - 1];
     return JSON.stringify(
       step
@@ -495,8 +515,12 @@ test("the current Rust op registration starts the bundle and serves explicit sou
       ["knowledge_text_read", manualReference],
       ["content_document_read", contentReference],
       ["content_create", contentRequest],
+      [
+        "content_items_read",
+        { execution_id: contentReference.execution_id, limit: 25 },
+      ],
     ]);
-    assert.equal(requests.length, 4);
+    assert.equal(requests.length, 5);
     assert.match(requests[1].messages.at(-1).content, /Two years/u);
     assert.equal(emitted.length, 1);
     assert.equal(emitted[0][0], "loop.completed");
@@ -1168,6 +1192,7 @@ test("report reduction and immutable read are exposed as separate scoped host to
         "content_start",
         "content_create",
         "content_execution_read",
+        "content_items_read",
         "content_media_list",
         "content_document_read",
         "content_media_insert",
@@ -1631,6 +1656,7 @@ test("attachment-only turn imports bound items, reads its exact source version, 
         "content_start",
         "content_create",
         "content_execution_read",
+        "content_items_read",
         "content_media_list",
         "content_document_read",
         "content_media_insert",
@@ -2526,6 +2552,209 @@ test("homepage content create discovers a scoped schema and preserves its frozen
     });
     assert.equal(result.answer, "The two content documents are queued.");
     assert.deepEqual(calls, [request, request]);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("created content discovers paged item IDs before reading the actual persisted document", async () => {
+  const request = {
+    request_id: "00000000-0000-4000-8000-000000000321",
+    topic: "Equipment upkeep",
+    source_version_ids: [manualReference.source_version_id],
+    documents: [
+      {
+        key: "guide",
+        content_type: "article",
+        title: null,
+        instructions: null,
+      },
+      {
+        key: "questions",
+        content_type: "faq",
+        title: null,
+        instructions: null,
+      },
+    ],
+    language: "en",
+    market: null,
+    audience: null,
+  };
+  const executionId = "00000000-0000-4000-8000-000000000322";
+  const itemId = "00000000-0000-4000-8000-000000000323";
+  const otherItemId = "00000000-0000-4000-8000-000000000324";
+  const cursor = "opaque-next-document-page";
+  const document = {
+    execution_id: executionId,
+    item_id: itemId,
+    current_revision_id: "00000000-0000-4000-8000-000000000325",
+    document: {
+      schema_version: 2,
+      title: "Stored equipment guide",
+      blocks: [],
+    },
+  };
+  const receipt = {
+    execution_id: executionId,
+    origin: { kind: "on_demand", request },
+    status: "running",
+    handoff_id: null,
+    coverage: {
+      total: 2,
+      ready: 0,
+      blocked: 0,
+      deferred: 0,
+      not_applicable: 0,
+      cancelled: 0,
+      incomplete: 2,
+    },
+  };
+  const calls = [];
+  let modelCall = 0;
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async contentCreate(input) {
+      calls.push(["create", input]);
+      assert.deepEqual(input, request);
+      return receipt;
+    },
+    async contentExecutionRead(input) {
+      calls.push(["read", input]);
+      assert.deepEqual(input, { execution_id: executionId });
+      return {
+        ...receipt,
+        status: "closed",
+        handoff_id: "00000000-0000-4000-8000-000000000326",
+        coverage: { ...receipt.coverage, ready: 2, incomplete: 0 },
+      };
+    },
+    async contentItemsRead(input) {
+      calls.push(["items", input]);
+      assert.equal(input.execution_id, executionId);
+      assert.equal(input.limit, 1);
+      if (input.cursor === undefined) {
+        return {
+          execution_id: executionId,
+          total: 2,
+          items: [
+            {
+              item_id: otherItemId,
+              document_key: "questions",
+              status: "ready",
+            },
+          ],
+          next_cursor: cursor,
+        };
+      }
+      assert.equal(input.cursor, cursor);
+      return {
+        execution_id: executionId,
+        total: 2,
+        items: [{ item_id: itemId, document_key: "guide", status: "ready" }],
+        next_cursor: null,
+      };
+    },
+    async contentDocumentRead(input) {
+      calls.push(["document", input]);
+      assert.deepEqual(input, { execution_id: executionId, item_id: itemId });
+      return document;
+    },
+    async modelComplete(input) {
+      const schema = input.tools.find(
+        (tool) => tool.function.name === "content_items_read",
+      ).function.parameters;
+      assert.equal(schema.additionalProperties, false);
+      assert.deepEqual(schema.required, ["execution_id"]);
+      assert.deepEqual(Object.keys(schema.properties), [
+        "execution_id",
+        "cursor",
+        "limit",
+      ]);
+      assert.equal(schema.properties.execution_id.format, "uuid");
+      assert.deepEqual(schema.properties.limit, {
+        type: "integer",
+        minimum: 1,
+        maximum: 100,
+      });
+      assert.match(
+        input.system,
+        /page content_items_read for actual item_id references/u,
+      );
+      assert.match(input.system, /Never guess item IDs/u);
+      const previous = modelCall
+        ? JSON.parse(input.messages.at(-1).content)
+        : null;
+      let tool;
+      switch (modelCall++) {
+        case 0:
+          tool = ["content_create", request];
+          break;
+        case 1:
+          assert.equal(previous.item_id, undefined);
+          tool = [
+            "content_execution_read",
+            { execution_id: previous.execution_id },
+          ];
+          break;
+        case 2:
+          assert.equal(previous.status, "closed");
+          assert.equal(previous.item_id, undefined);
+          tool = [
+            "content_items_read",
+            { execution_id: previous.execution_id, limit: 1 },
+          ];
+          break;
+        case 3:
+          assert.equal(previous.items[0].document_key, "questions");
+          tool = [
+            "content_items_read",
+            {
+              execution_id: previous.execution_id,
+              cursor: previous.next_cursor,
+              limit: 1,
+            },
+          ];
+          break;
+        case 4:
+          assert.equal(previous.items[0].document_key, "guide");
+          tool = [
+            "content_document_read",
+            {
+              execution_id: previous.execution_id,
+              item_id: previous.items[0].item_id,
+            },
+          ];
+          break;
+        default:
+          assert.deepEqual(previous, document);
+          return finalModelAnswer("Stored equipment guide is available.");
+      }
+      return {
+        ...finalModelAnswer(""),
+        finish_reason: "tool_calls",
+        tool_calls: [
+          {
+            id: `content-discovery-${modelCall}`,
+            type: "function",
+            function: { name: tool[0], arguments: JSON.stringify(tool[1]) },
+          },
+        ],
+      };
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?itemDiscovery=${Date.now()}`
+    );
+    const result = await main({
+      ...historyTurn,
+      prompt: "Create a guide and FAQ and show the guide",
+    });
+    assert.equal(result.answer, "Stored equipment guide is available.");
+    assert.deepEqual(
+      calls.map(([name]) => name),
+      ["create", "read", "items", "items", "document"],
+    );
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }
