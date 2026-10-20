@@ -2197,6 +2197,13 @@
 - 本机已验证当前锁定 `v8 150.4.0` 的 Windows archive 已落在 `I:\cargo\.rusty_v8`（约 39 MB）；本地 Cargo 可直接复用该缓存。完整 CI artifact 下载链路待下一次 GitHub Actions 成功运行后复核。
 - 加强 V8 artifact 恢复：README 现在按当前 commit 选择成功的 CI run；恢复脚本要求完整 target/V8/rustc 元数据，拒绝空清单、重复或带路径分隔符的 archive，并保留 URL 转义后的 Cargo cache 键。新增 PowerShell 回归覆盖正常恢复、Linux target、哈希篡改和路径穿越拒绝；Windows CI 在上传前从干净 Cargo home 复跑恢复脚本。当前本地 fixture 测试通过，真实 GitHub Actions 下载链路仍需成功 run 后复核。
 
+# 2026-10-20 对话模型消息与发布链接
+
+- 工作台保留 canonical messages，移除重复传递的顶层 system；内容工作流使用的独立 system/prompt 路径不变。回归覆盖首次请求及工具返回后的消息顺序和调用关联。
+- AI 发布状态读取补充既有 HTTP 投影的 `public_url`，不从候选地址推断发布成功；host 契约为 v25，仍为 53 项，无数据库迁移。
+- 本地验证：Agent Runtime 76 项、发布请求 API 10 项、单篇延后 DTO 1 项、内容工具 7 项通过；包格式及两份 bundle 构建通过。独立 Astra 第一轮审查无阻断项。
+- 完整工具集合的独立真实模型探测返回 HTTP 200；它没有执行业务工具，不等于原研究任务或正式内容生成完成，也不能证明重复消息导致此前 HTTP 503。本条记录源码验证，部署与真实内容验收仍待完成。
+
 # 2026-10-20 按需内容生成集成检查
 
 - 新增项目级按需内容入口与 `content_create` 工具，复用现有资产、生成、检查和修正；请求冻结精确来源与文档类型，允许无品牌、无周期的草稿项目。封存按需执行不自动分发。

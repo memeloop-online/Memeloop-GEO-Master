@@ -945,6 +945,7 @@ fn content_distribute_ref(request: geo_domain::ContentDistributionRequest) -> Co
         attempt_id: None,
         outcome: None,
         fixture: None,
+        public_url: None,
     }
 }
 
@@ -1477,6 +1478,7 @@ impl HostOps for RepositoryHostOps {
                 .to_owned()
         });
         result.fixture = publication.fixture;
+        result.public_url = publication.public_url;
         Ok(result)
     }
 
