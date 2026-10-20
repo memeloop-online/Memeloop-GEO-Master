@@ -1104,6 +1104,121 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
             ..
         } if id == rich_request.request_id && payload == rich_payload
     ));
+
+    // A first short post shares the request/intent/outbox path, but freezes
+    // its own placement and body and proves only that placement.
+    let mut short_account = ready_account.clone();
+    short_account.account_id = Uuid::new_v4();
+    short_account.platform = "zhihu".into();
+    sqlx::query("INSERT INTO channel_accounts (operator_id,tenant_id,project_id,account_id,platform,metadata) VALUES ($1,$2,$3,$4,'zhihu',$5)")
+        .bind(operator).bind(tenant).bind(project.id.as_uuid())
+        .bind(short_account.account_id).bind(serde_json::to_value(&short_account).unwrap())
+        .execute(database.pool()).await.unwrap();
+    let mut short_input = first_input.clone();
+    short_input.account = short_account;
+    short_input.placement_slot = "short_post".into();
+    short_input.idempotency_key = "independent-short".into();
+    let short_request = repository
+        .accept(&scope, short_input.clone())
+        .await
+        .unwrap();
+    let short_request = repository
+        .materialize(&scope, short_request.request_id)
+        .await
+        .unwrap();
+    let short_intent_id = short_request.publication_intent_id.unwrap();
+    assert_ne!(short_intent_id, first_intent);
+    let short_bundle = distribution
+        .get_publication_bundle(&scope, short_intent_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        short_bundle.variant.markdown,
+        eligible.document.markdown_body()
+    );
+    assert_eq!(short_bundle.variant.title, eligible.document.title);
+    let short_jobs = jobs.materialize_pending_commands(None, 100).await.unwrap();
+    assert_eq!(short_jobs.len(), 1);
+    let short_target_id = short_jobs[0].target_id;
+    let short_frozen = jobs.get_target(&scope, short_target_id).await.unwrap();
+    assert!(
+        matches!(short_frozen.target.input, geo_domain::ChannelTargetInput::GeneratedPublish {
+        ref placement_slot, ref body, origin_request_id: Some(id), ..
+    } if placement_slot == "short_post" && body == &eligible.document.markdown_body() && id == short_request.request_id)
+    );
+    let attempt_id = Uuid::new_v4();
+    let now = Utc::now();
+    jobs.claim(&scope, short_target_id, attempt_id, now)
+        .await
+        .unwrap();
+    let expected = geo_domain::plain_text_publication_readback_hash(
+        "short_post",
+        &eligible.document.title,
+        &eligible.document.markdown_body(),
+    );
+    let public_url = "https://www.zhihu.com/pin/123456";
+    jobs.finish(&scope, short_target_id, attempt_id, geo_domain::ChannelOutcome {
+        status: geo_domain::ChannelOutcomeStatus::Verified,
+        detail: None,
+        occurred_at: now,
+        raw_answer: None,
+        citations: vec![],
+        public_url: Some(public_url.into()),
+        screenshot_ref: None,
+        connector_version: Some("browser.v1".into()),
+        fixture: false,
+        runner_evidence: vec![
+            serde_json::json!({"kind":"public_readback","url":public_url,"content_matched":true,
+                "owned_by_account":true,"expected_sha256":expected,"readback_sha256":expected}),
+            serde_json::json!({"kind":"runner_receipt","schema_version":"geo.runner.receipt.v1",
+                "provenance":"live","execution_id":attempt_id,"connector_version":"browser.v1","occurred_at":now}),
+        ],
+    }, now).await.unwrap();
+    let capabilities = geo_persistence::PgConnectorCapabilityRepository::from_database(&database);
+    let proof = capabilities
+        .project_saved_publication_verification(&scope, short_target_id, attempt_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(proof.key.placement_slot, "short_post");
+    assert_eq!(
+        capabilities
+            .project_saved_publication_verification(&scope, short_target_id, attempt_id)
+            .await
+            .unwrap(),
+        Some(proof.clone())
+    );
+    use geo_domain::ConnectorCapabilityRepository;
+    assert_eq!(
+        capabilities
+            .history(
+                scope.operator_id,
+                &geo_domain::ConnectorKey {
+                    platform_id: "zhihu".into(),
+                    placement_slot: "primary".into(),
+                }
+            )
+            .await
+            .unwrap(),
+        vec![]
+    );
+    short_input.idempotency_key = "independent-short-repeated".into();
+    let repeated_short = repository.accept(&scope, short_input).await.unwrap();
+    assert_eq!(
+        repository
+            .materialize(&scope, repeated_short.request_id)
+            .await
+            .unwrap()
+            .publication_intent_id,
+        Some(short_intent_id)
+    );
+    assert!(
+        jobs.materialize_pending_commands(None, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
     sqlx::query(
         "UPDATE knowledge_sources SET purpose='internal' \
          WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND source_id=$4",

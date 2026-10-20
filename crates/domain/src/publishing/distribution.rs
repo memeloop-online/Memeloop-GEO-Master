@@ -40,7 +40,7 @@ fn identity(parts: &[&str]) -> Uuid {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlatformPlacement {
     pub platform_id: String,
-    /// Only the primary placement is covered. Extra accounts do not multiply coverage.
+    /// A distinct publication surface. Extra accounts do not multiply coverage.
     pub placement_slot: String,
     pub capability_version: String,
     pub supported_formats: Vec<String>,
@@ -235,6 +235,11 @@ impl PublicationBundle {
             }
         } else if self.revision.document.requires_rich_publication() {
             return Err(AppError::conflict("rich publication payload is missing"));
+        } else if self.variant.placement_slot == "short_post"
+            && (self.variant.markdown != self.revision.document.markdown_body()
+                || self.variant.title != self.revision.document.title)
+        {
+            return Err(AppError::conflict("short publication revision differs"));
         }
         let expected = match &self.origin {
             PublicationOrigin::CoverageTarget { target }
@@ -263,6 +268,8 @@ impl PublicationBundle {
             || self.command.payload_hash != self.intent.payload_hash
             || self.intent.payload_hash != self.variant.payload_hash
             || self.intent.variant_id != self.variant.variant_id
+            || self.intent.platform_id != self.variant.platform_id
+            || self.intent.placement_slot != self.variant.placement_slot
         {
             return Err(AppError::conflict("publication origin binding differs"));
         }
@@ -718,7 +725,11 @@ fn prepare_versioned_variant(
         ));
     }
     let title = revision.document.title.clone();
-    let markdown = revision.markdown.clone();
+    let markdown = if placement.placement_slot == "short_post" {
+        revision.document.markdown_body()
+    } else {
+        revision.markdown.clone()
+    };
     let payload_hash = digest(&[&title, &markdown]);
     let variant_id = identity(&[
         &revision.revision_id.to_string(),
@@ -2060,21 +2071,21 @@ mod report_evidence_tests {
             updated_at: Utc::now(),
         };
         let storage = MemoryDistributionRepository::new();
-        let make_request = |key: &str| {
+        let make_request = |key: &str, placement: &str| {
             prepare_content_distribution_request(
                 &scope,
                 &AcceptContentDistributionRequest {
                     revision: revision.clone(),
                     account: account.clone(),
-                    placement_slot: "primary".into(),
+                    placement_slot: placement.into(),
                     format: TEXT_DISTRIBUTION_FORMAT.into(),
                     idempotency_key: key.into(),
                 },
             )
             .unwrap()
         };
-        let first = make_request("first");
-        let second = make_request("second");
+        let first = make_request("first", "primary");
+        let second = make_request("second", "primary");
         let intent = storage
             .materialize_request_origin(&scope, &first, &revision)
             .await
@@ -2093,5 +2104,37 @@ mod report_evidence_tests {
             matches!(bundle.origin, PublicationOrigin::ContentRequest { request }
             if request.request_id == first.request_id)
         );
+        assert_eq!(bundle.variant.markdown, revision.markdown);
+        let short_request = make_request("short", "short_post");
+        let short = storage
+            .materialize_request_origin(&scope, &short_request, &revision)
+            .await
+            .unwrap();
+        assert_ne!(short.intent_id, intent.intent_id);
+        let short_bundle = storage
+            .get_publication_bundle(&scope, short.intent_id)
+            .await
+            .unwrap();
+        assert_eq!(short_bundle.variant.placement_slot, "short_post");
+        assert_eq!(short_bundle.variant.title, revision.document.title);
+        assert_eq!(short_bundle.variant.markdown, "Cited text");
+        assert_eq!(
+            short_bundle.variant.markdown,
+            revision.document.markdown_body()
+        );
+        assert_ne!(
+            short_bundle.variant.payload_hash,
+            bundle.variant.payload_hash
+        );
+        let short_reused = storage
+            .materialize_request_origin(
+                &scope,
+                &make_request("short-again", "short_post"),
+                &revision,
+            )
+            .await
+            .unwrap();
+        assert_eq!(short_reused.intent_id, short.intent_id);
+        assert_eq!(storage.publication_commands(&scope).await.len(), 2);
     }
 }

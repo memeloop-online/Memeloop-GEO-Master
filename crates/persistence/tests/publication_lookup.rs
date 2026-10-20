@@ -131,6 +131,7 @@ async fn lookup_is_scoped_fenced_append_only_and_never_rewrites_send() {
     let target = ChannelTarget {
         target_id,
         input: ChannelTargetInput::Publish {
+            placement_slot: "primary".into(),
             source_id: Uuid::new_v4(),
             source_version_id: Uuid::new_v4(),
             platform: "zhihu".into(),
@@ -949,6 +950,7 @@ async fn discovery_paginates_ambiguous_sends_and_enriches_only_newly_finalized_j
     let publication = || ChannelTarget {
         target_id: Uuid::new_v4(),
         input: ChannelTargetInput::Publish {
+            placement_slot: "primary".into(),
             source_id: Uuid::new_v4(),
             source_version_id: Uuid::new_v4(),
             platform: "zhihu".into(),

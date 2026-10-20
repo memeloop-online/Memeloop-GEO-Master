@@ -979,6 +979,7 @@ async fn publication_target_resolves_original_across_cycles_without_mutation_or_
         distribution_target_id: sent.target_id,
         origin_request_id: None,
         platform: sent.platform_id.clone(),
+        placement_slot: sent.placement_slot.clone(),
         account_id,
         title: bundle.variant.title.clone(),
         body_sha256: geo_domain::sha256_hex(bundle.variant.markdown.as_bytes()),

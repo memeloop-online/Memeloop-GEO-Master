@@ -373,6 +373,7 @@ impl ChannelService {
         scope: &TenantScope,
         account_id: Uuid,
         attempt_id: Uuid,
+        placement_slot: &str,
     ) -> Result<(Uuid, ChannelSecret, ChannelSessionVersion), AppError> {
         self.resume_available_browser_bound_inner(
             scope,
@@ -380,6 +381,7 @@ impl ChannelService {
             attempt_id,
             Uuid::new_v4(),
             None,
+            placement_slot,
         )
         .await
     }
@@ -391,6 +393,7 @@ impl ChannelService {
         attempt_id: Uuid,
         session_id: Uuid,
         reservation_id: Uuid,
+        placement_slot: &str,
     ) -> Result<(Uuid, ChannelSecret, ChannelSessionVersion), AppError> {
         self.resume_available_browser_bound_inner(
             scope,
@@ -398,6 +401,7 @@ impl ChannelService {
             attempt_id,
             session_id,
             Some(reservation_id),
+            placement_slot,
         )
         .await
     }
@@ -409,11 +413,12 @@ impl ChannelService {
         attempt_id: Uuid,
         session_id: Uuid,
         reservation_id: Option<Uuid>,
+        placement_slot: &str,
     ) -> Result<(Uuid, ChannelSecret, ChannelSessionVersion), AppError> {
         let prepared = self.prepare_available_browser(scope, account_id).await?;
         let session_version = prepared.session_version(account_id);
         let version = self
-            .publication_connector_version(&prepared.platform, "publish")
+            .publication_connector_version(&prepared.platform, placement_slot, "publish")
             .await?;
         let operation = self
             .prepare_owned_browser(
@@ -431,6 +436,7 @@ impl ChannelService {
             account_id,
             owner_kind: prepared.owner_kind,
             platform: prepared.platform.clone(),
+            placement_slot: placement_slot.to_owned(),
             platform_account_id: prepared.platform_account_id.clone(),
             connector_version: version,
             effective_proxy: serde_json::to_value(self.operation_proxy(&operation, scope)?)
@@ -462,6 +468,7 @@ impl ChannelService {
         account_id: Uuid,
         attempt_id: Uuid,
         binding: &ChannelSecret,
+        placement_slot: &str,
     ) -> Result<(Uuid, String, String), AppError> {
         self.resume_publication_lookup_browser_inner(
             scope,
@@ -470,10 +477,12 @@ impl ChannelService {
             binding,
             Uuid::new_v4(),
             None,
+            placement_slot,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn resume_publication_lookup_browser_reserved(
         &self,
         scope: &TenantScope,
@@ -482,6 +491,7 @@ impl ChannelService {
         binding: &ChannelSecret,
         session_id: Uuid,
         reservation_id: Uuid,
+        placement_slot: &str,
     ) -> Result<(Uuid, String, String), AppError> {
         self.resume_publication_lookup_browser_inner(
             scope,
@@ -490,10 +500,12 @@ impl ChannelService {
             binding,
             session_id,
             Some(reservation_id),
+            placement_slot,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn resume_publication_lookup_browser_inner(
         &self,
         scope: &TenantScope,
@@ -502,12 +514,14 @@ impl ChannelService {
         binding: &ChannelSecret,
         session_id: Uuid,
         reservation_id: Option<Uuid>,
+        placement_slot: &str,
     ) -> Result<(Uuid, String, String), AppError> {
         let bytes = self.decrypt(scope, attempt_id, "publication_execution", binding)?;
         let original: PublicationBrowserBinding = serde_json::from_slice(&bytes)
             .map_err(|_| AppError::conflict("publication browser binding is invalid"))?;
         if !matches!(original.version, 1 | 2)
             || original.account_id != account_id
+            || original.placement_slot != placement_slot
             || original.platform_account_id.trim().is_empty()
             || original.connector_version.trim().is_empty()
         {
@@ -527,7 +541,7 @@ impl ChannelService {
             ));
         }
         if self
-            .publication_connector_version(&current.platform, "lookup")
+            .publication_connector_version(&current.platform, placement_slot, "lookup")
             .await?
             != original.connector_version
         {
@@ -588,6 +602,7 @@ impl ChannelService {
         attempt_id: Uuid,
         binding: &ChannelSecret,
         platform: &str,
+        placement_slot: &str,
     ) -> Option<String> {
         let bytes = self
             .decrypt(scope, attempt_id, "publication_execution", binding)
@@ -596,6 +611,7 @@ impl ChannelService {
         (matches!(original.version, 1 | 2)
             && original.account_id == account_id
             && original.platform == platform
+            && original.placement_slot == placement_slot
             && !original.platform_account_id.trim().is_empty()
             && !original.connector_version.trim().is_empty()
             && original.connector_version.len() <= 100
@@ -687,12 +703,13 @@ impl ChannelService {
     async fn publication_connector_version(
         &self,
         platform: &str,
+        placement_slot: &str,
         operation: &str,
     ) -> Result<String, AppError> {
         let capabilities = self.browser()?.capabilities().await?;
         let connector = capabilities.connectors.into_iter().find(|connector| {
             connector.platform == platform
-                && connector.placement_slot == "primary"
+                && connector.placement_slot == placement_slot
                 && connector.operations.iter().any(|op| op == operation)
                 && !connector.connector_version.trim().is_empty()
                 && connector.connector_version.len() <= 100
@@ -871,6 +888,7 @@ struct PublicationBrowserBinding {
     account_id: Uuid,
     owner_kind: ChannelOwnerKind,
     platform: String,
+    placement_slot: String,
     platform_account_id: String,
     connector_version: String,
     // Null means direct access. Any selected proxy includes credentials, all
@@ -4126,7 +4144,7 @@ mod publication_binding_tests {
         set_default_proxy(&service, &scope, Some("proxy-secret")).await;
         let attempt = Uuid::new_v4();
         let (session_id, bound, _) = service
-            .resume_available_browser_bound(&scope, account_id, attempt)
+            .resume_available_browser_bound(&scope, account_id, attempt, "primary")
             .await
             .unwrap();
         service
@@ -4159,7 +4177,7 @@ mod publication_binding_tests {
             .await
             .unwrap();
         let (lookup_session, identity, version) = service
-            .resume_publication_lookup_browser(&scope, account_id, attempt, &bound)
+            .resume_publication_lookup_browser(&scope, account_id, attempt, &bound, "primary")
             .await
             .unwrap();
         assert_eq!(
@@ -4176,7 +4194,13 @@ mod publication_binding_tests {
             .unwrap();
         assert!(
             service
-                .resume_publication_lookup_browser(&scope, account_id, Uuid::new_v4(), &bound)
+                .resume_publication_lookup_browser(
+                    &scope,
+                    account_id,
+                    Uuid::new_v4(),
+                    &bound,
+                    "primary"
+                )
                 .await
                 .is_err()
         );
@@ -4187,14 +4211,20 @@ mod publication_binding_tests {
         );
         assert!(
             service
-                .resume_publication_lookup_browser(&other_scope, account_id, attempt, &bound)
+                .resume_publication_lookup_browser(
+                    &other_scope,
+                    account_id,
+                    attempt,
+                    &bound,
+                    "primary"
+                )
                 .await
                 .is_err()
         );
         for replacement in [None, Some("changed-secret")] {
             replace_account_route(&service, &scope, account_id, replacement).await;
             let (lookup_session, _, _) = service
-                .resume_publication_lookup_browser(&scope, account_id, attempt, &bound)
+                .resume_publication_lookup_browser(&scope, account_id, attempt, &bound, "primary")
                 .await
                 .unwrap();
             assert_eq!(
@@ -4214,7 +4244,7 @@ mod publication_binding_tests {
             .unwrap();
         assert!(
             service
-                .resume_publication_lookup_browser(&scope, account_id, attempt, &bound)
+                .resume_publication_lookup_browser(&scope, account_id, attempt, &bound, "primary")
                 .await
                 .is_err()
         );
@@ -4227,7 +4257,7 @@ mod publication_binding_tests {
         *stub.version.lock().await = "connector.v2".into();
         assert!(
             service
-                .resume_publication_lookup_browser(&scope, account_id, attempt, &bound)
+                .resume_publication_lookup_browser(&scope, account_id, attempt, &bound, "primary")
                 .await
                 .is_err()
         );
@@ -4260,6 +4290,7 @@ mod publication_binding_tests {
             account_id,
             owner_kind: ChannelOwnerKind::Customer,
             platform: "zhihu".into(),
+            placement_slot: "primary".into(),
             platform_account_id: "original-identity".into(),
             connector_version: "connector.v1".into(),
             effective_proxy: json!({"server":"http://127.0.0.1:9191","username":null,"password":"historical-secret"}),
@@ -4275,7 +4306,7 @@ mod publication_binding_tests {
             )
             .unwrap();
         let (session, _, _) = service
-            .resume_publication_lookup_browser(&scope, account_id, attempt, &sealed)
+            .resume_publication_lookup_browser(&scope, account_id, attempt, &sealed, "primary")
             .await
             .unwrap();
         assert_eq!(
@@ -4294,7 +4325,13 @@ mod publication_binding_tests {
             .unwrap();
         assert!(
             service
-                .resume_publication_lookup_browser(&scope, account_id, attempt, &incomplete)
+                .resume_publication_lookup_browser(
+                    &scope,
+                    account_id,
+                    attempt,
+                    &incomplete,
+                    "primary"
+                )
                 .await
                 .is_err()
         );
@@ -4345,7 +4382,7 @@ mod publication_binding_tests {
             .unwrap();
         let attempt = Uuid::new_v4();
         let (_, bound, mut version) = service
-            .resume_available_browser_bound(&scope, pool_id, attempt)
+            .resume_available_browser_bound(&scope, pool_id, attempt, "primary")
             .await
             .unwrap();
         let verified = crate::browser_bridge::VerifiedBrowserSession {
@@ -4402,7 +4439,7 @@ mod publication_binding_tests {
         );
         assert!(
             service
-                .resume_publication_lookup_browser(&scope, pool_id, attempt, &bound)
+                .resume_publication_lookup_browser(&scope, pool_id, attempt, &bound, "primary")
                 .await
                 .is_err()
         );
@@ -4429,7 +4466,7 @@ mod publication_binding_tests {
         );
         assert!(
             service
-                .resume_publication_lookup_browser(&scope, pool_id, attempt, &bound)
+                .resume_publication_lookup_browser(&scope, pool_id, attempt, &bound, "primary")
                 .await
                 .is_err()
         );

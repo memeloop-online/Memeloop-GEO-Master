@@ -220,26 +220,41 @@ export function createRunner(options = {}) {
             Array.isArray(adapter.operations) &&
             adapter.operations.every((operation) => OPERATIONS.has(operation)),
         )
-        .map(([platform, adapter]) => ({
-          platform,
-          placement_slot: "primary",
-          connector_version: adapter.connectorVersion,
-          model_discovery_supported:
-            typeof adapter.inspectMeasurementOptions === "function",
-          operations: adapter.operations.filter(
-            (operation) =>
-              operation !== "rich_publish" ||
-              typeof adapter.executeRich === "function",
-          ),
-          // Presence in a deployed runner is not live account verification.
-          verified: false,
-          ...(typeof adapter.loginEntryAvailable === "boolean"
-            ? { login_entry_available: adapter.loginEntryAvailable }
-            : {}),
-          ...(typeof adapter.loginSupported === "boolean"
-            ? { login_supported: adapter.loginSupported }
-            : {}),
-        })),
+        .flatMap(([platform, adapter]) =>
+          Object.entries(
+            adapter.placements ?? {
+              primary: { operations: adapter.operations },
+            },
+          )
+            .filter(
+              ([slot, placement]) =>
+                /^[a-z][a-z0-9_]{0,63}$/.test(slot) &&
+                Array.isArray(placement?.operations) &&
+                placement.operations.every((operation) =>
+                  OPERATIONS.has(operation),
+                ),
+            )
+            .map(([slot, placement]) => ({
+              platform,
+              placement_slot: slot,
+              connector_version: adapter.connectorVersion,
+              model_discovery_supported:
+                typeof adapter.inspectMeasurementOptions === "function",
+              operations: placement.operations.filter(
+                (operation) =>
+                  operation !== "rich_publish" ||
+                  typeof adapter.executeRich === "function",
+              ),
+              // Presence in a deployed runner is not live account verification.
+              verified: false,
+              ...(typeof adapter.loginEntryAvailable === "boolean"
+                ? { login_entry_available: adapter.loginEntryAvailable }
+                : {}),
+              ...(typeof adapter.loginSupported === "boolean"
+                ? { login_supported: adapter.loginSupported }
+                : {}),
+            })),
+        ),
     };
   }
 
@@ -653,7 +668,21 @@ export function createRunner(options = {}) {
         evidence: [],
         ...hostReceipt,
       };
-    if (!record.adapter.operations?.includes(input.operation)) {
+    const placementSlot =
+      input.payload.placement_slot === undefined
+        ? "primary"
+        : input.payload.placement_slot;
+    const placementOperations =
+      typeof placementSlot !== "string"
+        ? []
+        : record.adapter.placements
+          ? Object.hasOwn(record.adapter.placements, placementSlot)
+            ? record.adapter.placements[placementSlot].operations
+            : []
+          : placementSlot === "primary"
+            ? record.adapter.operations
+            : [];
+    if (!placementOperations?.includes(input.operation)) {
       return {
         status: "unsupported",
         reason: "operation_not_supported",

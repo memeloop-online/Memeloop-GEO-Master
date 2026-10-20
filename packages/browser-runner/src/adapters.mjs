@@ -10,6 +10,7 @@ import { observeDeepSeekWebSearch } from "./deepseek-web-search.mjs";
 import { inspectDeepSeekMeasurementOptions } from "./deepseek-model-discovery.mjs";
 import { capturedNewConversationId } from "./provider-conversation-ownership.mjs";
 import { consumerWebProviders } from "./consumer-web-providers.mjs";
+import { publishShortPost, lookupShortPost } from "./short-publication.mjs";
 import {
   probeGlmAccount,
   probeDeepseekAccount,
@@ -733,6 +734,7 @@ function contentPayload(payload, allowUrl = false) {
       (key) =>
         key !== "title" &&
         key !== "body" &&
+        !(key === "placement_slot" && payload.placement_slot === "primary") &&
         !(allowUrl && key === "public_url"),
     ) ||
     typeof payload.title !== "string" ||
@@ -749,6 +751,47 @@ function contentPayload(payload, allowUrl = false) {
 
 function normalized(text) {
   return text.replace(/\s+/gu, " ").trim();
+}
+
+function shortPostPayload(payload, lookup = false) {
+  if (
+    payload === null ||
+    typeof payload !== "object" ||
+    Array.isArray(payload) ||
+    Object.keys(payload).some(
+      (key) =>
+        !["placement_slot", "title", "body"].includes(key) &&
+        !(lookup && ["external_id", "public_url"].includes(key)),
+    )
+  )
+    return null;
+  const content = {
+    body: payload.body,
+    ...(payload.title !== undefined ? { title: payload.title } : {}),
+  };
+  if (!lookup) return content;
+  let externalId = payload.external_id;
+  if (payload.public_url !== undefined) {
+    let url;
+    try {
+      url = new URL(payload.public_url);
+    } catch {
+      return null;
+    }
+    const match = /^\/pin\/(\d+)\/?$/.exec(url.pathname);
+    if (
+      url.origin !== "https://www.zhihu.com" ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      !match ||
+      (externalId !== undefined && externalId !== match[1])
+    )
+      return null;
+    externalId = match[1];
+  }
+  return { ...content, external_id: externalId };
 }
 
 function zhihuPostUrl(value, origin = ZHIHU_POST_ORIGIN) {
@@ -1263,10 +1306,37 @@ export const adapters = Object.freeze({
     origin: "https://www.zhihu.com",
     entry: "https://www.zhihu.com/creator",
     operations: Object.freeze(["publish", "lookup"]),
+    placements: Object.freeze({
+      primary: Object.freeze({
+        operations: Object.freeze(["publish", "lookup"]),
+      }),
+      short_post: Object.freeze({
+        operations: Object.freeze(["publish", "lookup"]),
+      }),
+    }),
     identify(page) {
       return probeOwnAccount(page, ZHIHU_SELF, zhihuIdentity);
     },
     async execute(page, operation, payload, network) {
+      const slot =
+        payload?.placement_slot === undefined
+          ? "primary"
+          : payload.placement_slot;
+      if (slot === "short_post") {
+        if (!["publish", "lookup"].includes(operation))
+          return unsupported("operation_not_supported");
+        const content = shortPostPayload(payload, operation === "lookup");
+        if (!content)
+          return unsupported(
+            operation === "lookup"
+              ? "invalid_lookup_payload"
+              : "invalid_content_payload",
+          );
+        return operation === "publish"
+          ? publishShortPost(page, content, network)
+          : lookupShortPost(page, content, network);
+      }
+      if (slot !== "primary") return unsupported("placement_not_supported");
       if (operation === "publish") return publishZhihu(page, payload, network);
       if (operation === "lookup") {
         const content = contentPayload(payload, true);

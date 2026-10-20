@@ -396,6 +396,7 @@ async fn frozen_channel_plan_claim_finish_and_report_denominator_in_postgres() {
             ChannelTarget {
                 target_id: publication_id,
                 input: ChannelTargetInput::Publish {
+                    placement_slot: "primary".into(),
                     source_id: Uuid::new_v4(),
                     source_version_id: Uuid::new_v4(),
                     platform: "fixture_platform".into(),

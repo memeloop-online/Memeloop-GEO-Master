@@ -167,6 +167,7 @@ const capabilities: ProjectConnectorCapability[] = [
     enabled: true,
     availability: "available",
     content_types: ["plain_text_article.v1"],
+    requestable_formats: ["markdown.v1"],
   },
 ];
 const receipt = {
@@ -278,6 +279,165 @@ describe("ContentDistributionPanel", () => {
     ).toEqual([]);
   });
 
+  it("allows a first plain request from deployed support without verified availability or settings", () => {
+    expect(
+      eligiblePublishingAccounts(
+        accounts,
+        platforms,
+        [
+          {
+            ...capabilities[0],
+            enabled: false,
+            availability: "unavailable",
+            content_types: [],
+          },
+        ],
+        revision,
+      ).map((account) => account.account_id),
+    ).toEqual(["own-1", "shared-1"]);
+  });
+
+  it("excludes unavailable formats and unknown placements without falling back to verified capability", () => {
+    for (const capability of [
+      { ...capabilities[0], requestable_formats: [] },
+      { ...capabilities[0], requestable_formats: ["rich_markdown.v2"] },
+      { ...capabilities[0], placement_slot: "unsupported" },
+      { ...capabilities[0], requestable_formats: undefined },
+    ]) {
+      expect(
+        eligiblePublishingAccounts(
+          accounts,
+          platforms,
+          [capability as ProjectConnectorCapability],
+          revision,
+        ),
+      ).toEqual([]);
+    }
+  });
+
+  it("selects short content on the same account and sends its actual placement", async () => {
+    vi.mocked(listProjectConnectorCapabilities).mockResolvedValue({
+      items: [
+        capabilities[0],
+        { ...capabilities[0], placement_slot: "short_post" },
+      ],
+    });
+    const user = userEvent.setup();
+    mount();
+    expect(screen.queryByLabelText("发布位置")).toBeNull();
+    await user.selectOptions(await screen.findByLabelText("发布账号"), "own-1");
+    const placement = screen.getByLabelText("发布位置");
+    expect(placement).toHaveValue("primary");
+    expect(screen.getByRole("option", { name: "文章" })).toBeTruthy();
+    await user.selectOptions(placement, "short_post");
+    await user.click(screen.getByRole("button", { name: "发布所选版本" }));
+    await waitFor(() =>
+      expect(submitContentDistributionRequest).toHaveBeenCalledOnce(),
+    );
+    expect(
+      vi.mocked(submitContentDistributionRequest).mock.calls[0]?.[2],
+    ).toMatchObject({
+      account_id: "own-1",
+      placement_slot: "short_post",
+      format: "markdown.v1",
+    });
+  });
+
+  it.each(["primary", "short_post"])(
+    "uses the sole first-request %s placement without showing an unnecessary selector",
+    async (placement) => {
+      vi.mocked(listProjectConnectorCapabilities).mockResolvedValue({
+        items: [
+          {
+            ...capabilities[0],
+            placement_slot: placement,
+            enabled: false,
+            availability: "unavailable",
+            content_types: [],
+          },
+        ],
+      });
+      const user = userEvent.setup();
+      mount();
+      await user.selectOptions(
+        await screen.findByLabelText("发布账号"),
+        "own-1",
+      );
+      expect(screen.queryByLabelText("发布位置")).toBeNull();
+      expect(screen.queryByText("已完成公开验证。")).toBeNull();
+      await user.click(screen.getByRole("button", { name: "发布所选版本" }));
+      await waitFor(() =>
+        expect(submitContentDistributionRequest).toHaveBeenCalledOnce(),
+      );
+      expect(
+        vi.mocked(submitContentDistributionRequest).mock.calls[0]?.[2]
+          .placement_slot,
+      ).toBe(placement);
+    },
+  );
+
+  it("resets placement when changing accounts and submits only a supported placement", async () => {
+    vi.mocked(listChannelAccounts).mockResolvedValue({
+      items: [
+        ...accounts,
+        { ...accounts[0], account_id: "other-1", platform: "baidu_creator" },
+      ],
+    });
+    vi.mocked(listChannelPlatforms).mockResolvedValue({
+      items: [...platforms, { ...platforms[0], id: "baidu_creator" }],
+    });
+    vi.mocked(listProjectConnectorCapabilities).mockResolvedValue({
+      items: [
+        capabilities[0],
+        { ...capabilities[0], placement_slot: "short_post" },
+        { ...capabilities[0], platform_id: "baidu_creator" },
+      ],
+    });
+    const user = userEvent.setup();
+    mount();
+    const account = await screen.findByLabelText("发布账号");
+    await user.selectOptions(account, "own-1");
+    await user.selectOptions(screen.getByLabelText("发布位置"), "short_post");
+    await user.selectOptions(account, "shared-1");
+    expect(screen.getByLabelText("发布位置")).toHaveValue("primary");
+    await user.selectOptions(screen.getByLabelText("发布位置"), "short_post");
+    await user.selectOptions(account, "other-1");
+    expect(screen.queryByLabelText("发布位置")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "发布所选版本" }));
+    await waitFor(() =>
+      expect(submitContentDistributionRequest).toHaveBeenCalledOnce(),
+    );
+    expect(
+      vi.mocked(submitContentDistributionRequest).mock.calls[0]?.[2],
+    ).toMatchObject({
+      account_id: "other-1",
+      placement_slot: "primary",
+    });
+  });
+
+  it("keeps a rich version on its proven article placement when short content supports only plain text", async () => {
+    vi.mocked(listProjectConnectorCapabilities).mockResolvedValue({
+      items: [
+        { ...capabilities[0], requestable_formats: ["rich_markdown.v2"] },
+        { ...capabilities[0], placement_slot: "short_post" },
+      ],
+    });
+    const user = userEvent.setup();
+    mount({ selectedRevision: richRevision });
+    await user.selectOptions(await screen.findByLabelText("发布账号"), "own-1");
+    expect(screen.queryByLabelText("发布位置")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "发布所选版本" }));
+    await waitFor(() =>
+      expect(submitContentDistributionRequest).toHaveBeenCalledOnce(),
+    );
+    expect(
+      vi.mocked(submitContentDistributionRequest).mock.calls[0]?.[2],
+    ).toMatchObject({
+      placement_slot: "primary",
+      format: "rich_markdown.v2",
+    });
+  });
+
   it("submits one click and reuses the exact key and revision on a network retry", async () => {
     vi.mocked(submitContentDistributionRequest)
       .mockRejectedValueOnce(new Error("Connection lost"))
@@ -285,6 +445,7 @@ describe("ContentDistributionPanel", () => {
     const user = userEvent.setup();
     mount();
     await user.selectOptions(await screen.findByLabelText("发布账号"), "own-1");
+    expect(screen.queryByLabelText("发布位置")).toBeNull();
     await user.click(screen.getByRole("button", { name: "发布所选版本" }));
     await screen.findByText("提交结果暂未确认，请重试。");
     await user.click(screen.getByRole("button", { name: "重试" }));
@@ -310,37 +471,51 @@ describe("ContentDistributionPanel", () => {
     expect(window.sessionStorage.length).toBe(0);
   });
 
-  it("restores the exact uncertain request across remount even when the selected revision advances", async () => {
-    vi.mocked(submitContentDistributionRequest).mockRejectedValue(
-      new Error("Response lost"),
-    );
-    const user = userEvent.setup();
-    const original = mount();
-    await user.selectOptions(await screen.findByLabelText("发布账号"), "own-1");
-    await user.click(screen.getByRole("button", { name: "发布所选版本" }));
-    await screen.findByRole("button", { name: "重试" });
-    expect(window.sessionStorage.length).toBe(1);
-    const first = vi.mocked(submitContentDistributionRequest).mock.calls[0];
-    original.unmount();
-    mount({
-      selectedRevision: {
-        ...richRevision,
-        revision_id: "revision-2",
-        revision: 2,
-      },
-    });
-    expect(screen.queryByRole("button", { name: "发布所选版本" })).toBeNull();
-    expect(screen.queryByLabelText("发布账号")).toBeNull();
-    expect(submitContentDistributionRequest).toHaveBeenCalledTimes(1);
-    await user.click(screen.getByRole("button", { name: "重试" }));
-    await waitFor(() =>
-      expect(submitContentDistributionRequest).toHaveBeenCalledTimes(2),
-    );
-    expect(vi.mocked(submitContentDistributionRequest).mock.calls[1]).toEqual(
-      first,
-    );
-    expect(window.sessionStorage.length).toBe(1);
-  });
+  it.each(["primary", "short_post"])(
+    "restores the exact uncertain %s request across remount even when the selected revision advances",
+    async (placement) => {
+      vi.mocked(listProjectConnectorCapabilities).mockResolvedValue({
+        items: [
+          capabilities[0],
+          { ...capabilities[0], placement_slot: "short_post" },
+        ],
+      });
+      vi.mocked(submitContentDistributionRequest).mockRejectedValue(
+        new Error("Response lost"),
+      );
+      const user = userEvent.setup();
+      const original = mount();
+      await user.selectOptions(
+        await screen.findByLabelText("发布账号"),
+        "own-1",
+      );
+      await user.selectOptions(screen.getByLabelText("发布位置"), placement);
+      await user.click(screen.getByRole("button", { name: "发布所选版本" }));
+      await screen.findByRole("button", { name: "重试" });
+      expect(window.sessionStorage.length).toBe(1);
+      const first = vi.mocked(submitContentDistributionRequest).mock.calls[0];
+      expect(first?.[2].placement_slot).toBe(placement);
+      original.unmount();
+      mount({
+        selectedRevision: {
+          ...richRevision,
+          revision_id: "revision-2",
+          revision: 2,
+        },
+      });
+      expect(screen.queryByRole("button", { name: "发布所选版本" })).toBeNull();
+      expect(screen.queryByLabelText("发布账号")).toBeNull();
+      expect(submitContentDistributionRequest).toHaveBeenCalledTimes(1);
+      await user.click(screen.getByRole("button", { name: "重试" }));
+      await waitFor(() =>
+        expect(submitContentDistributionRequest).toHaveBeenCalledTimes(2),
+      );
+      expect(vi.mocked(submitContentDistributionRequest).mock.calls[1]).toEqual(
+        first,
+      );
+      expect(window.sessionStorage.length).toBe(1);
+    },
+  );
 
   it("keeps pending requests isolated from other projects and assets", async () => {
     vi.mocked(submitContentDistributionRequest).mockRejectedValue(

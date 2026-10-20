@@ -31,13 +31,11 @@ import {
   submitContentDistributionRequest,
   type ContentDistributionInput,
   type ContentDistributionRequest,
+  type DistributionPlacement,
 } from "../api/contentDistribution";
 import "../i18n/contentDistribution";
 
-const requiredCapability = {
-  "markdown.v1": "plain_text_article.v1",
-  "rich_markdown.v2": "rich_markdown.v2",
-} as const;
+const placementSlots: DistributionPlacement[] = ["primary", "short_post"];
 const deferralReasons = [
   "project_paused",
   "account_unavailable",
@@ -75,7 +73,9 @@ function readPending(
       record.input?.content_asset_id !== assetId ||
       typeof record.input.content_revision_id !== "string" ||
       typeof record.input.account_id !== "string" ||
-      record.input.placement_slot !== "primary" ||
+      !placementSlots.includes(
+        record.input.placement_slot as DistributionPlacement,
+      ) ||
       !["markdown.v1", "rich_markdown.v2"].includes(record.input.format ?? "")
     )
       return null;
@@ -131,24 +131,30 @@ export function eligiblePublishingAccounts(
       .filter((platform) => platform.purpose === "publishing")
       .map((platform) => platform.id),
   );
-  const required = requiredCapability[distributionFormat(revision)];
-  const supported = new Set(
-    capabilities
-      .filter(
-        (capability) =>
-          capability.placement_slot === "primary" &&
-          capability.availability === "available" &&
-          capability.enabled &&
-          capability.content_types.includes(required),
-      )
-      .map((capability) => capability.platform_id),
-  );
   return accounts.filter(
     (account) =>
       account.enabled &&
       account.status === "ready" &&
       publishing.has(account.platform) &&
-      supported.has(account.platform),
+      eligiblePublishingPlacements(account.platform, capabilities, revision)
+        .length > 0,
+  );
+}
+
+function eligiblePublishingPlacements(
+  platformId: string,
+  capabilities: ProjectConnectorCapability[],
+  revision: ContentRevision,
+): DistributionPlacement[] {
+  const format = distributionFormat(revision);
+  return placementSlots.filter((placement) =>
+    capabilities.some(
+      (capability) =>
+        capability.platform_id === platformId &&
+        capability.placement_slot === placement &&
+        Array.isArray(capability.requestable_formats) &&
+        capability.requestable_formats.includes(format),
+    ),
   );
 }
 
@@ -255,6 +261,8 @@ export function ContentDistributionPanel({
       query.state.data?.outcome === "verified" ? false : 5000,
   });
   const [accountId, setAccountId] = useState("");
+  const [placementSlot, setPlacementSlot] =
+    useState<DistributionPlacement>("primary");
   const mutation = useMutation({
     mutationFn: ({
       input,
@@ -288,20 +296,30 @@ export function ContentDistributionPanel({
   const selectedAccount = options.find(
     (account) => account.account_id === accountId,
   );
+  const placements = selectedAccount
+    ? eligiblePublishingPlacements(
+        selectedAccount.platform,
+        capabilities.data?.items ?? [],
+        revision,
+      )
+    : [];
+  const selectedPlacement = placements.includes(placementSlot)
+    ? placementSlot
+    : placements[0];
   const submit = () => {
     if (readonly || mutation.isPending || requestId) return;
     if (pending) {
       mutation.mutate(pending);
       return;
     }
-    if (!selectedAccount) return;
+    if (!selectedAccount || !selectedPlacement) return;
     const next = {
       key: createIdempotencyKey(),
       input: {
         content_asset_id: assetId,
         content_revision_id: revision.revision_id,
         account_id: selectedAccount.account_id,
-        placement_slot: "primary",
+        placement_slot: selectedPlacement,
         format: distributionFormat(revision),
       },
     };
@@ -516,6 +534,12 @@ export function ContentDistributionPanel({
                 <p>
                   {t("contentDistribution.account")}: {pending.input.account_id}
                 </p>
+                <p>
+                  {t("contentDistribution.placement")}:{" "}
+                  {t(
+                    `contentDistribution.placements.${pending.input.placement_slot}`,
+                  )}
+                </p>
               </details>
               {!readonly && (
                 <>
@@ -569,6 +593,7 @@ export function ContentDistributionPanel({
                       disabled={readonly || mutation.isPending}
                       onChange={(event) => {
                         setAccountId(event.target.value);
+                        setPlacementSlot("primary");
                         mutation.reset();
                       }}
                     >
@@ -613,6 +638,26 @@ export function ContentDistributionPanel({
                       : t("contentDistribution.noAccount")}
                   </p>
                 ))}
+              {placements.length > 1 && (
+                <Field label={t("contentDistribution.placement")}>
+                  <Select
+                    value={selectedPlacement}
+                    disabled={readonly || mutation.isPending}
+                    onChange={(event) => {
+                      setPlacementSlot(
+                        event.target.value as DistributionPlacement,
+                      );
+                      mutation.reset();
+                    }}
+                  >
+                    {placements.map((placement) => (
+                      <option key={placement} value={placement}>
+                        {t(`contentDistribution.placements.${placement}`)}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+              )}
               {!readonly &&
                 accounts.isSuccess &&
                 platforms.isSuccess &&
@@ -625,7 +670,9 @@ export function ContentDistributionPanel({
               {!readonly && options.length > 0 && (
                 <Button
                   appearance="primary"
-                  disabled={!selectedAccount || mutation.isPending}
+                  disabled={
+                    !selectedAccount || !selectedPlacement || mutation.isPending
+                  }
                   onClick={submit}
                 >
                   {mutation.isPending

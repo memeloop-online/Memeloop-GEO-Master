@@ -230,10 +230,12 @@ pub async fn read_content_distribution_publication(
                 || !matches!(&target.target.input,
                     ChannelTargetInput::GeneratedPublish {
                         publication_intent_id,
+                        placement_slot,
                         payload_hash,
                         rich_payload,
                         ..
                     } if *publication_intent_id == bundle.intent.intent_id
+                        && placement_slot == &bundle.intent.placement_slot
                         && payload_hash == &bundle.variant.payload_hash
                         && rich_payload.as_ref() == bundle.variant.rich_payload.as_ref())
             {

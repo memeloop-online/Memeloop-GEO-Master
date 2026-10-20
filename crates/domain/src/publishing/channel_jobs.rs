@@ -36,6 +36,7 @@ pub enum ChannelTargetInput {
         source_id: Uuid,
         source_version_id: Uuid,
         platform: String,
+        placement_slot: String,
         account_id: Uuid,
         title: String,
         body: String,
@@ -51,6 +52,7 @@ pub enum ChannelTargetInput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_request_id: Option<Uuid>,
         platform: String,
+        placement_slot: String,
         account_id: Uuid,
         title: String,
         body: String,
@@ -1367,6 +1369,7 @@ impl MemoryChannelJobRepository {
             publication_intent_id,
             account_id,
             platform,
+            placement_slot,
             title,
             body,
             body_sha256,
@@ -1404,9 +1407,11 @@ impl MemoryChannelJobRepository {
             || bundle.intent.intent_id != *publication_intent_id
             || bundle.intent.account_id != *account_id
             || bundle.intent.platform_id != *platform
+            || bundle.intent.placement_slot != *placement_slot
             || bundle.intent.payload_hash != *payload_hash
             || bundle.variant.variant_id != *variant_id
             || bundle.variant.content_revision_id != *content_revision_id
+            || bundle.variant.placement_slot != *placement_slot
             || bundle.variant.title != *title
             || bundle.variant.markdown != *body
             || bundle.variant.rich_payload.as_ref() != Some(frozen)
@@ -2714,6 +2719,7 @@ mod tests {
                     ChannelTarget {
                         target_id: first,
                         input: ChannelTargetInput::Publish {
+                            placement_slot: "primary".into(),
                             source_id: Uuid::new_v4(),
                             source_version_id: Uuid::new_v4(),
                             platform: "fixture".into(),
@@ -2726,6 +2732,7 @@ mod tests {
                     ChannelTarget {
                         target_id: second,
                         input: ChannelTargetInput::Publish {
+                            placement_slot: "primary".into(),
                             source_id: Uuid::new_v4(),
                             source_version_id: Uuid::new_v4(),
                             platform: "fixture".into(),
@@ -2889,6 +2896,7 @@ mod tests {
         let target = ChannelTarget {
             target_id: command,
             input: ChannelTargetInput::GeneratedPublish {
+                placement_slot: "primary".into(),
                 content_revision_id: Uuid::new_v4(),
                 variant_id: Uuid::new_v4(),
                 publication_intent_id: Uuid::new_v4(),
@@ -2983,6 +2991,7 @@ mod tests {
                 targets: vec![ChannelTarget {
                     target_id,
                     input: ChannelTargetInput::Publish {
+                        placement_slot: "primary".into(),
                         source_id: Uuid::new_v4(),
                         source_version_id: Uuid::new_v4(),
                         platform: "zhihu".into(),
@@ -3154,6 +3163,7 @@ mod tests {
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
         let input = |source_version_id| ChannelTargetInput::Publish {
+            placement_slot: "primary".into(),
             source_id: Uuid::new_v4(),
             source_version_id,
             platform: "zhihu".into(),
@@ -3251,6 +3261,7 @@ mod tests {
                     targets: vec![ChannelTarget {
                         target_id,
                         input: ChannelTargetInput::Publish {
+                            placement_slot: "primary".into(),
                             source_id: Uuid::new_v4(),
                             source_version_id: Uuid::new_v4(),
                             platform: "zhihu".into(),

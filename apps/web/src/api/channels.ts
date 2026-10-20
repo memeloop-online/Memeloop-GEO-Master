@@ -36,6 +36,7 @@ export interface ProjectConnectorCapability {
   revision: number;
   enabled: boolean;
   content_types: string[];
+  requestable_formats: string[];
   availability: ConnectorAvailability;
 }
 

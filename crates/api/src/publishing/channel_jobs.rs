@@ -11,7 +11,7 @@ use geo_domain::{
     ChannelStatus, ChannelTarget, ChannelTargetInput, ChannelTargetView, ConnectorAvailability,
     ConnectorKey, ErrorCode, KnowledgePurpose, ProjectId, ProjectStatus, PublicationOrigin,
     QuestionReference, RICH_DISTRIBUTION_FORMAT, RICH_MARKDOWN_FORMAT, SourceState, TenantScope,
-    sha256_hex, validate_rich_publication_payload,
+    plain_text_publication_readback_hash, sha256_hex, validate_rich_publication_payload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -88,11 +88,11 @@ pub enum ChannelDispatchDeferred {
 
 /// A callback is an independently configured service capability, not a
 /// connector's plain publish proof or a claim made by the runner itself.
-fn rich_send_bridge_available(state: &AppState) -> bool {
+pub(crate) fn rich_send_bridge_available(state: &AppState) -> bool {
     state.publication_send_callback.is_some() && state.channel_service().browser.is_some()
 }
 
-fn rich_runner_operation_available(
+pub(crate) fn rich_runner_operation_available(
     connectors: &[crate::browser_bridge::RunnerConnector],
     key: &ConnectorKey,
     version: &str,
@@ -129,6 +129,7 @@ async fn generated_connector_available(
 ) -> Result<bool, AppError> {
     let ChannelTargetInput::GeneratedPublish {
         platform,
+        placement_slot,
         publication_intent_id,
         distribution_target_id,
         origin_request_id,
@@ -151,6 +152,7 @@ async fn generated_connector_available(
             if Some(request.request_id) != *origin_request_id
                 || !distribution_target_id.is_nil()
                 || request.platform_id != *platform
+                || request.placement_slot != *placement_slot
                 || request.format
                     != if rich_payload.is_some() {
                         RICH_DISTRIBUTION_FORMAT
@@ -165,96 +167,48 @@ async fn generated_connector_available(
                 placement_slot: request.placement_slot,
             };
             let connectors = crate::connector_capabilities::deployed_versions(state).await;
-            let Some(version) = crate::connector_capabilities::deployed_version(&connectors, &key)
-            else {
-                return Ok(false);
-            };
-            if rich_payload.is_some()
-                && !rich_runner_operation_available(&connectors, &key, version)
-            {
-                return Ok(false);
-            }
             let settings = state
                 .connector_capability_repository()
                 .get(scope.operator_id, &key)
                 .await?;
-            if settings.as_ref().is_some_and(|settings| !settings.enabled) {
-                return Ok(false);
-            }
             if rich_payload.is_none() {
-                // An explicitly requested first article establishes its own
-                // publication/readback evidence; prior success is not required.
-                let mut matching = connectors.iter().filter(|connector| {
-                    connector.platform == key.platform_id
-                        && connector.placement_slot == key.placement_slot
-                });
-                let Some(connector) = matching.next() else {
-                    return Ok(false);
-                };
-                if matching.next().is_some()
-                    || connector.connector_version.trim().is_empty()
-                    || !["publish", "lookup"].iter().all(|operation| {
-                        connector
-                            .operations
-                            .iter()
-                            .any(|item| item.as_str() == *operation)
-                    })
-                {
-                    return Ok(false);
+                let mut semantic = None;
+                if settings.as_ref().is_some_and(|settings| {
+                    !settings
+                        .content_types
+                        .iter()
+                        .any(|format| format == geo_domain::PLAIN_TEXT_ARTICLE_FORMAT)
+                }) {
+                    let content = state.content_repository();
+                    if let Some(asset) = content.get_asset(scope, request.content_asset_id).await? {
+                        semantic = content
+                            .get_item(scope, asset.execution_id, asset.item_id)
+                            .await?
+                            .map(|item| item.content_type);
+                    }
                 }
-                let Some(settings) = settings else {
-                    return Ok(true);
-                };
-                if settings
-                    .content_types
-                    .iter()
-                    .any(|format| format == geo_domain::PLAIN_TEXT_ARTICLE_FORMAT)
-                {
-                    return Ok(true);
-                }
-                let content = state.content_repository();
-                let Some(asset) = content.get_asset(scope, request.content_asset_id).await? else {
-                    return Ok(false);
-                };
-                return Ok(content
-                    .get_item(scope, asset.execution_id, asset.item_id)
-                    .await?
-                    .is_some_and(|item| {
-                        crate::connector_capabilities::configured_publication_format(
-                            &settings,
-                            &item.content_type,
-                        )
-                        .is_some()
-                    }));
+                return Ok(
+                    crate::connector_capabilities::requested_plaintext_available(
+                        &connectors,
+                        &key,
+                        settings.as_ref(),
+                        Some(semantic.as_deref().unwrap_or("")),
+                    ),
+                );
             }
-            let Some(settings) = settings else {
+            let Some(version) = crate::connector_capabilities::deployed_version(&connectors, &key)
+            else {
                 return Ok(false);
             };
-            let content = state.content_repository();
-            let semantic =
-                if let Some(asset) = content.get_asset(scope, request.content_asset_id).await? {
-                    content
-                        .get_item(scope, asset.execution_id, asset.item_id)
-                        .await?
-                        .map(|item| item.content_type)
-                } else {
-                    None
-                };
-            let proof_format = if rich_payload.is_some() {
-                crate::connector_capabilities::configured_rich_publication_format(&settings)
-            } else if settings
-                .content_types
-                .iter()
-                .any(|format| format == geo_domain::PLAIN_TEXT_ARTICLE_FORMAT)
-            {
-                Some(geo_domain::PLAIN_TEXT_ARTICLE_FORMAT)
-            } else {
-                semantic.as_deref().filter(|semantic| {
-                    geo_domain::publication_format_for_semantic_type(semantic).is_some()
-                        && settings.content_types.iter().any(|item| item == *semantic)
-                })
+            if !rich_runner_operation_available(&connectors, &key, version) {
+                return Ok(false);
+            }
+            let Some(settings) = settings.filter(|settings| settings.enabled) else {
+                return Ok(false);
             };
-            let Some(proof_format) = proof_format else {
+            let Some(proof_format) =
+                crate::connector_capabilities::configured_rich_publication_format(&settings)
+            else {
                 return Ok(false);
             };
             return Ok(state
@@ -300,6 +254,7 @@ async fn generated_connector_available(
     }
     if frozen.target_id != *distribution_target_id
         || frozen.platform_id != *platform
+        || frozen.placement_slot != *placement_slot
         || placement.capability_version != version
         || placement.fixture
         || placement.unavailable_reason.is_some()
@@ -348,12 +303,17 @@ async fn legacy_connector_available(
     scope: &TenantScope,
     input: &ChannelTargetInput,
 ) -> Result<bool, AppError> {
-    let ChannelTargetInput::Publish { platform, .. } = input else {
+    let ChannelTargetInput::Publish {
+        platform,
+        placement_slot,
+        ..
+    } = input
+    else {
         return Ok(true);
     };
     let key = ConnectorKey {
         platform_id: platform.clone(),
-        placement_slot: "primary".into(),
+        placement_slot: placement_slot.clone(),
     };
     let Some(settings) = state
         .connector_capability_repository()
@@ -450,6 +410,32 @@ struct PublicationCandidate {
     source: String,
 }
 
+pub(crate) fn text_publication_payload(
+    placement_slot: &str,
+    title: &str,
+    body: &str,
+) -> serde_json::Value {
+    if placement_slot == "short_post" {
+        json!({"placement_slot": placement_slot, "body": body})
+    } else {
+        json!({"placement_slot": placement_slot, "title": title, "body": body})
+    }
+}
+
+pub(crate) fn valid_publication_url(candidate: &str, platform: &str, placement_slot: &str) -> bool {
+    let prefixes: &[&str] = match (platform, placement_slot) {
+        ("zhihu", "primary") => &["https://www.zhihu.com/p/", "https://zhuanlan.zhihu.com/p/"],
+        ("zhihu", "short_post") => &["https://www.zhihu.com/pin/"],
+        _ => return false,
+    };
+    candidate.len() <= 256
+        && prefixes.iter().any(|prefix| {
+            candidate
+                .strip_prefix(prefix)
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+        })
+}
+
 /// Retain only a bounded, canonical post-submit hint, not a verified receipt.
 /// Association identifiers are supplied by Rust, never by adapter JSON.
 fn publication_candidate(
@@ -471,23 +457,24 @@ fn publication_candidate(
         return None;
     }
     let hint: PublicationCandidate = serde_json::from_value(value.clone()).ok()?;
-    let (platform, title, body) = match &target.input {
+    let (platform, placement_slot, title, body) = match &target.input {
         ChannelTargetInput::Publish {
             platform,
+            placement_slot,
             title,
             body,
             ..
         }
         | ChannelTargetInput::GeneratedPublish {
             platform,
+            placement_slot,
             title,
             body,
             ..
-        } => (platform, title, body),
+        } => (platform, placement_slot, title, body),
         ChannelTargetInput::Measure { .. } => return None,
     };
-    let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let expected = sha256_hex(format!("{}\n{}", normalize(title), normalize(body)).as_bytes());
+    let expected = plain_text_publication_readback_hash(placement_slot, title, body);
     if hint.kind != "publication_candidate"
         || hint.schema_version != "geo.publication.candidate.v1"
         || hint.source != "post_submit_navigation"
@@ -495,22 +482,7 @@ fn publication_candidate(
         || hint.observed_at < claimed_at
         || hint.observed_at > received_at
         || hint.url.len() > 256
-        || platform != "zhihu"
-    {
-        return None;
-    }
-    let url = reqwest::Url::parse(&hint.url).ok()?;
-    let post_id = url.path().strip_prefix("/p/")?;
-    if url.scheme() != "https"
-        || !matches!(url.host_str(), Some("www.zhihu.com" | "zhuanlan.zhihu.com"))
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.port().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || url.as_str() != hint.url
-        || post_id.is_empty()
-        || !post_id.bytes().all(|byte| byte.is_ascii_digit())
+        || !valid_publication_url(&hint.url, platform, placement_slot)
     {
         return None;
     }
@@ -588,23 +560,24 @@ pub(crate) fn publication_readback(
     {
         return false;
     }
-    let (platform, title, body) = match target {
+    let (platform, placement_slot, title, body) = match target {
         ChannelTargetInput::Publish {
             platform,
+            placement_slot,
             title,
             body,
             ..
         }
         | ChannelTargetInput::GeneratedPublish {
             platform,
+            placement_slot,
             title,
             body,
             ..
-        } => (platform, title, body),
+        } => (platform, placement_slot, title, body),
         ChannelTargetInput::Measure { .. } => return false,
     };
-    let normalize = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let expected_hash = sha256_hex(format!("{}\n{}", normalize(title), normalize(body)).as_bytes());
+    let expected_hash = plain_text_publication_readback_hash(placement_slot, title, body);
     if result.status != "completed"
         || result.stage.as_deref() != Some("public_readback")
         || result.occurred_at.is_none()
@@ -618,19 +591,7 @@ pub(crate) fn publication_readback(
     else {
         return false;
     };
-    let post_id = url
-        .path()
-        .strip_prefix("/p/")
-        .unwrap_or_default()
-        .trim_end_matches('/');
-    if url.scheme() != "https"
-        || !matches!(url.host_str(), Some("www.zhihu.com" | "zhuanlan.zhihu.com"))
-        || platform != "zhihu"
-        || post_id.is_empty()
-        || !post_id.bytes().all(|byte| byte.is_ascii_digit())
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
+    if !valid_publication_url(url.as_str(), platform, placement_slot) {
         return false;
     }
     result.evidence.iter().any(|proof| {
@@ -883,6 +844,7 @@ async fn generated_publication_preflight(
         distribution_target_id,
         origin_request_id,
         platform,
+        placement_slot,
         account_id,
         title,
         body,
@@ -903,6 +865,11 @@ async fn generated_publication_preflight(
     let intent = &bundle.intent;
     let command = &bundle.command;
     bundle.validate_origin()?;
+    let expected_body = if placement_slot == "short_post" {
+        revision.document.markdown_body()
+    } else {
+        revision.markdown.clone()
+    };
     if evidence.is_empty()
         || *content_revision_id != revision.revision_id
         || *variant_id != variant.variant_id
@@ -911,15 +878,17 @@ async fn generated_publication_preflight(
         || intent.variant_id != variant.variant_id
         || intent.content_revision_id != revision.revision_id
         || intent.platform_id != *platform
+        || intent.placement_slot != *placement_slot
         || intent.account_id != *account_id
         || variant.platform_id != *platform
+        || variant.placement_slot != *placement_slot
         || variant.content_revision_id != revision.revision_id
         || variant.title != *title
         || variant.markdown != *body
         || variant.evidence != *evidence
         || revision.evidence != *evidence
         || revision.document.title != *title
-        || revision.markdown != *body
+        || expected_body != *body
         || revision.markdown != revision.document.markdown()
         || sha256_hex(body.as_bytes()) != *body_sha256
         || variant.payload_hash != *payload_hash
@@ -962,6 +931,7 @@ async fn generated_publication_preflight(
                 || target.publication_intent_id != Some(intent.intent_id)
                 || target.account_id != Some(*account_id)
                 || target.platform_id != *platform
+                || target.placement_slot != *placement_slot
             {
                 return Err(AppError::conflict("covered publication origin differs"));
             }
@@ -1258,6 +1228,7 @@ async fn publication_input(
         source_id: request.source_id,
         source_version_id: request.source_version_id,
         platform: request.platform,
+        placement_slot: "primary".into(),
         account_id: request.account_id,
         title: detail.source.name,
         body_sha256: sha256_hex(body.as_bytes()),
@@ -1736,19 +1707,20 @@ async fn execute_reserved_channel_target(
     // checks runner/cipher/session availability without consuming the attempt.
     let attempt_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
-    let opened = if planned.target.input.is_publication() {
-        service
+    let opened = match &planned.target.input {
+        ChannelTargetInput::Publish { placement_slot, .. }
+        | ChannelTargetInput::GeneratedPublish { placement_slot, .. } => service
             .resume_available_browser_bound_reserved(
                 scope,
                 account.account_id,
                 attempt_id,
                 session_id,
                 reservation_id,
+                placement_slot,
             )
             .await
-            .map(|(session, binding, version)| (session, Some(binding), version))
-    } else {
-        service
+            .map(|(session, binding, version)| (session, Some(binding), version)),
+        ChannelTargetInput::Measure { .. } => service
             .resume_available_browser_with_renewal_id_reserved(
                 scope,
                 account.account_id,
@@ -1757,7 +1729,7 @@ async fn execute_reserved_channel_target(
                 geo_domain::BrowserOperationPurpose::Measure,
             )
             .await
-            .map(|(session, version)| (session, None, version))
+            .map(|(session, version)| (session, None, version)),
     };
     let (session, binding, mut session_version) = match opened {
         Ok(opened) => opened,
@@ -1814,15 +1786,22 @@ async fn execute_reserved_channel_target(
         }
     };
     let (operation, payload) = match &target.input {
-        ChannelTargetInput::Publish { title, body, .. } => {
-            ("publish", json!({"title":title,"body":body}))
+        ChannelTargetInput::Publish {
+            placement_slot,
+            title,
+            body,
+            ..
         }
-        ChannelTargetInput::GeneratedPublish {
+        | ChannelTargetInput::GeneratedPublish {
+            placement_slot,
             title,
             body,
             rich_payload: None,
             ..
-        } => ("publish", json!({"title":title,"body":body})),
+        } => (
+            "publish",
+            text_publication_payload(placement_slot, title, body),
+        ),
         // Rich content takes a distinct authenticated multipart route below.
         ChannelTargetInput::GeneratedPublish {
             rich_payload: Some(_),
@@ -2607,6 +2586,7 @@ mod tests {
                 source_id: Uuid::new_v4(),
                 source_version_id: Uuid::new_v4(),
                 platform: "zhihu".into(),
+                placement_slot: "primary".into(),
                 account_id: Uuid::new_v4(),
                 title: " source ".into(),
                 body: "body\ntext".into(),
@@ -2693,11 +2673,60 @@ mod tests {
     }
 
     #[test]
+    fn short_post_readback_requires_pin_url_and_exact_body_without_title() {
+        let target = ChannelTarget {
+            target_id: Uuid::new_v4(),
+            input: ChannelTargetInput::Publish {
+                source_id: Uuid::new_v4(),
+                source_version_id: Uuid::new_v4(),
+                platform: "zhihu".into(),
+                placement_slot: "short_post".into(),
+                account_id: Uuid::new_v4(),
+                title: "Internal asset title".into(),
+                body: "Exact short body".into(),
+                body_sha256: sha256_hex(b"Exact short body"),
+            },
+        };
+        let now = Utc::now();
+        let digest = sha256_hex(b"\nExact short body");
+        let url = "https://www.zhihu.com/pin/12345";
+        let candidate = json!({"kind":"publication_candidate",
+            "schema_version":"geo.publication.candidate.v1","url":url,
+            "expected_sha256":digest,"observed_at":now,"source":"post_submit_navigation"});
+        assert!(
+            publication_candidate(&candidate, &target, Uuid::new_v4(), now, now, "short.v1")
+                .is_some()
+        );
+        let mut receipt = BrowserExecution {
+            execution_id: Uuid::new_v4(),
+            provenance: Some(crate::browser_bridge::BrowserReceiptProvenance::Live),
+            status: "completed".into(),
+            reason: None,
+            evidence: vec![json!({"kind":"public_readback","url":url,
+                "content_matched":true,"owned_by_account":true,
+                "expected_sha256":digest,"readback_sha256":digest})],
+            public_url: Some(url.into()),
+            occurred_at: Some(now),
+            connector_version: Some("short.v1".into()),
+            stage: Some("public_readback".into()),
+        };
+        assert!(publication_readback(&receipt, &target.input));
+        receipt.public_url = Some("https://www.zhihu.com/p/12345".into());
+        assert!(!publication_readback(&receipt, &target.input));
+        receipt.public_url = Some(url.into());
+        receipt.evidence[0]["expected_sha256"] =
+            json!(sha256_hex(b"Internal asset title\nExact short body"));
+        receipt.evidence[0]["readback_sha256"] = receipt.evidence[0]["expected_sha256"].clone();
+        assert!(!publication_readback(&receipt, &target.input));
+    }
+
+    #[test]
     fn completed_without_owned_public_readback_is_not_verified() {
         let input = ChannelTargetInput::Publish {
             source_id: Uuid::new_v4(),
             source_version_id: Uuid::new_v4(),
             platform: "zhihu".into(),
+            placement_slot: "primary".into(),
             account_id: Uuid::new_v4(),
             title: "source".into(),
             body: "body".into(),
@@ -2777,6 +2806,7 @@ mod tests {
             distribution_target_id: Uuid::new_v4(),
             origin_request_id: None,
             platform: "zhihu".into(),
+            placement_slot: "primary".into(),
             account_id: Uuid::new_v4(),
             title: "Frozen title".into(),
             body: "Frozen body".into(),

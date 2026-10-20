@@ -159,6 +159,7 @@ async fn lookup_http_enforces_auth_scope_target_kind_and_empty_contract() {
                             source_id: Uuid::new_v4(),
                             source_version_id: Uuid::new_v4(),
                             platform: "zhihu".into(),
+                            placement_slot: "primary".into(),
                             account_id: Uuid::new_v4(),
                             title: "Title".into(),
                             body: "Body".into(),

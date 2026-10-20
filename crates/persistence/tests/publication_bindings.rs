@@ -105,6 +105,7 @@ async fn encrypted_binding_is_pre_send_scoped_and_database_immutable() {
     let publish = |target_id| ChannelTarget {
         target_id,
         input: ChannelTargetInput::Publish {
+            placement_slot: "primary".into(),
             source_id: Uuid::new_v4(),
             source_version_id: Uuid::new_v4(),
             platform: "fixture".into(),

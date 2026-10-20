@@ -226,6 +226,7 @@ mod tests {
         let target = ChannelTarget {
             target_id,
             input: ChannelTargetInput::GeneratedPublish {
+                placement_slot: "primary".into(),
                 content_revision_id: revision,
                 variant_id: Uuid::new_v4(),
                 publication_intent_id: intent,
