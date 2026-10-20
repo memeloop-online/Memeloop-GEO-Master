@@ -1290,7 +1290,7 @@ export const adapters = Object.freeze({
     connectorVersion: CONNECTOR_VERSION,
     origin: "https://baijiahao.baidu.com",
     entry: "https://baijiahao.baidu.com/builder/theme/bjh/login",
-    operations: Object.freeze(["publish", "lookup"]),
+    operations: Object.freeze(["publish"]),
     identify(page) {
       return probeOwnAccount(page, BAIDU_SELF, baiduIdentity);
     },
@@ -1305,7 +1305,7 @@ export const adapters = Object.freeze({
     connectorVersion: CONNECTOR_VERSION,
     origin: "https://creator.xiaohongshu.com",
     entry: "https://creator.xiaohongshu.com/login",
-    operations: Object.freeze(["publish", "lookup"]),
+    operations: Object.freeze([]),
     identify(page) {
       return xiaohongshuIdentity(page);
     },

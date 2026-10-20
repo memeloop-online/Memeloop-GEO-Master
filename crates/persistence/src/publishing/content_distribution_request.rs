@@ -544,8 +544,9 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
             ));
         }
         live_request_account(&mut tx, scope, &request).await?;
-        // An account login is not format proof. Persisted connector evidence
-        // and current settings must both permit the exact requested format.
+        // First plain-text publication can establish capability evidence.
+        // Explicit restrictions remain binding; rich publication still needs
+        // settings and prior proof for its exact format.
         let semantic: Option<String> = sqlx::query_scalar(
             "SELECT entry->>'content_type' FROM content_revisions r \
              JOIN content_executions e ON (e.operator_id,e.tenant_id,e.project_id,e.execution_id)= \
@@ -573,45 +574,32 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
         .fetch_optional(&mut *tx)
         .await
         .map_err(db)?;
-        let Some(configured) = configured else {
-            return Err(classified_request_failure(
-                ContentRequestDeferralReason::ConnectorUnavailable,
-                AppError::conflict("publication format is not available"),
-            ));
-        };
-        if !configured.get::<bool, _>("enabled") {
-            return Err(classified_request_failure(
-                ContentRequestDeferralReason::ConnectorUnavailable,
-                AppError::conflict("publication connector is disabled"),
-            ));
-        }
-        let types: Vec<String> = decode(configured.get("content_types"))?;
-        let proof_format = if request.format == geo_domain::RICH_DISTRIBUTION_FORMAT {
-            if types.iter().any(|item| item == geo_domain::RICH_MARKDOWN_FORMAT) {
-                geo_domain::RICH_MARKDOWN_FORMAT
+        if let Some(configured) = &configured {
+            let types: Vec<String> = decode(configured.get("content_types"))?;
+            let permitted_format = if request.format == geo_domain::RICH_DISTRIBUTION_FORMAT {
+                types.iter().any(|item| item == geo_domain::RICH_MARKDOWN_FORMAT)
             } else {
+                types.iter().any(|item| item == geo_domain::PLAIN_TEXT_ARTICLE_FORMAT)
+                    || semantic.as_deref().is_some_and(|semantic| {
+                        geo_domain::publication_format_for_semantic_type(semantic).is_some()
+                            && types.iter().any(|item| item == semantic)
+                    })
+            };
+            if !configured.get::<bool, _>("enabled") || !permitted_format {
                 return Err(classified_request_failure(
                     ContentRequestDeferralReason::ConnectorUnavailable,
-                    AppError::conflict("rich publication format is not available"),
+                    AppError::conflict("publication format is not available"),
                 ));
             }
-        } else if types
-            .iter()
-            .any(|item| item == geo_domain::PLAIN_TEXT_ARTICLE_FORMAT)
-        {
-            geo_domain::PLAIN_TEXT_ARTICLE_FORMAT
-        } else if semantic.as_deref().is_some_and(|semantic| {
-            geo_domain::publication_format_for_semantic_type(semantic).is_some()
-                && types.iter().any(|item| item == semantic)
-        }) {
-            semantic.as_deref().expect("recognized semantic type")
-        } else {
-            return Err(classified_request_failure(
-                ContentRequestDeferralReason::ConnectorUnavailable,
-                AppError::conflict("publication format is not available"),
-            ));
-        };
-        let has_proof: bool = sqlx::query_scalar(
+        }
+        if request.format == geo_domain::RICH_DISTRIBUTION_FORMAT {
+            if configured.is_none() {
+                return Err(classified_request_failure(
+                    ContentRequestDeferralReason::ConnectorUnavailable,
+                    AppError::conflict("publication format is not available"),
+                ));
+            }
+            let has_proof: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM connector_capability_verifications \
              WHERE operator_id=$1 AND platform_id=$2 AND placement_slot=$3 \
                 AND content_type=$4)",
@@ -619,15 +607,16 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
         .bind(scope.operator_id.as_uuid())
         .bind(&request.platform_id)
         .bind(&request.placement_slot)
-        .bind(proof_format)
+        .bind(geo_domain::RICH_MARKDOWN_FORMAT)
         .fetch_one(&mut *tx)
         .await
         .map_err(db)?;
-        if !has_proof {
-            return Err(classified_request_failure(
-                ContentRequestDeferralReason::ConnectorUnavailable,
-                AppError::conflict("publication format has no verified connector"),
-            ));
+            if !has_proof {
+                return Err(classified_request_failure(
+                    ContentRequestDeferralReason::ConnectorUnavailable,
+                    AppError::conflict("publication format has no verified connector"),
+                ));
+            }
         }
         let row = sqlx::query(
             "SELECT r.body AS revision_body,c.body AS check_body \

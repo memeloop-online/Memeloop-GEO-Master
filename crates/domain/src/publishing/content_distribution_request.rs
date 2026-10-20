@@ -587,45 +587,51 @@ impl MemoryContentDistributionRequestRepository {
         } else {
             None
         };
-        let proof_format = configured
-            .filter(|settings| settings.enabled)
-            .and_then(|settings| {
-                if request.format == RICH_DISTRIBUTION_FORMAT {
-                    return settings
-                        .content_types
-                        .contains(&RICH_MARKDOWN_FORMAT.to_owned())
-                        .then(|| RICH_MARKDOWN_FORMAT.to_owned());
-                }
-                if settings
+        // A first plain-text send establishes its own capability evidence.
+        // Explicit operator restrictions still apply; rich content continues
+        // to require exact format proof before entering the publication ledger.
+        if let Some(settings) = &configured {
+            let permitted_format = if request.format == RICH_DISTRIBUTION_FORMAT {
+                settings
+                    .content_types
+                    .iter()
+                    .any(|format| format == RICH_MARKDOWN_FORMAT)
+            } else {
+                settings
                     .content_types
                     .iter()
                     .any(|format| format == crate::PLAIN_TEXT_ARTICLE_FORMAT)
-                {
-                    Some(crate::PLAIN_TEXT_ARTICLE_FORMAT.to_owned())
-                } else {
-                    semantic.filter(|semantic| {
+                    || semantic.as_ref().is_some_and(|semantic| {
                         crate::publication_format_for_semantic_type(semantic).is_some()
                             && settings.content_types.contains(semantic)
                     })
-                }
-            })
-            .ok_or_else(|| {
-                classified_request_failure(
+            };
+            if !settings.enabled || !permitted_format {
+                return Err(classified_request_failure(
                     ContentRequestDeferralReason::ConnectorUnavailable,
                     AppError::conflict("publication format is not available"),
-                )
-            })?;
-        if !authority
-            .connectors
-            .history(scope.operator_id, &key)
-            .await?
-            .iter()
-            .any(|proof| proof.content_type == proof_format)
-        {
-            return Err(classified_request_failure(
-                ContentRequestDeferralReason::ConnectorUnavailable,
-                AppError::conflict("publication format is not available"),
-            ));
+                ));
+            }
+        }
+        if request.format == RICH_DISTRIBUTION_FORMAT {
+            if configured.is_none() {
+                return Err(classified_request_failure(
+                    ContentRequestDeferralReason::ConnectorUnavailable,
+                    AppError::conflict("publication format is not available"),
+                ));
+            }
+            if !authority
+                .connectors
+                .history(scope.operator_id, &key)
+                .await?
+                .iter()
+                .any(|proof| proof.content_type == RICH_MARKDOWN_FORMAT)
+            {
+                return Err(classified_request_failure(
+                    ContentRequestDeferralReason::ConnectorUnavailable,
+                    AppError::conflict("publication format is not available"),
+                ));
+            }
         }
         let revision = authority
             .content
