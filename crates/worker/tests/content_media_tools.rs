@@ -7,12 +7,12 @@ use geo_domain::{
     StructuredDocument, TenantScope, ToolCallIdentity, ToolCallOutcome,
 };
 use geo_worker::{
-    ContentDocumentReadRequest, ContentDocumentSnapshot, ContentMediaBindRequest,
-    ContentMediaInsertReceipt, ContentMediaInsertRequest, ContentMediaListRequest,
-    ContentMediaPage, ContentMediaRef, HOST_OPS_VERSION, HostBridge, HostOp, HostOpError,
-    HostOpErrorCode, HostOps, HostRuntime, ManifestPage, ManifestReadRequest, MeasureRequest,
-    MeasureSample, ModelCompletion, ModelCompletionRequest, PublishReceipt, PublishRequest,
-    ToolCallRecorder,
+    ContentDocumentReadRequest, ContentDocumentReviseReceipt, ContentDocumentReviseRequest,
+    ContentDocumentSnapshot, ContentMediaBindRequest, ContentMediaInsertReceipt,
+    ContentMediaInsertRequest, ContentMediaListRequest, ContentMediaPage, ContentMediaRef,
+    HOST_OPS_VERSION, HostBridge, HostOp, HostOpError, HostOpErrorCode, HostOps, HostRuntime,
+    ManifestPage, ManifestReadRequest, MeasureRequest, MeasureSample, ModelCompletion,
+    ModelCompletionRequest, PublishReceipt, PublishRequest, ToolCallRecorder,
 };
 use uuid::Uuid;
 
@@ -68,6 +68,22 @@ struct FakeOps;
 
 #[async_trait]
 impl HostOps for FakeOps {
+    async fn content_document_revise(
+        &self,
+        _: &TenantScope,
+        request: ContentDocumentReviseRequest,
+    ) -> Result<ContentDocumentReviseReceipt, HostOpError> {
+        request.validate().unwrap();
+        Ok(ContentDocumentReviseReceipt {
+            execution_id: request.execution_id,
+            item_id: request.item_id,
+            asset_id: Uuid::new_v4(),
+            base_revision_id: request.base_revision_id,
+            revision_id: Uuid::new_v4(),
+            revision: 2,
+        })
+    }
+
     async fn model_complete(
         &self,
         _: &TenantScope,
@@ -124,7 +140,8 @@ fn recorded_bridge(recorder: Arc<Recorder>) -> HostBridge {
 
 #[test]
 fn current_surface_and_strict_media_dtos() {
-    assert_eq!(HOST_OPS_VERSION, "geo.hostops.v25");
+    assert_eq!(HOST_OPS_VERSION, "geo.hostops.v26");
+    assert_eq!(HostOp::COUNT, 54);
     let names = HostRuntime::op_surface();
     assert!(
         !names
@@ -137,6 +154,10 @@ fn current_surface_and_strict_media_dtos() {
         (
             HostOp::ContentDocumentRead,
             "op_host_content_document_read_v1",
+        ),
+        (
+            HostOp::ContentDocumentRevise,
+            "op_host_content_document_revise_v1",
         ),
         (
             HostOp::ContentMediaInsert,
@@ -241,6 +262,136 @@ fn media_insert_text_and_page_validation() {
         }
         .validate_for(&ContentMediaListRequest::default())
         .is_err()
+    );
+}
+
+fn revise_request() -> ContentDocumentReviseRequest {
+    ContentDocumentReviseRequest {
+        execution_id: Uuid::new_v4(),
+        item_id: Uuid::new_v4(),
+        base_revision_id: Uuid::new_v4(),
+        document: StructuredDocument {
+            schema_version: 2,
+            title: "Guide".into(),
+            blocks: vec![ContentBlock {
+                block_id: Uuid::new_v4(),
+                kind: ContentBlockKind::Paragraph,
+                text: "A sourced statement.".into(),
+                citation_ids: vec![Uuid::new_v4()],
+                items: vec![],
+                rich: None,
+            }],
+        },
+    }
+}
+
+#[test]
+fn document_revision_requires_typed_current_schema_and_nonzero_references() {
+    let request = revise_request();
+    assert!(request.validate().is_ok());
+    let mut value = serde_json::to_value(&request).unwrap();
+    value["project_id"] = serde_json::json!(Uuid::new_v4());
+    assert!(serde_json::from_value::<ContentDocumentReviseRequest>(value).is_err());
+    let mutations: [fn(&mut ContentDocumentReviseRequest); 5] = [
+        |request: &mut ContentDocumentReviseRequest| request.base_revision_id = Uuid::nil(),
+        |request: &mut ContentDocumentReviseRequest| request.document.schema_version = 1,
+        |request: &mut ContentDocumentReviseRequest| {
+            request.document.blocks[0].block_id = Uuid::nil()
+        },
+        |request: &mut ContentDocumentReviseRequest| {
+            request
+                .document
+                .blocks
+                .push(request.document.blocks[0].clone())
+        },
+        |request: &mut ContentDocumentReviseRequest| {
+            request.document.blocks[0]
+                .items
+                .push("invalid paragraph item".into())
+        },
+    ];
+    for mutate in mutations {
+        let mut invalid = request.clone();
+        mutate(&mut invalid);
+        assert!(invalid.validate().is_err());
+    }
+}
+
+#[tokio::test]
+async fn revision_ledger_rejects_unrelated_receipts_and_records_exact_draft_receipt() {
+    let recorder = Arc::new(Recorder::default());
+    let bridge = recorded_bridge(Arc::clone(&recorder));
+    let request = revise_request();
+    let receipt = ContentDocumentReviseReceipt {
+        execution_id: request.execution_id,
+        item_id: request.item_id,
+        asset_id: Uuid::new_v4(),
+        base_revision_id: request.base_revision_id,
+        revision_id: Uuid::new_v4(),
+        revision: 1, // A reused asset forks into its own first draft revision.
+    };
+    for field in [
+        "execution_id",
+        "item_id",
+        "base_revision_id",
+        "revision_id",
+        "asset_id",
+        "revision",
+    ] {
+        let mut invalid = serde_json::to_value(&receipt).unwrap();
+        invalid[field] = if field == "revision" {
+            serde_json::json!(0)
+        } else if field == "revision_id" {
+            serde_json::json!(request.base_revision_id)
+        } else {
+            serde_json::json!(Uuid::nil())
+        };
+        let invalid: ContentDocumentReviseReceipt = serde_json::from_value(invalid).unwrap();
+        let failed = bridge
+            .invoke_recorded(HostOp::ContentDocumentRevise, &request, |_| async move {
+                Ok::<_, HostOpError>(invalid)
+            })
+            .await;
+        assert_eq!(failed.unwrap_err().code, HostOpErrorCode::Internal);
+    }
+    let result = bridge
+        .invoke_recorded(HostOp::ContentDocumentRevise, &request, |_| async move {
+            Ok::<_, HostOpError>(receipt)
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.base_revision_id, request.base_revision_id);
+    let outcomes = recorder.outcomes.lock().unwrap();
+    assert_eq!(&outcomes[..6], &[ToolCallOutcome::Failed; 6]);
+    assert_eq!(outcomes[6], ToolCallOutcome::Succeeded);
+}
+
+#[tokio::test]
+async fn revision_op_dispatches_typed_document_and_records_its_receipt() {
+    let recorder = Arc::new(Recorder::default());
+    let bridge = recorded_bridge(Arc::clone(&recorder));
+    let request = revise_request();
+    let payload = serde_json::to_string(&serde_json::to_string(&request).unwrap()).unwrap();
+    let script = format!(
+        "const result = await Deno.core.ops.op_host_content_document_revise_v1({payload});\nDeno.core.ops.op_host_emit('revision', result);"
+    );
+    let entry = "memeloop://bundle/revision-test.js";
+    let mut runtime = HostRuntime::new(&[(entry, script.as_str())], bridge, None).unwrap();
+    runtime
+        .evaluate_module(entry, Duration::from_secs(10))
+        .await
+        .unwrap();
+    let state = runtime.host_state();
+    let event = state
+        .events
+        .iter()
+        .find(|event| event.topic == "revision")
+        .unwrap();
+    let receipt: ContentDocumentReviseReceipt = serde_json::from_str(&event.payload).unwrap();
+    assert!(receipt.validate_for(&request).is_ok());
+    assert_eq!(
+        *recorder.outcomes.lock().unwrap(),
+        vec![ToolCallOutcome::Succeeded]
     );
 }
 

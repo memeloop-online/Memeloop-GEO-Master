@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import test from "node:test";
+import { CONTENT_DOCUMENT_REVISE_SCHEMA } from "../src/content-document-schema.mjs";
 
 const bundlePath = new URL(
   "../dist/memeloop-agent-loop.bundle.mjs",
@@ -48,6 +50,323 @@ function finalModelAnswer(text = "Current answer") {
     completion_tokens: 1,
     finish_reason: "stop",
   };
+}
+
+test("content revision schema accepts Rust defaults and nullable rich attributes while rejecting extras", () => {
+  // Reuse the validator installed by the pinned MemeLoop dependency. Rust
+  // validates UUIDs and the domain tree; these fixtures exercise schema shape.
+  const webRequire = createRequire(
+    new URL("../../../apps/web/package.json", import.meta.url),
+  );
+  const memeloopRequire = createRequire(
+    webRequire.resolve("memeloop/loop-api"),
+  );
+  const Ajv = memeloopRequire("ajv");
+  const validate = new Ajv({ strict: true, validateFormats: false }).compile(
+    CONTENT_DOCUMENT_REVISE_SCHEMA,
+  );
+  const uuid = "00000000-0000-4000-8000-000000000211";
+  const plain = {
+    execution_id: uuid,
+    item_id: uuid,
+    base_revision_id: uuid,
+    document: {
+      schema_version: 2,
+      title: "Guide",
+      blocks: [{ block_id: uuid, kind: "paragraph", text: "A paragraph." }],
+    },
+  };
+  const rich = (node) => ({
+    ...plain,
+    document: {
+      ...plain.document,
+      blocks: [
+        { block_id: uuid, kind: "rich", text: "", rich: { version: 1, node } },
+      ],
+    },
+  });
+  const link = rich({
+    type: "paragraph",
+    content: [
+      {
+        type: "text",
+        text: "Source",
+        marks: [
+          {
+            type: "link",
+            attrs: { href: "https://example.test/source", title: null },
+          },
+        ],
+      },
+    ],
+  });
+  const table = rich({
+    type: "table",
+    content: ["tableHeader", "tableCell"].map((type) => ({
+      type: "tableRow",
+      content: [
+        {
+          type,
+          attrs: { colwidth: null, textAlign: null },
+          content: [{ type: "paragraph" }],
+        },
+      ],
+    })),
+  });
+  const code = rich({
+    type: "codeBlock",
+    attrs: {},
+    content: [{ type: "text", text: "example" }],
+  });
+  const fullPlain = structuredClone(plain);
+  fullPlain.document.blocks[0].citation_ids = [];
+  fullPlain.document.blocks[0].items = [];
+  for (const [name, fixture] of Object.entries({
+    plain,
+    fullPlain,
+    link,
+    table,
+    code,
+  })) {
+    assert.equal(
+      validate(fixture),
+      true,
+      `${name}: ${JSON.stringify(validate.errors)}`,
+    );
+  }
+  for (const [fixture, path] of [
+    [plain, []],
+    [plain, ["document"]],
+    [plain, ["document", "blocks", 0]],
+    [link, ["document", "blocks", 0, "rich"]],
+    [link, ["document", "blocks", 0, "rich", "node"]],
+    [link, ["document", "blocks", 0, "rich", "node", "content", 0, "marks", 0]],
+    [
+      link,
+      [
+        "document",
+        "blocks",
+        0,
+        "rich",
+        "node",
+        "content",
+        0,
+        "marks",
+        0,
+        "attrs",
+      ],
+    ],
+    [
+      table,
+      [
+        "document",
+        "blocks",
+        0,
+        "rich",
+        "node",
+        "content",
+        0,
+        "content",
+        0,
+        "attrs",
+      ],
+    ],
+    [code, ["document", "blocks", 0, "rich", "node", "attrs"]],
+  ]) {
+    const invalid = structuredClone(fixture);
+    path.reduce((value, key) => value[key], invalid).unexpected = true;
+    assert.equal(validate(invalid), false, `Extra field at ${path.join(".")}`);
+  }
+});
+
+for (const conflict of [false, true]) {
+  test(`content revision preserves typed tables through the native tool loop${conflict ? " on conflict" : ""}`, async () => {
+    const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+    const reference = { execution_id: id(201), item_id: id(202) };
+    const base = id(203);
+    const unchanged = {
+      block_id: id(204),
+      kind: "paragraph",
+      text: "Keep this sourced paragraph.",
+      citation_ids: [id(205)],
+      items: [],
+    };
+    const table = {
+      block_id: id(206),
+      kind: "rich",
+      text: "",
+      citation_ids: [id(205)],
+      items: [],
+      rich: {
+        version: 1,
+        node: {
+          type: "table",
+          content: ["tableHeader", "tableCell"].map((type) => ({
+            type: "tableRow",
+            content: [
+              {
+                type,
+                content: [
+                  { type: "paragraph", content: [{ type: "text", text: "A" }] },
+                ],
+              },
+            ],
+          })),
+        },
+      },
+    };
+    const revision = {
+      ...reference,
+      base_revision_id: base,
+      document: {
+        schema_version: 2,
+        title: "Comparison",
+        blocks: [unchanged, table],
+      },
+    };
+    const receipt = {
+      ...reference,
+      asset_id: id(207),
+      base_revision_id: base,
+      revision_id: id(208),
+      revision: 2,
+    };
+    const calls = [];
+    const requests = [];
+    globalThis.__GEO_AGENT_TEST_HOST__ = {
+      async emit() {},
+      async contentDocumentRead(input) {
+        calls.push(["read", input]);
+        return {
+          ...reference,
+          revision_id: base,
+          current_revision_id: base,
+          document: {
+            ...revision.document,
+            blocks: [
+              unchanged,
+              { ...unchanged, block_id: table.block_id, text: "| A |" },
+            ],
+          },
+        };
+      },
+      async contentDocumentRevise(input) {
+        calls.push(["revise", input]);
+        if (conflict) {
+          throw new Error(
+            JSON.stringify({
+              code: "conflict",
+              op: "content.document.revise.v1",
+              message: "Revision changed",
+            }),
+          );
+        }
+        return receipt;
+      },
+      async modelComplete(request) {
+        requests.push(request);
+        const schema = request.tools.find(
+          ({ function: tool }) => tool.name === "content_document_revise",
+        ).function.parameters;
+        assert.equal(schema.additionalProperties, false);
+        assert.deepEqual(schema.required, [
+          "execution_id",
+          "item_id",
+          "base_revision_id",
+          "document",
+        ]);
+        assert.equal(schema.properties.document.additionalProperties, false);
+        assert.equal(
+          schema.properties.document.properties.schema_version.const,
+          2,
+        );
+        assert.equal(
+          schema.properties.document.properties.blocks.items
+            .additionalProperties,
+          false,
+        );
+        assert.equal(
+          schema.properties.document.properties.blocks.items.properties.rich
+            .anyOf[0].properties.node.$ref,
+          "#/$defs/richNode",
+        );
+        const variants = schema.$defs.richNode.anyOf;
+        for (const type of [
+          "table",
+          "tableRow",
+          "tableHeader",
+          "tableCell",
+          "media",
+          "orderedList",
+          "text",
+        ]) {
+          const variant = variants.find(
+            (value) => value.properties.type.const === type,
+          );
+          assert.ok(variant, type);
+          assert.equal(variant.additionalProperties, false);
+        }
+        assert.match(
+          canonicalSystemContent(request),
+          /Preserve non-target block IDs/u,
+        );
+        const step =
+          requests.length === 1
+            ? ["content_document_read", reference]
+            : requests.length === 2
+              ? ["content_document_revise", revision]
+              : null;
+        if (step) {
+          return {
+            ...finalModelAnswer(""),
+            finish_reason: "tool_calls",
+            tool_calls: [
+              {
+                id: `revise-${requests.length}`,
+                type: "function",
+                function: { name: step[0], arguments: JSON.stringify(step[1]) },
+              },
+            ],
+          };
+        }
+        const returned = request.messages.at(-1).content;
+        assert.match(returned, conflict ? /conflict/u : /revision_id/u);
+        if (!conflict)
+          assert.match(returned, new RegExp(receipt.revision_id, "u"));
+        return finalModelAnswer(
+          conflict
+            ? "The document changed; reread before applying the edit."
+            : "Saved a new draft revision, pending checks.",
+        );
+      },
+    };
+    try {
+      const { main } = await import(
+        `${bundlePath.href}?contentRevision=${conflict}-${Date.now()}`
+      );
+      const run = main({
+        ...historyTurn,
+        prompt:
+          "Convert the comparison into a typed table and preserve the rest.",
+      });
+      if (conflict) {
+        await assert.rejects(run, /conflict/u);
+        assert.equal(requests.length, 2);
+      } else {
+        const result = await run;
+        assert.equal(requests.length, 3);
+        assert.match(result.answer, /draft revision/u);
+      }
+      assert.deepEqual(calls, [
+        ["read", reference],
+        ["revise", revision],
+      ]);
+      assert.deepEqual(calls[1][1].document.blocks[0], unchanged);
+      assert.equal(calls[1][1].document.blocks[1].rich.node.type, "table");
+    } finally {
+      delete globalThis.__GEO_AGENT_TEST_HOST__;
+    }
+  });
 }
 
 function canonicalSystemContent(request) {
@@ -449,6 +768,7 @@ test("the current Rust op registration starts the bundle and serves explicit sou
   assert.ok(opNames.includes("op_host_knowledge_text_read_v1"));
   assert.ok(opNames.includes("op_host_content_create_v1"));
   assert.ok(opNames.includes("op_host_content_items_read_v1"));
+  assert.ok(opNames.includes("op_host_content_document_revise_v1"));
   assert.ok(!opNames.includes("op_host_knowledge_search_v1"));
   const ops = Object.fromEntries(
     opNames.map((name) => [
@@ -481,6 +801,30 @@ test("the current Rust op registration starts the bundle and serves explicit sou
   const calls = [];
   const requests = [];
   const emitted = [];
+  const revisionRequest = {
+    ...contentReference,
+    base_revision_id: "00000000-0000-4000-8000-000000000096",
+    document: {
+      schema_version: 2,
+      title: "Revised guide",
+      blocks: [
+        {
+          block_id: "00000000-0000-4000-8000-000000000097",
+          kind: "paragraph",
+          text: "A revised paragraph.",
+          citation_ids: [],
+          items: [],
+        },
+      ],
+    },
+  };
+  const revisionReceipt = {
+    ...contentReference,
+    asset_id: "00000000-0000-4000-8000-000000000098",
+    base_revision_id: revisionRequest.base_revision_id,
+    revision_id: "00000000-0000-4000-8000-000000000099",
+    revision: 2,
+  };
   ops.op_host_knowledge_text_read_v1 = async (payload) => {
     calls.push(["knowledge_text_read", JSON.parse(payload)]);
     return JSON.stringify({
@@ -498,6 +842,10 @@ test("the current Rust op registration starts the bundle and serves explicit sou
       origin: { kind: "on_demand", request: contentRequest },
       status: "running",
     });
+  };
+  ops.op_host_content_document_revise_v1 = async (payload) => {
+    calls.push(["content_document_revise", JSON.parse(payload)]);
+    return JSON.stringify(revisionReceipt);
   };
   ops.op_host_content_items_read_v1 = async (payload) => {
     calls.push(["content_items_read", JSON.parse(payload)]);
@@ -525,6 +873,7 @@ test("the current Rust op registration starts the bundle and serves explicit sou
     const step = [
       ["knowledge_text_read", manualReference],
       ["content_document_read", contentReference],
+      ["content_document_revise", revisionRequest],
       ["content_create", contentRequest],
       [
         "content_items_read",
@@ -557,13 +906,18 @@ test("the current Rust op registration starts the bundle and serves explicit sou
     assert.deepEqual(calls, [
       ["knowledge_text_read", manualReference],
       ["content_document_read", contentReference],
+      ["content_document_revise", revisionRequest],
       ["content_create", contentRequest],
       [
         "content_items_read",
         { execution_id: contentReference.execution_id, limit: 25 },
       ],
     ]);
-    assert.equal(requests.length, 5);
+    assert.equal(requests.length, 6);
+    assert.deepEqual(
+      JSON.parse(requests[3].messages.at(-1).content),
+      revisionReceipt,
+    );
     assert.match(requests[1].messages.at(-1).content, /Two years/u);
     assert.equal(emitted.length, 1);
     assert.equal(emitted[0][0], "loop.completed");
@@ -1241,6 +1595,7 @@ test("report reduction and immutable read are exposed as separate scoped host to
         "content_items_read",
         "content_media_list",
         "content_document_read",
+        "content_document_revise",
         "content_media_insert",
         "distribution_start",
         "distribution_read",
@@ -1705,6 +2060,7 @@ test("attachment-only turn imports bound items, reads its exact source version, 
         "content_items_read",
         "content_media_list",
         "content_document_read",
+        "content_document_revise",
         "content_media_insert",
         "content_media_bind",
         "distribution_start",

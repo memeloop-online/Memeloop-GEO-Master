@@ -25,18 +25,19 @@ use crate::host::{
     ChannelDiscoverRequest, ChannelManifestReadRequest, ChannelPlanRequest,
     ChannelTargetExecuteRequest, ContentCheckFinishRequest, ContentCloseRequest,
     ContentCreateRequest, ContentDistributeReadRequest, ContentDistributeRequest,
-    ContentDocumentReadRequest, ContentExecutionReadRequest, ContentGenerateFinishRequest,
-    ContentItemsReadRequest, ContentMediaBindRequest, ContentMediaInsertRequest,
-    ContentMediaListRequest, ContentPrepareRequest, ContentRepairFinishRequest,
-    ContentSourceReadRequest, ContentStartRequest, ContentStepRequest, CreateQuestionSet,
-    DistributionReadRequest, DistributionResumeRequest, DistributionStartRequest,
-    DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge, HostOp, HostOpError,
-    KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest, KnowledgeImportUrlRequest,
-    KnowledgeTextReadRequest, KnowledgeTextReviseRequest, ManifestReadRequest, MeasureRequest,
-    MeasurementOptionsRequest, MeasurementPlanCreateRequest, MeasurementPlanReadRequest,
-    ModelCompletionRequest, ProjectCurrentRequest, ProjectEstimateRequest, ProjectReviseRequest,
-    ProjectStartRequest, PublishRequest, QuestionDiscoverRequest, QuestionReviseRequest,
-    ReportGetRequest, ReportPreviewRequest, ReportReduceRequest, validate_question_create,
+    ContentDocumentReadRequest, ContentDocumentReviseRequest, ContentExecutionReadRequest,
+    ContentGenerateFinishRequest, ContentItemsReadRequest, ContentMediaBindRequest,
+    ContentMediaInsertRequest, ContentMediaListRequest, ContentPrepareRequest,
+    ContentRepairFinishRequest, ContentSourceReadRequest, ContentStartRequest, ContentStepRequest,
+    CreateQuestionSet, DistributionReadRequest, DistributionResumeRequest,
+    DistributionStartRequest, DistributionTargetsReadRequest, HOST_OP_ERROR_NAME, HostBridge,
+    HostOp, HostOpError, KnowledgeImportAttachmentsRequest, KnowledgeImportStatusRequest,
+    KnowledgeImportUrlRequest, KnowledgeTextReadRequest, KnowledgeTextReviseRequest,
+    ManifestReadRequest, MeasureRequest, MeasurementOptionsRequest, MeasurementPlanCreateRequest,
+    MeasurementPlanReadRequest, ModelCompletionRequest, ProjectCurrentRequest,
+    ProjectEstimateRequest, ProjectReviseRequest, ProjectStartRequest, PublishRequest,
+    QuestionDiscoverRequest, QuestionReviseRequest, ReportGetRequest, ReportPreviewRequest,
+    ReportReduceRequest, validate_question_create,
 };
 
 macro_rules! project_op {
@@ -373,6 +374,29 @@ pub async fn op_host_content_document_read_v1(
             bridge
                 .capabilities()
                 .content_document_read(bridge.scope(), request)
+                .await
+        })
+        .await?;
+    Ok(encode(op, &result)?)
+}
+
+#[op2]
+#[string]
+pub async fn op_host_content_document_revise_v1(
+    state: Rc<RefCell<OpState>>,
+    #[string] payload: String,
+) -> Result<String, JsErrorBox> {
+    let op = HostOp::ContentDocumentRevise;
+    let bridge = bridge(&state.borrow())?;
+    let request = parse_request::<ContentDocumentReviseRequest>(op, &payload)?;
+    request
+        .validate()
+        .map_err(|reason| js_error(HostOpError::invalid_request(op, reason)))?;
+    let result = bridge
+        .invoke_recorded(op, &request.clone(), |bridge| async move {
+            bridge
+                .capabilities()
+                .content_document_revise(bridge.scope(), request)
                 .await
         })
         .await?;
@@ -1185,6 +1209,7 @@ pub const PRODUCTION_OP_NAMES: [&str; HostOp::COUNT + 2] = [
     HostOp::SerpReparse.op_name(),
     HostOp::KnowledgeImportUrl.op_name(),
     HostOp::ContentCreate.op_name(),
+    HostOp::ContentDocumentRevise.op_name(),
     // Rust-owned run state: the loop's emit contract and the checkpoint probe.
     "op_host_emit",
     "op_host_checkpoint",
