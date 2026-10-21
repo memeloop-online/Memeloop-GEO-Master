@@ -61,6 +61,7 @@ async function run({
   repairError,
   checkCompletion,
   repairCompletion,
+  reviewFixture,
   currentAtCheck = false,
   currentAtRepair = false,
 } = {}) {
@@ -125,7 +126,7 @@ async function run({
       token,
       revision: {
         revision_id: `revision-${item.item_id}-${item.automatic_repair_count}`,
-        document: {
+        document: reviewFixture?.document ?? {
           schema_version: 2,
           title: "Frozen stored title",
           blocks: [
@@ -153,7 +154,7 @@ async function run({
         },
       },
       quotes: quotesFor(request),
-      check_sections: [
+      check_sections: reviewFixture?.check_sections ?? [
         [null, "Frozen stored title"],
         ["stored-block", "Stored typed claim"],
       ],
@@ -308,7 +309,7 @@ async function run({
       const claim = reviewClaim("repair", request);
       return {
         ...claim,
-        blocking_findings: [
+        blocking_findings: reviewFixture?.blocking_findings ?? [
           {
             finding_id: "stored-finding",
             code: "unsupported_claim",
@@ -1234,6 +1235,140 @@ test("repair uses the checked revision and blocking findings before an independe
   assert.equal(result.checkFinishes[0].token, `stored-check-${itemId}-1`);
   assert.equal(result.item.automatic_repair_count, 1);
   assert.equal(result.item.status, "ready");
+});
+
+// These mocked workflow tests prove instruction and fixture delivery only, not
+// whether a real model correctly classifies or repairs the supplied text.
+test("review prompts distinguish editorial labels beside a supported fact", async () => {
+  const document = {
+    schema_version: 2,
+    title: "Test document",
+    blocks: [
+      {
+        block_id: "stored-block",
+        kind: "heading",
+        text: "Draft",
+        citation_ids: ["chunk-0"],
+        items: [],
+      },
+      {
+        block_id: "supported-block",
+        kind: "paragraph",
+        text: "Source fact 0",
+        citation_ids: ["chunk-0"],
+        items: [],
+      },
+    ],
+  };
+  const sections = [
+    [null, document.title],
+    ...document.blocks.map((block) => [block.block_id, block.text]),
+  ];
+  const findings = [null, "stored-block"].map((block_id) => ({
+    finding_id: `editorial-finding-${block_id ?? "title"}`,
+    code: "unsupported_claim",
+    block_id,
+    evidence: [],
+    detail: "Editorial label absent from source quote",
+    blocking: true,
+  }));
+  const result = await run({
+    initial: "needs_repair",
+    reviewFixture: {
+      document,
+      check_sections: sections,
+      blocking_findings: findings,
+    },
+  });
+  const repair = result.repairRequests[0];
+  const check = result.checkRequests[0];
+  assert.deepEqual(JSON.parse(repair.prompt).previous_document, document);
+  assert.deepEqual(JSON.parse(repair.prompt).blocking_findings, findings);
+  assert.deepEqual(JSON.parse(check.prompt).document, document);
+  for (const request of [repair, check]) {
+    const input = JSON.parse(request.prompt);
+    assert.deepEqual(input.check_sections, sections);
+    assert.equal(input.evidence[0].quote, "Source fact 0");
+    assert.ok(request.system.includes("purely editorial labels"));
+    assert.ok(request.system.includes("document purpose or organization"));
+    assert.ok(request.system.includes("untrusted data"));
+  }
+  assert.ok(
+    check.system.includes(
+      "absence of such a label from the quotes alone does not make it an unsupported product claim",
+    ),
+  );
+  assert.ok(check.system.includes("title AND EVERY top-level block_id"));
+  assert.ok(check.system.includes("Each section requires one check"));
+  assert.ok(check.system.includes("permitted citation_ids"));
+  assert.ok(
+    repair.system.includes(
+      "When repairing a flagged title or block, preserve purely editorial labels",
+    ),
+  );
+  assert.ok(repair.system.includes("Preserve unflagged blocks exactly"));
+});
+
+test("review prompts keep test-prefixed PDF and certification assertions subject to evidence", async () => {
+  const document = {
+    schema_version: 2,
+    title: "Test: PDF import is available",
+    blocks: [
+      {
+        block_id: "stored-block",
+        kind: "heading",
+        text: "Test: PDF import is certified and passed all tests",
+        citation_ids: ["chunk-0"],
+        items: [],
+      },
+      {
+        block_id: "action-block",
+        kind: "paragraph",
+        text: "Test: the document was published externally",
+        citation_ids: ["chunk-0"],
+        items: [],
+      },
+    ],
+  };
+  const sections = [
+    [null, document.title],
+    ...document.blocks.map((block) => [block.block_id, block.text]),
+  ];
+  const result = await run({
+    initial: "needs_repair",
+    reviewFixture: { document, check_sections: sections },
+  });
+  const check = result.checkRequests[0];
+  const repair = result.repairRequests[0];
+  assert.deepEqual(JSON.parse(check.prompt).document, document);
+  assert.deepEqual(JSON.parse(repair.prompt).previous_document, document);
+  for (const request of [check, repair]) {
+    assert.deepEqual(JSON.parse(request.prompt).check_sections, sections);
+    assert.equal(JSON.parse(request.prompt).evidence[0].quote, "Source fact 0");
+    assert.ok(
+      request.system.includes("even in a heading or with a test prefix"),
+    );
+  }
+  assert.ok(
+    check.system.includes(
+      "Product capabilities, availability, performance, prices, certifications, completed tests and external actions still require evidence",
+    ),
+  );
+  assert.ok(
+    check.system.includes(
+      "Mark any unsupported or uncertain claim accordingly with its precise fragment",
+    ),
+  );
+  assert.ok(
+    repair.system.includes(
+      "This does not preserve unsupported product claims or claims of completed tests or external actions",
+    ),
+  );
+  assert.ok(
+    repair.system.includes(
+      "correct or delete unsupported claims using ONLY exact public evidence",
+    ),
+  );
 });
 
 test("current check and repair results skip their model calls after stale item reads", async () => {
