@@ -182,6 +182,7 @@ const receipt = {
   account_id: "own-1",
   placement_slot: "primary",
   format: "markdown.v1",
+  withdraw_after_publish: false,
   publication_intent_id: null,
 };
 
@@ -340,6 +341,7 @@ describe("ContentDistributionPanel", () => {
       account_id: "own-1",
       placement_slot: "short_post",
       format: "markdown.v1",
+      withdraw_after_publish: false,
     });
   });
 
@@ -463,6 +465,7 @@ describe("ContentDistributionPanel", () => {
       account_id: "own-1",
       placement_slot: "primary",
       format: "markdown.v1",
+      withdraw_after_publish: false,
     });
     expect(await screen.findByText("发布请求已提交")).toBeTruthy();
     expect(screen.getByTestId("path").textContent).toContain(
@@ -517,6 +520,44 @@ describe("ContentDistributionPanel", () => {
     },
   );
 
+  it("retries an explicit withdrawal request unchanged across remount", async () => {
+    const input = {
+      content_asset_id: "asset-1",
+      content_revision_id: "revision-1",
+      account_id: "own-1",
+      placement_slot: "short_post",
+      format: "markdown.v1",
+      withdraw_after_publish: true,
+    };
+    window.sessionStorage.setItem(
+      'content-distribution-pending:["user-1","operator-1","tenant-1","project-1","asset-1"]',
+      JSON.stringify({ key: "withdrawal-retry", input }),
+    );
+    vi.mocked(submitContentDistributionRequest).mockRejectedValue(
+      new Error("Response lost"),
+    );
+    const user = userEvent.setup();
+    const original = mount();
+    await user.click(screen.getByRole("button", { name: "重试" }));
+    await waitFor(() =>
+      expect(submitContentDistributionRequest).toHaveBeenCalledOnce(),
+    );
+    original.unmount();
+    mount({ selectedRevision: richRevision });
+    await user.click(screen.getByRole("button", { name: "重试" }));
+    await waitFor(() =>
+      expect(submitContentDistributionRequest).toHaveBeenCalledTimes(2),
+    );
+    for (const call of vi.mocked(submitContentDistributionRequest).mock.calls) {
+      expect(call).toEqual([
+        "tenant-1",
+        "project-1",
+        input,
+        "withdrawal-retry",
+      ]);
+    }
+  });
+
   it("keeps pending requests isolated from other projects and assets", async () => {
     vi.mocked(submitContentDistributionRequest).mockRejectedValue(
       new Error("Response lost"),
@@ -558,6 +599,7 @@ describe("ContentDistributionPanel", () => {
           account_id: "account-1",
           placement_slot: "primary",
           format: "markdown.v1",
+          withdraw_after_publish: false,
         },
       }),
     );
@@ -705,12 +747,38 @@ describe("ContentDistributionPanel", () => {
           account_id: "own-1",
           placement_slot: "primary",
           format: "markdown.v1",
+          withdraw_after_publish: false,
         },
       }),
     );
     mount({ path: "/?distribution_request_id=request-1" });
     expect(await screen.findByText("发布请求已提交")).toBeTruthy();
     await waitFor(() => expect(window.sessionStorage.length).toBe(0));
+    expect(submitContentDistributionRequest).not.toHaveBeenCalled();
+  });
+
+  it("does not discard an uncertain request with a different withdrawal instruction", async () => {
+    vi.mocked(getContentDistributionRequest).mockResolvedValue({
+      ...receipt,
+      placement_slot: "short_post",
+    } as never);
+    window.sessionStorage.setItem(
+      'content-distribution-pending:["user-1","operator-1","tenant-1","project-1","asset-1"]',
+      JSON.stringify({
+        key: "withdrawal-retry",
+        input: {
+          content_asset_id: "asset-1",
+          content_revision_id: "revision-1",
+          account_id: "own-1",
+          placement_slot: "short_post",
+          format: "markdown.v1",
+          withdraw_after_publish: true,
+        },
+      }),
+    );
+    mount({ path: "/?distribution_request_id=request-1" });
+    expect(await screen.findByText("发布请求已提交")).toBeTruthy();
+    expect(window.sessionStorage.length).toBe(1);
     expect(submitContentDistributionRequest).not.toHaveBeenCalled();
   });
 
@@ -725,6 +793,7 @@ describe("ContentDistributionPanel", () => {
           account_id: "own-1",
           placement_slot: "primary",
           format: "markdown.v1",
+          withdraw_after_publish: false,
         },
       }),
     );

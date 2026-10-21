@@ -621,6 +621,7 @@ async fn formal_coverage_reuses_request_origin_and_its_actual_command() {
         account: account.clone(),
         placement_slot: "primary".into(),
         format: geo_domain::TEXT_DISTRIBUTION_FORMAT.into(),
+        withdraw_after_publish: false,
         idempotency_key: "request-before-coverage".into(),
     };
     let first = geo_domain::prepare_content_distribution_request(&fixture.scope, &input).unwrap();
@@ -790,6 +791,7 @@ async fn publication_target_resolves_original_across_cycles_without_mutation_or_
                 .clone(),
             placement_slot: "primary".into(),
             format: geo_domain::TEXT_DISTRIBUTION_FORMAT.into(),
+            withdraw_after_publish: false,
             idempotency_key: "reuse-coverage-origin".into(),
         },
     )

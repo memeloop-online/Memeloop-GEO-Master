@@ -180,6 +180,7 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
         account,
         placement_slot: "primary".into(),
         format: TEXT_DISTRIBUTION_FORMAT.into(),
+        withdraw_after_publish: false,
         idempotency_key: "request-1".into(),
     };
     let repository = PgContentDistributionRequestRepository::from_database(&database);
@@ -427,6 +428,7 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
         account: repository_input_account(&scope, second_account),
         placement_slot: "primary".into(),
         format: TEXT_DISTRIBUTION_FORMAT.into(),
+        withdraw_after_publish: false,
         idempotency_key: "request-second-account".into(),
     };
     let second_request = repository.accept(&scope, second_input).await.unwrap();
@@ -679,6 +681,7 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
         account: ready_account.clone(),
         placement_slot: "primary".into(),
         format: TEXT_DISTRIBUTION_FORMAT.into(),
+        withdraw_after_publish: false,
         idempotency_key: "independent-1".into(),
     };
     let first = repository
@@ -1034,6 +1037,7 @@ async fn accepted_requests_replay_conflict_scope_and_link_existing_intents() {
                 account: ready_account.clone(),
                 placement_slot: "primary".into(),
                 format: geo_domain::RICH_DISTRIBUTION_FORMAT.into(),
+                withdraw_after_publish: false,
                 idempotency_key: "rich-exact".into(),
             },
         )

@@ -16,8 +16,14 @@ const ID = /^[a-zA-Z0-9_-]{1,128}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHA256 = /^[0-9a-f]{64}$/;
 const VIEWPORT = Object.freeze({ width: 1280, height: 800 });
-const OPERATIONS = new Set(["publish", "measure", "lookup", "rich_publish"]);
-const JSON_OPERATIONS = new Set(["publish", "measure", "lookup"]);
+const OPERATIONS = new Set([
+  "publish",
+  "measure",
+  "lookup",
+  "withdraw",
+  "rich_publish",
+]);
+const JSON_OPERATIONS = new Set(["publish", "measure", "lookup", "withdraw"]);
 const BROWSER_CHANNELS = new Set(["chromium", "chrome", "msedge"]);
 const STATUSES = new Set([
   "unsupported",

@@ -1445,6 +1445,7 @@ impl HostOps for RepositoryHostOps {
                 account_id: request.account_id,
                 placement_slot: request.placement_slot,
                 format: request.format,
+                withdraw_after_publish: false,
             },
             request.idempotency_key,
         )
@@ -2562,6 +2563,7 @@ mod tests {
             account_id: uuid::Uuid::new_v4(),
             account_owner_kind: "customer".into(),
             format: "markdown.v1".into(),
+            withdraw_after_publish: false,
             idempotency_key_hash: "sensitive-opaque-key-hash".into(),
             request_hash: "sensitive-input-hash".into(),
             publication_intent_id: None,

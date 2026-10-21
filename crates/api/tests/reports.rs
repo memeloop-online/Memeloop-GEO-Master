@@ -1392,6 +1392,7 @@ async fn formal_cell_reusing_independent_request_maps_lookup_to_real_command_id(
             account: account.clone(),
             placement_slot: target.placement_slot.clone(),
             format: TEXT_DISTRIBUTION_FORMAT.into(),
+            withdraw_after_publish: false,
             idempotency_key: "independent-report-fixture".into(),
         },
     )

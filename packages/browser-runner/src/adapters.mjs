@@ -10,7 +10,11 @@ import { observeDeepSeekWebSearch } from "./deepseek-web-search.mjs";
 import { inspectDeepSeekMeasurementOptions } from "./deepseek-model-discovery.mjs";
 import { capturedNewConversationId } from "./provider-conversation-ownership.mjs";
 import { consumerWebProviders } from "./consumer-web-providers.mjs";
-import { publishShortPost, lookupShortPost } from "./short-publication.mjs";
+import {
+  publishShortPost,
+  lookupShortPost,
+  withdrawShortPost,
+} from "./short-publication.mjs";
 import {
   probeGlmAccount,
   probeDeepseekAccount,
@@ -753,14 +757,19 @@ function normalized(text) {
   return text.replace(/\s+/gu, " ").trim();
 }
 
-function shortPostPayload(payload, lookup = false) {
+function shortPostPayload(payload, operation) {
+  const lookup = operation === "lookup";
+  const permitted =
+    operation === "withdraw"
+      ? ["placement_slot", "external_id", "body"]
+      : ["placement_slot", "title", "body"];
   if (
     payload === null ||
     typeof payload !== "object" ||
     Array.isArray(payload) ||
     Object.keys(payload).some(
       (key) =>
-        !["placement_slot", "title", "body"].includes(key) &&
+        !permitted.includes(key) &&
         !(lookup && ["external_id", "public_url"].includes(key)),
     )
   )
@@ -769,6 +778,8 @@ function shortPostPayload(payload, lookup = false) {
     body: payload.body,
     ...(payload.title !== undefined ? { title: payload.title } : {}),
   };
+  if (operation === "withdraw")
+    return { body: content.body, external_id: payload.external_id };
   if (!lookup) return content;
   let externalId = payload.external_id;
   if (payload.public_url !== undefined) {
@@ -1305,13 +1316,13 @@ export const adapters = Object.freeze({
     connectorVersion: CONNECTOR_VERSION,
     origin: "https://www.zhihu.com",
     entry: "https://www.zhihu.com/creator",
-    operations: Object.freeze(["publish", "lookup"]),
+    operations: Object.freeze(["publish", "lookup", "withdraw"]),
     placements: Object.freeze({
       primary: Object.freeze({
         operations: Object.freeze(["publish", "lookup"]),
       }),
       short_post: Object.freeze({
-        operations: Object.freeze(["publish", "lookup"]),
+        operations: Object.freeze(["publish", "lookup", "withdraw"]),
       }),
     }),
     identify(page) {
@@ -1323,15 +1334,17 @@ export const adapters = Object.freeze({
           ? "primary"
           : payload.placement_slot;
       if (slot === "short_post") {
-        if (!["publish", "lookup"].includes(operation))
+        if (!["publish", "lookup", "withdraw"].includes(operation))
           return unsupported("operation_not_supported");
-        const content = shortPostPayload(payload, operation === "lookup");
+        const content = shortPostPayload(payload, operation);
         if (!content)
           return unsupported(
             operation === "lookup"
               ? "invalid_lookup_payload"
               : "invalid_content_payload",
           );
+        if (operation === "withdraw")
+          return withdrawShortPost(page, content, network);
         return operation === "publish"
           ? publishShortPost(page, content, network)
           : lookupShortPost(page, content, network);

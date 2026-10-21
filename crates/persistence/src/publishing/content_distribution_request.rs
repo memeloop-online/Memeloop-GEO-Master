@@ -94,6 +94,7 @@ pub(crate) fn read_request(row: &sqlx::postgres::PgRow) -> ContentDistributionRe
         account_id: row.get("account_id"),
         account_owner_kind: row.get("account_owner_kind"),
         format: row.get("format"),
+        withdraw_after_publish: row.get("withdraw_after_publish"),
         idempotency_key_hash: row.get("idempotency_key_hash"),
         request_hash: row.get("request_hash"),
         publication_intent_id: row.get("publication_intent_id"),
@@ -116,7 +117,7 @@ pub(crate) fn read_request(row: &sqlx::postgres::PgRow) -> ContentDistributionRe
 
 pub(crate) const REQUEST_COLUMNS: &str = "request_id,operator_id,tenant_id,project_id,schema_version,\
 content_revision_id,content_asset_id,platform_id,placement_slot,account_id,account_owner_kind,\
-format,idempotency_key_hash,request_hash,publication_intent_id,materialization_reason,\
+format,withdraw_after_publish,idempotency_key_hash,request_hash,publication_intent_id,materialization_reason,\
 materialization_attempts,materialization_next_retry_at,created_at";
 
 fn decode<T: serde::de::DeserializeOwned>(json: serde_json::Value) -> Result<T, AppError> {
@@ -330,8 +331,8 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
             "INSERT INTO content_distribution_requests \
              (request_id,operator_id,tenant_id,project_id,schema_version,content_revision_id,\
               content_asset_id,platform_id,placement_slot,account_id,account_owner_kind,format,\
-              idempotency_key_hash,request_hash,created_at) \
-             SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15 \
+              idempotency_key_hash,request_hash,created_at,withdraw_after_publish) \
+             SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16 \
              WHERE EXISTS (SELECT 1 FROM content_revisions r WHERE \
                  r.operator_id=$2 AND r.tenant_id=$3 AND r.project_id=$4 \
                  AND r.revision_id=$6 AND r.asset_id=$7) \
@@ -361,6 +362,7 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
         .bind(&request.idempotency_key_hash)
         .bind(&request.request_hash)
         .bind(request.created_at)
+        .bind(request.withdraw_after_publish)
         .fetch_optional(&mut *tx)
         .await
         .map_err(db)?;
@@ -440,11 +442,15 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
             .ok_or_else(|| AppError::not_found("distribution request not found"))?;
         let request = read_request(&request);
         let row = sqlx::query(
-            "SELECT i.body AS intent, v.body AS variant FROM distribution_publication_intents i \
+            "SELECT i.body AS intent, v.body AS variant, \
+             COALESCE(q.withdraw_after_publish,false) AS original_withdrawal \
+             FROM distribution_publication_intents i \
              JOIN distribution_channel_variants v ON (v.operator_id,v.tenant_id,v.project_id,v.variant_id)=\
                (i.operator_id,i.tenant_id,i.project_id,i.variant_id) \
              JOIN distribution_publication_commands c ON (c.operator_id,c.tenant_id,c.project_id,c.intent_id)=\
                (i.operator_id,i.tenant_id,i.project_id,i.intent_id) \
+             LEFT JOIN content_distribution_requests q ON (q.operator_id,q.tenant_id,q.project_id,q.request_id)=\
+               (i.operator_id,i.tenant_id,i.project_id,i.origin_request_id) \
              WHERE i.operator_id=$1 AND i.tenant_id=$2 AND i.project_id=$3 AND i.intent_id=$4",
         )
         .bind(scope.operator_id.as_uuid())
@@ -455,6 +461,11 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
         .await
         .map_err(db)?
         .ok_or_else(|| AppError::not_found("publication intent not found"))?;
+        if row.get::<bool, _>("original_withdrawal") != request.withdraw_after_publish {
+            return Err(AppError::conflict(
+                "existing publication withdrawal authority differs",
+            ));
+        }
         let intent: PublicationIntent = serde_json::from_value(row.get("intent"))
             .map_err(|_| AppError::new(ErrorCode::Internal, "invalid stored intent"))?;
         let variant: ChannelVariant = serde_json::from_value(row.get("variant"))
@@ -748,6 +759,26 @@ impl ContentDistributionRequestRepository for PgContentDistributionRequestReposi
         .await
         .map_err(db)?;
         let intent = if let Some(row) = previous {
+            let original_withdrawal: bool = if let Some(origin_request_id) =
+                row.get::<Option<Uuid>, _>("origin_request_id")
+            {
+                sqlx::query_scalar(
+                    "SELECT withdraw_after_publish FROM content_distribution_requests \
+                     WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND request_id=$4",
+                )
+                .bind(scope.operator_id.as_uuid())
+                .bind(scope.tenant_id.as_uuid())
+                .bind(project_id)
+                .bind(origin_request_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(db)?
+            } else {
+                false
+            };
+            if original_withdrawal != request.withdraw_after_publish {
+                return Err(AppError::conflict("existing publication withdrawal authority differs").into());
+            }
             let mut prior: PublicationIntent = decode(row.get("body"))?;
             prior.verification = decode(serde_json::Value::String(row.get("verification")))?;
             prior.verification_evidence_id = row.get("verification_evidence_id");

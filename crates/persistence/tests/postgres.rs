@@ -365,6 +365,389 @@ async fn seed_project(pool: &PgPool, operator_id: Uuid, tenant_id: Uuid, label: 
 
 #[tokio::test]
 #[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
+async fn publication_withdrawal_is_scoped_one_shot_and_preserves_the_send_receipt() {
+    use chrono::Utc;
+    use geo_domain::{
+        AcceptContentDistributionRequest, ChannelAccount, ChannelJobRepository, ChannelOutcome,
+        ChannelOutcomeStatus, ChannelOwnerKind, ChannelStatus, ContentBlock, ContentBlockKind,
+        ContentCheck, ContentDistributionRequestRepository, ContentEvidence, ContentRevision,
+        EvidenceRef, PublicationWithdrawalState, StructuredDocument, TEXT_DISTRIBUTION_FORMAT,
+        plain_text_publication_readback_hash,
+    };
+    use geo_persistence::{PgChannelJobRepository, PgContentDistributionRequestRepository};
+
+    let database = connect().await;
+    let scope = seed_scope(database.pool(), "withdrawal").await;
+    let foreign = seed_sibling_scope(database.pool(), &scope, "withdrawal-other").await;
+    let operator = scope.operator_id.as_uuid();
+    let tenant = scope.tenant_id.as_uuid();
+    let project = scope.project_id.unwrap().as_uuid();
+    macro_rules! insert {
+        ($query:expr $(, $value:expr)* $(,)?) => {
+            sqlx::query($query).bind(operator).bind(tenant).bind(project)
+                $(.bind($value))* .execute(database.pool()).await.unwrap()
+        };
+    }
+    let knowledge = PgKnowledgeRepository::from_database(&database);
+    let imported = knowledge
+        .import_batch(
+            &scope,
+            vec![ImportItem {
+                client_item_id: "withdrawal-source".into(),
+                kind: SourceKind::Text,
+                name: "Public fixture".into(),
+                purpose: KnowledgePurpose::Public,
+                text: Some("A public fixture sentence.".into()),
+                url: None,
+                object_id: None,
+                knowledge_release_id: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let source = imported.items[0].source.as_ref().unwrap();
+    let detail = knowledge
+        .get_source_detail(&scope, source.source_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let chunk = &detail.chunks[0];
+    let reference = EvidenceRef {
+        source_version_id: chunk.source_version_id,
+        chunk_id: Some(chunk.chunk_id),
+        locator: chunk.locator.clone(),
+    };
+    let manifest = Uuid::new_v4();
+    let content_execution = Uuid::new_v4();
+    insert!(
+        "INSERT INTO document_manifests (operator_id,tenant_id,project_id,manifest_id,\
+        cycle_id,origin_kind,revision,state,sealed,expected_count,scope_hash,input_refs) \
+        VALUES ($1,$2,$3,$4,NULL,'on_demand',1,'ready',true,1,'fixture','{}'::jsonb)",
+        manifest
+    );
+    insert!(
+        "INSERT INTO content_executions (operator_id,tenant_id,project_id,execution_id,\
+        cycle_id,origin_kind,request_id,manifest_id,manifest_revision,policy_version,input_hash,state) \
+        VALUES ($1,$2,$3,$4,NULL,'on_demand',$5,$6,1,'fixture','fixture','{}'::jsonb)",
+        content_execution,
+        Uuid::new_v4(),
+        manifest
+    );
+    let now = Utc::now();
+    let account = ChannelAccount {
+        account_id: Uuid::new_v4(),
+        project_id: scope.project_id.unwrap(),
+        owner_kind: ChannelOwnerKind::Customer,
+        platform: "zhihu".into(),
+        group_id: None,
+        status: ChannelStatus::Ready,
+        display_name: None,
+        platform_account_id: None,
+        avatar_url: None,
+        enabled: true,
+        proxy_configured: false,
+        proxy_server: None,
+        created_at: now,
+        updated_at: now,
+    };
+    insert!(
+        "INSERT INTO channel_accounts (operator_id,tenant_id,project_id,account_id,platform,metadata) \
+        VALUES ($1,$2,$3,$4,'zhihu',$5)",
+        account.account_id,
+        serde_json::to_value(&account).unwrap()
+    );
+    let requests = PgContentDistributionRequestRepository::from_database(&database);
+    let jobs = PgChannelJobRepository::from_database(&database);
+
+    for scenario in [
+        "verified",
+        "wrong-candidate",
+        "navigation-only",
+        "unverified",
+        "interrupted",
+    ] {
+        let document = StructuredDocument {
+            title: format!("Withdrawal fixture {scenario}"),
+            schema_version: 2,
+            blocks: vec![ContentBlock {
+                block_id: Uuid::new_v4(),
+                kind: ContentBlockKind::Paragraph,
+                text: chunk.text.clone(),
+                citation_ids: vec![chunk.chunk_id],
+                items: vec![],
+                rich: None,
+            }],
+        };
+        let revision = ContentRevision {
+            revision_id: Uuid::new_v4(),
+            asset_id: Uuid::new_v4(),
+            revision: 1,
+            base_revision_id: None,
+            derived_from_revision_id: None,
+            markdown: document.markdown(),
+            document,
+            evidence: vec![reference.clone()],
+            quotes: vec![ContentEvidence {
+                reference: reference.clone(),
+                exact_quote: chunk.text.clone(),
+            }],
+            findings: vec![],
+            created_at: now,
+        };
+        let check = ContentCheck {
+            check_id: Uuid::new_v4(),
+            revision_id: revision.revision_id,
+            findings: vec![],
+            created_at: now,
+        };
+        insert!(
+            "INSERT INTO content_revisions (operator_id,tenant_id,project_id,revision_id,\
+            execution_id,asset_id,revision,body,created_at) VALUES ($1,$2,$3,$4,$5,$6,1,$7,$8)",
+            revision.revision_id,
+            content_execution,
+            revision.asset_id,
+            serde_json::to_value(&revision).unwrap(),
+            now
+        );
+        insert!(
+            "INSERT INTO content_checks (operator_id,tenant_id,project_id,check_id,\
+            execution_id,revision_id,body,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            check.check_id,
+            content_execution,
+            revision.revision_id,
+            serde_json::to_value(&check).unwrap(),
+            now
+        );
+        let input = AcceptContentDistributionRequest {
+            revision: revision.clone(),
+            account: account.clone(),
+            placement_slot: "short_post".into(),
+            format: TEXT_DISTRIBUTION_FORMAT.into(),
+            withdraw_after_publish: true,
+            idempotency_key: scenario.into(),
+        };
+        let mut unsupported = input.clone();
+        unsupported.account.platform = "unsupported".into();
+        assert_eq!(
+            requests.accept(&scope, unsupported).await.unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        let request = requests.accept(&scope, input.clone()).await.unwrap();
+        let request = requests
+            .materialize(&scope, request.request_id)
+            .await
+            .unwrap();
+        let intent = request.publication_intent_id.unwrap();
+        let mut opposite = input.clone();
+        opposite.withdraw_after_publish = false;
+        opposite.idempotency_key = format!("opposite-{scenario}");
+        let opposite = requests.accept(&scope, opposite).await.unwrap();
+        assert_eq!(
+            requests
+                .link_intent(&scope, opposite.request_id, intent)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            requests
+                .materialize(&scope, opposite.request_id)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        let target_id: Uuid = sqlx::query_scalar(
+            "SELECT command_id FROM distribution_publication_commands WHERE intent_id=$1",
+        )
+        .bind(intent)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        jobs.materialize_pending_commands(None, 1000).await.unwrap();
+        let attempt_id = Uuid::new_v4();
+        let reservation = Uuid::new_v4();
+        let at = Utc::now();
+        jobs.reserve_account(
+            &scope,
+            account.account_id,
+            reservation,
+            at,
+            at + chrono::Duration::minutes(5),
+        )
+        .await
+        .unwrap();
+        jobs.claim_reserved(&scope, target_id, attempt_id, reservation, at)
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs.get_withdrawal(&scope, attempt_id).await.unwrap().state,
+            PublicationWithdrawalState::AwaitingPublication
+        );
+        assert_eq!(
+            jobs.get_withdrawal(&foreign, attempt_id)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            jobs.resolve_withdrawal(&scope, attempt_id)
+                .await
+                .unwrap()
+                .state,
+            PublicationWithdrawalState::AwaitingPublication
+        );
+        let target = jobs.get_target(&scope, target_id).await.unwrap().target;
+        let geo_domain::ChannelTargetInput::GeneratedPublish { title, body, .. } = &target.input
+        else {
+            panic!("generated publication")
+        };
+        let expected = plain_text_publication_readback_hash("short_post", title, body);
+        let url = "https://www.zhihu.com/pin/123456789";
+        let observed = at + chrono::Duration::milliseconds(1);
+        let outcome = ChannelOutcome {
+            status: ChannelOutcomeStatus::Unknown,
+            detail: None,
+            occurred_at: observed,
+            raw_answer: None,
+            citations: vec![],
+            public_url: None,
+            screenshot_ref: None,
+            connector_version: Some("browser-v1".into()),
+            fixture: false,
+            runner_evidence: vec![if scenario == "navigation-only" {
+                json!({"kind":"publication_candidate","schema_version":"geo.publication.candidate.v1",
+                    "source":"post_submit_navigation","url":url,"expected_sha256":expected,
+                    "attempt_id":attempt_id,"target_id":target_id,"account_id":account.account_id,
+                    "connector_version":"browser-v1","observed_at":observed})
+            } else {
+                json!({"kind":"publication_created","schema_version":"geo.publication.created.v1",
+                    "external_id":"123456789","url":url,"expected_sha256":expected,
+                    "request_method":"POST","request_url":"https://www.zhihu.com/api/v4/content/publish","http_status":201,
+                    "attempt_id": if scenario == "wrong-candidate" {Uuid::nil()} else {attempt_id},
+                    "target_id":target_id,"account_id":account.account_id,"connector_version":"browser-v1","observed_at":observed})
+            }],
+        };
+        let receipt = jobs
+            .finish(&scope, target_id, attempt_id, outcome, observed)
+            .await
+            .unwrap();
+        let resolved = jobs.resolve_withdrawal(&scope, attempt_id).await.unwrap();
+        if matches!(scenario, "wrong-candidate" | "navigation-only") {
+            assert_eq!(
+                resolved.state,
+                PublicationWithdrawalState::AwaitingPublication
+            );
+            if scenario == "navigation-only" {
+                sqlx::query("UPDATE channel_execution_targets SET frozen_input=jsonb_set(frozen_input,'{input,platform}','\"unsupported\"'::jsonb) WHERE target_id=$1")
+                    .bind(target_id).execute(database.pool()).await.unwrap();
+                assert!(jobs.resolve_withdrawal(&scope, attempt_id).await.is_err());
+                assert!(
+                    jobs.scan_withdrawals(None, 1000)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|row| row.attempt_id == attempt_id)
+                );
+                sqlx::query(
+                    "UPDATE channel_execution_targets SET frozen_input=$1 WHERE target_id=$2",
+                )
+                .bind(serde_json::to_value(&target).unwrap())
+                .bind(target_id)
+                .execute(database.pool())
+                .await
+                .unwrap();
+                // Malformed JSON is represented as non-actionable while its
+                // relational cursor remains present in the same scan page.
+                sqlx::query(
+                    "UPDATE publication_withdrawals SET body=body-'scope' WHERE attempt_id=$1",
+                )
+                .bind(attempt_id)
+                .execute(database.pool())
+                .await
+                .unwrap();
+                let scanned = jobs.scan_withdrawals(None, 1000).await.unwrap();
+                let invalid = scanned
+                    .iter()
+                    .find(|row| row.attempt_id == attempt_id)
+                    .unwrap();
+                assert_eq!(invalid.state, PublicationWithdrawalState::Unknown);
+                assert_eq!(
+                    invalid.error_code.as_deref(),
+                    Some("withdrawal_record_invalid")
+                );
+                assert!(
+                    scanned
+                        .iter()
+                        .any(|row| row.scope == scope && row.attempt_id != attempt_id)
+                );
+                sqlx::query("UPDATE publication_withdrawals SET body=$1 WHERE attempt_id=$2")
+                    .bind(serde_json::to_value(&resolved).unwrap())
+                    .bind(attempt_id)
+                    .execute(database.pool())
+                    .await
+                    .unwrap();
+            }
+        } else {
+            assert_eq!(resolved.state, PublicationWithdrawalState::Ready);
+            assert!(
+                jobs.claim_withdrawal(&scope, attempt_id, Uuid::new_v4(), Uuid::new_v4(), observed)
+                    .await
+                    .is_err()
+            );
+            let execution = Uuid::new_v4();
+            jobs.claim_withdrawal(&scope, attempt_id, execution, reservation, observed)
+                .await
+                .unwrap();
+            assert!(
+                jobs.claim_withdrawal(&scope, attempt_id, Uuid::new_v4(), reservation, observed)
+                    .await
+                    .is_err()
+            );
+            if scenario == "interrupted" {
+                let old = Utc::now() - chrono::Duration::minutes(6);
+                sqlx::query("UPDATE publication_withdrawals SET claimed_at=$1,body=jsonb_set(body,'{claimed_at}',to_jsonb($1::timestamptz)) WHERE attempt_id=$2")
+                    .bind(old).bind(attempt_id).execute(database.pool()).await.unwrap();
+                jobs.scan_withdrawals(None, 1000).await.unwrap();
+                assert_eq!(
+                    jobs.get_withdrawal(&scope, attempt_id).await.unwrap().state,
+                    PublicationWithdrawalState::Unknown
+                );
+            } else {
+                let evidence = json!({"schema_version":"geo.publication.withdrawal.v1",
+                    "execution_id":execution,"external_id":"123456789","public_url":url,
+                    "expected_sha256":expected,"connector_version":"browser-v1","provenance":"live",
+                    "delete_confirmed":scenario=="verified","delete_status":204,"absence_status":404,"observed_at":observed});
+                let finished = jobs
+                    .finish_withdrawal(&scope, attempt_id, execution, evidence, observed)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    finished.state,
+                    if scenario == "verified" {
+                        PublicationWithdrawalState::Withdrawn
+                    } else {
+                        PublicationWithdrawalState::Unknown
+                    }
+                );
+            }
+            assert!(
+                jobs.claim_withdrawal(&scope, attempt_id, Uuid::new_v4(), reservation, observed)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(jobs.get_target(&scope, target_id).await.unwrap(), receipt);
+        jobs.release_account(&scope, account.account_id, reservation)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
 async fn csv_generation_slices_persist_alongside_full_record() {
     let database = connect().await;
     let repository = PgKnowledgeRepository::from_database(&database);

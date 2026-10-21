@@ -170,6 +170,7 @@ mod tests {
                     account_id: Uuid::new_v4(),
                     account_owner_kind: "customer".into(),
                     format: "markdown.v1".into(),
+                    withdraw_after_publish: false,
                     idempotency_key_hash: "fixture".into(),
                     request_hash: "fixture".into(),
                     publication_intent_id: None,

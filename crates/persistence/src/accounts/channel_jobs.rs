@@ -5,8 +5,10 @@ use chrono::{DateTime, Utc};
 use geo_domain::{
     AppError, ChannelAttempt, ChannelCycleInputs, ChannelDispatchCandidate, ChannelJobRepository,
     ChannelOutcome, ChannelPlan, ChannelSecret, ChannelTarget, ChannelTargetInput,
-    ChannelTargetView, ErrorCode, OperatorId, ProjectId, StandaloneMeasurementPlan, TenantId,
-    TenantScope, frozen_cycle_inputs, validate_rich_publication_payload,
+    ChannelTargetView, ErrorCode, OperatorId, ProjectId, PublicationWithdrawal,
+    PublicationWithdrawalState, StandaloneMeasurementPlan, TenantId, TenantScope,
+    finish_publication_withdrawal, frozen_cycle_inputs, resolve_publication_withdrawal,
+    validate_rich_publication_payload,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -54,6 +56,126 @@ fn project(scope: &TenantScope) -> Result<Uuid, AppError> {
         .project_id
         .map(|id| id.as_uuid())
         .ok_or_else(|| AppError::forbidden("project scope required"))
+}
+
+async fn withdrawal_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &TenantScope,
+    attempt_id: Uuid,
+) -> Result<PublicationWithdrawal, AppError> {
+    let body: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT body FROM publication_withdrawals WHERE operator_id=$1 AND tenant_id=$2 \
+         AND project_id=$3 AND attempt_id=$4 FOR UPDATE",
+    )
+    .bind(scope.operator_id.as_uuid())
+    .bind(scope.tenant_id.as_uuid())
+    .bind(project(scope)?)
+    .bind(attempt_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db)?;
+    decode(body.ok_or_else(|| AppError::not_found("publication withdrawal not found"))?)
+}
+
+async fn save_withdrawal_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    row: &PublicationWithdrawal,
+) -> Result<(), AppError> {
+    let state = encode(&row.state)?;
+    sqlx::query(
+        "UPDATE publication_withdrawals SET state=$1,execution_id=$2,claimed_at=$3,body=$4 \
+         WHERE operator_id=$5 AND tenant_id=$6 AND project_id=$7 AND attempt_id=$8",
+    )
+    .bind(state.as_str().expect("withdrawal state is a string"))
+    .bind(row.execution_id)
+    .bind(row.claimed_at)
+    .bind(encode(row)?)
+    .bind(row.scope.operator_id.as_uuid())
+    .bind(row.scope.tenant_id.as_uuid())
+    .bind(project(&row.scope)?)
+    .bind(row.attempt_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
+async fn bind_withdrawal_claim(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &TenantScope,
+    target: &ChannelTarget,
+    attempt_id: Uuid,
+) -> Result<(), AppError> {
+    let ChannelTargetInput::GeneratedPublish {
+        origin_request_id: Some(request_id),
+        platform,
+        placement_slot,
+        rich_payload,
+        ..
+    } = &target.input
+    else {
+        return Ok(());
+    };
+    let request = sqlx::query(
+        "SELECT withdraw_after_publish,account_owner_kind,account_id,platform_id,placement_slot,format \
+         FROM content_distribution_requests WHERE operator_id=$1 AND tenant_id=$2 \
+         AND project_id=$3 AND request_id=$4 FOR SHARE",
+    )
+    .bind(scope.operator_id.as_uuid())
+    .bind(scope.tenant_id.as_uuid())
+    .bind(project(scope)?)
+    .bind(request_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(db)?;
+    if !request.get::<bool, _>("withdraw_after_publish") {
+        return Ok(());
+    }
+    if request.get::<String, _>("account_owner_kind") != "customer"
+        || request.get::<Uuid, _>("account_id") != target.input.account_id()
+        || request.get::<String, _>("platform_id") != *platform
+        || platform != "zhihu"
+        || request.get::<String, _>("placement_slot") != *placement_slot
+        || placement_slot != "short_post"
+        || request.get::<String, _>("format") != geo_domain::TEXT_DISTRIBUTION_FORMAT
+        || rich_payload.is_some()
+    {
+        return Err(AppError::conflict(
+            "withdrawal publication authority differs",
+        ));
+    }
+    let withdrawal = PublicationWithdrawal {
+        scope: scope.clone(),
+        request_id: *request_id,
+        target_id: target.target_id,
+        attempt_id,
+        account_id: target.input.account_id(),
+        state: PublicationWithdrawalState::AwaitingPublication,
+        external_id: None,
+        public_url: None,
+        execution_id: None,
+        claimed_at: None,
+        evidence: serde_json::Value::Null,
+        finished_at: None,
+        error_code: None,
+    };
+    sqlx::query(
+        "INSERT INTO publication_withdrawals \
+         (attempt_id,operator_id,tenant_id,project_id,request_id,target_id,account_id,state,body) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'awaiting_publication',$8)",
+    )
+    .bind(attempt_id)
+    .bind(scope.operator_id.as_uuid())
+    .bind(scope.tenant_id.as_uuid())
+    .bind(project(scope)?)
+    .bind(request_id)
+    .bind(target.target_id)
+    .bind(target.input.account_id())
+    .bind(encode(&withdrawal)?)
+    .execute(&mut **tx)
+    .await
+    .map_err(db)?;
+    Ok(())
 }
 
 async fn bind_generated_claim(
@@ -204,6 +326,242 @@ fn owned_verified_readback(input: &ChannelTargetInput, outcome: &ChannelOutcome)
 
 #[async_trait]
 impl ChannelJobRepository for PgChannelJobRepository {
+    async fn get_withdrawal(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+    ) -> Result<PublicationWithdrawal, AppError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        crate::set_local_scope(&mut tx, scope).await.map_err(db)?;
+        let row = withdrawal_tx(&mut tx, scope, attempt_id).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(row)
+    }
+
+    async fn scan_withdrawals(
+        &self,
+        after_attempt_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<PublicationWithdrawal>, AppError> {
+        if !(1..=1000).contains(&limit) {
+            return Err(AppError::invalid_request(
+                "invalid withdrawal scan page size",
+            ));
+        }
+        // Trusted scheduler: scopes originate exclusively in the stored rows.
+        let records = sqlx::query(
+            "SELECT operator_id,tenant_id,project_id,request_id,target_id,attempt_id,account_id,body \
+             FROM publication_withdrawals \
+             WHERE ($1::uuid IS NULL OR attempt_id>$1) AND \
+               (state IN ('awaiting_publication','ready') OR \
+                (state='claimed' AND claimed_at<=clock_timestamp()-interval '5 minutes')) \
+             ORDER BY attempt_id LIMIT $2",
+        )
+        .bind(after_attempt_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?;
+        let mut rows = Vec::with_capacity(records.len());
+        for record in records {
+            let invalid = PublicationWithdrawal {
+                scope: TenantScope::new(
+                    record.get::<Uuid, _>("operator_id").into(),
+                    record.get::<Uuid, _>("tenant_id").into(),
+                    Some(record.get::<Uuid, _>("project_id").into()),
+                ),
+                request_id: record.get("request_id"),
+                target_id: record.get("target_id"),
+                attempt_id: record.get("attempt_id"),
+                account_id: record.get("account_id"),
+                state: PublicationWithdrawalState::Unknown,
+                external_id: None,
+                public_url: None,
+                execution_id: None,
+                claimed_at: None,
+                evidence: serde_json::Value::Null,
+                finished_at: None,
+                error_code: Some("withdrawal_record_invalid".into()),
+            };
+            let row = match decode::<PublicationWithdrawal>(record.get("body")) {
+                Ok(row)
+                    if row.scope == invalid.scope
+                        && row.request_id == invalid.request_id
+                        && row.target_id == invalid.target_id
+                        && row.attempt_id == invalid.attempt_id
+                        && row.account_id == invalid.account_id =>
+                {
+                    row
+                }
+                _ => {
+                    // A safe placeholder preserves the relational cursor and
+                    // scope without manufacturing cleanup authority.
+                    rows.push(invalid);
+                    continue;
+                }
+            };
+            // Readiness is resolved independently by the dispatcher. One
+            // unsupported/corrupt publication must not abort the whole page.
+            // Keep every row in the page so its last ID remains a valid cursor.
+            if row.state == PublicationWithdrawalState::Claimed {
+                rows.push(
+                    match self.resolve_withdrawal(&row.scope, row.attempt_id).await {
+                        Ok(resolved) => resolved,
+                        Err(_) => PublicationWithdrawal {
+                            error_code: Some("withdrawal_resolution_failed".into()),
+                            ..row
+                        },
+                    },
+                );
+            } else {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn resolve_withdrawal(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+    ) -> Result<PublicationWithdrawal, AppError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        crate::set_local_scope(&mut tx, scope).await.map_err(db)?;
+        let mut row = withdrawal_tx(&mut tx, scope, attempt_id).await?;
+        if row.state == PublicationWithdrawalState::Claimed
+            && row
+                .claimed_at
+                .is_some_and(|at| at + chrono::Duration::minutes(5) <= Utc::now())
+        {
+            row.state = PublicationWithdrawalState::Unknown;
+            row.error_code = Some("withdrawal_execution_expired".into());
+            row.finished_at = Some(Utc::now());
+            save_withdrawal_tx(&mut tx, &row).await?;
+        } else if row.state == PublicationWithdrawalState::AwaitingPublication {
+            let source = sqlx::query(
+                "SELECT t.frozen_input,a.claimed_at,a.outcome,a.received_at \
+                 FROM channel_execution_attempts a JOIN channel_execution_targets t ON \
+                   (t.operator_id,t.tenant_id,t.project_id,t.target_id)= \
+                   (a.operator_id,a.tenant_id,a.project_id,a.target_id) \
+                 WHERE a.operator_id=$1 AND a.tenant_id=$2 AND a.project_id=$3 \
+                   AND a.attempt_id=$4 AND a.target_id=$5 AND a.account_id=$6 FOR SHARE OF a,t",
+            )
+            .bind(scope.operator_id.as_uuid())
+            .bind(scope.tenant_id.as_uuid())
+            .bind(project(scope)?)
+            .bind(attempt_id)
+            .bind(row.target_id)
+            .bind(row.account_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?;
+            let target: ChannelTarget = decode(source.get("frozen_input"))?;
+            let attempt = ChannelAttempt {
+                attempt_id,
+                target_id: row.target_id,
+                claimed_at: source.get("claimed_at"),
+                outcome: source
+                    .get::<Option<serde_json::Value>, _>("outcome")
+                    .map(decode)
+                    .transpose()?,
+                received_at: source.get("received_at"),
+            };
+            resolve_publication_withdrawal(&mut row, &target, &attempt)?;
+            save_withdrawal_tx(&mut tx, &row).await?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(row)
+    }
+
+    async fn claim_withdrawal(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+        execution_id: Uuid,
+        reservation_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<PublicationWithdrawal, AppError> {
+        let account_id = self.get_withdrawal(scope, attempt_id).await?.account_id;
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        crate::set_local_scope(&mut tx, scope).await.map_err(db)?;
+        let lease: Option<(Uuid, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT reservation_id,expires_at FROM channel_account_preflight_reservations \
+             WHERE operator_id=$1 AND account_id=$2 FOR UPDATE",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(account_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        if !lease.is_some_and(|(owner, expiry)| owner == reservation_id && expiry > at) {
+            return Err(AppError::conflict("account preflight reservation expired"));
+        }
+        let mut row = withdrawal_tx(&mut tx, scope, attempt_id).await?;
+        if row.state != PublicationWithdrawalState::Ready
+            || row.execution_id.is_some()
+            || row.account_id != account_id
+        {
+            return Err(AppError::conflict("publication withdrawal is not ready"));
+        }
+        let metadata: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT metadata FROM channel_accounts WHERE operator_id=$1 AND tenant_id=$2 \
+             AND project_id=$3 AND account_id=$4 FOR SHARE",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(scope.tenant_id.as_uuid())
+        .bind(project(scope)?)
+        .bind(account_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let account: geo_domain::ChannelAccount = decode(
+            metadata.ok_or_else(|| AppError::conflict("withdrawal account is no longer owned"))?,
+        )?;
+        if account.account_id != account_id
+            || account.project_id.as_uuid() != project(scope)?
+            || account.owner_kind != geo_domain::ChannelOwnerKind::Customer
+            || account.platform != "zhihu"
+            || !account.enabled
+            || account.status != geo_domain::ChannelStatus::Ready
+        {
+            return Err(AppError::conflict("withdrawal account is unavailable"));
+        }
+        row.state = PublicationWithdrawalState::Claimed;
+        row.execution_id = Some(execution_id);
+        row.claimed_at = Some(at);
+        save_withdrawal_tx(&mut tx, &row).await?;
+        sqlx::query(
+            "UPDATE channel_account_preflight_reservations SET expires_at=$4 \
+             WHERE operator_id=$1 AND account_id=$2 AND reservation_id=$3",
+        )
+        .bind(scope.operator_id.as_uuid())
+        .bind(account_id)
+        .bind(reservation_id)
+        .bind(at + geo_domain::CHANNEL_EXECUTION_LEASE)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)?;
+        Ok(row)
+    }
+
+    async fn finish_withdrawal(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+        execution_id: Uuid,
+        evidence: serde_json::Value,
+        received_at: DateTime<Utc>,
+    ) -> Result<PublicationWithdrawal, AppError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        crate::set_local_scope(&mut tx, scope).await.map_err(db)?;
+        let mut row = withdrawal_tx(&mut tx, scope, attempt_id).await?;
+        finish_publication_withdrawal(&mut row, execution_id, evidence, received_at)?;
+        save_withdrawal_tx(&mut tx, &row).await?;
+        tx.commit().await.map_err(db)?;
+        Ok(row)
+    }
+
     async fn replay_measurement_plan(
         &self,
         scope: &TenantScope,
@@ -668,6 +1026,7 @@ impl ChannelJobRepository for PgChannelJobRepository {
         .await
         .map_err(db)?;
         bind_generated_claim(&mut tx, scope, &target, attempt_id, at).await?;
+        bind_withdrawal_claim(&mut tx, scope, &target, attempt_id).await?;
         // The locked reservation still belongs to this exact preflight owner.
         // Roll back the renewal together with the attempt if any write fails.
         sqlx::query(
@@ -826,6 +1185,7 @@ impl ChannelJobRepository for PgChannelJobRepository {
             .bind(project(scope)?).bind(target_id).bind(target.input.account_id()).bind(kind).bind(at)
             .execute(&mut *tx).await.map_err(db)?;
         bind_generated_claim(&mut tx, scope, &target, attempt_id, at).await?;
+        bind_withdrawal_claim(&mut tx, scope, &target, attempt_id).await?;
         tx.commit().await.map_err(db)?;
         debug_assert_eq!(result.rows_affected(), 1);
         Ok((

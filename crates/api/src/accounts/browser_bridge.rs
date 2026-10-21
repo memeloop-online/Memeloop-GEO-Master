@@ -460,7 +460,7 @@ impl BrowserBridge {
         payload: &serde_json::Value,
         source_capture_ticket: Option<&str>,
     ) -> Result<BrowserExecution, AppError> {
-        if !matches!(operation, "publish" | "measure" | "lookup")
+        if !matches!(operation, "publish" | "measure" | "lookup" | "withdraw")
             || !payload.is_object()
             || source_capture_ticket.is_some_and(|ticket| {
                 operation != "measure" || ticket.is_empty() || ticket.len() > 4096

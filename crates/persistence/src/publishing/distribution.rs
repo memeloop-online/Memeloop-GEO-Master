@@ -1105,11 +1105,22 @@ impl DistributionRepository for PgDistributionRepository {
         let (candidate, command) =
             prepare_publication_intent(scope, &manifest, &old, &variant, account_id, Utc::now());
         let stored = sqlx::query(
-            "SELECT body,verification,verification_evidence_id FROM distribution_publication_intents \
+            "SELECT body,verification,verification_evidence_id,origin_request_id FROM distribution_publication_intents \
              WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND logical_key=$4 FOR UPDATE"
         ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid())
             .bind(project(scope)?).bind(&candidate.logical_key).fetch_optional(&mut *tx).await.map_err(db)?;
         let previous = if let Some(row) = stored {
+            if let Some(request_id) = row.get::<Option<Uuid>, _>("origin_request_id") {
+                let opted_in: bool = sqlx::query_scalar(
+                    "SELECT withdraw_after_publish FROM content_distribution_requests WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND request_id=$4"
+                ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project(scope)?).bind(request_id)
+                    .fetch_one(&mut *tx).await.map_err(db)?;
+                if opted_in {
+                    return Err(AppError::conflict(
+                        "logical publication withdrawal policy differs",
+                    ));
+                }
+            }
             let mut old_intent: PublicationIntent = decode(row.get("body"))?;
             old_intent.verification = decode(serde_json::Value::String(row.get("verification")))?;
             old_intent.verification_evidence_id = row.get("verification_evidence_id");

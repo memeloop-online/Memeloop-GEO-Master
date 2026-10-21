@@ -167,6 +167,20 @@ async fn generated_connector_available(
                 placement_slot: request.placement_slot,
             };
             let connectors = crate::connector_capabilities::deployed_versions(state).await;
+            // Cleanup is part of this immutable request's promised operation.
+            // An older runner must not create a post it cannot later withdraw.
+            if request.withdraw_after_publish
+                && !connectors.iter().any(|connector| {
+                    connector.platform == key.platform_id
+                        && connector.placement_slot == key.placement_slot
+                        && connector
+                            .operations
+                            .iter()
+                            .any(|operation| operation == "withdraw")
+                })
+            {
+                return Ok(false);
+            }
             let settings = state
                 .connector_capability_repository()
                 .get(scope.operator_id, &key)
@@ -500,6 +514,116 @@ fn publication_candidate(
     }))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationCreated {
+    kind: String,
+    schema_version: String,
+    external_id: String,
+    url: String,
+    expected_sha256: String,
+    request_method: String,
+    request_url: String,
+    http_status: u16,
+    observed_at: DateTime<Utc>,
+}
+
+fn publication_created(
+    value: &serde_json::Value,
+    target: &ChannelTarget,
+    attempt: &geo_domain::ChannelAttempt,
+    received_at: DateTime<Utc>,
+    connector_version: &str,
+) -> Option<serde_json::Value> {
+    let (platform, placement_slot, title, body) = match &target.input {
+        ChannelTargetInput::Publish {
+            platform,
+            placement_slot,
+            title,
+            body,
+            ..
+        }
+        | ChannelTargetInput::GeneratedPublish {
+            platform,
+            placement_slot,
+            title,
+            body,
+            rich_payload: None,
+            ..
+        } => (platform, placement_slot, title, body),
+        _ => return None,
+    };
+    let proof: PublicationCreated = serde_json::from_value(value.clone()).ok()?;
+    let expected = plain_text_publication_readback_hash(placement_slot, title, body);
+    if platform != "zhihu"
+        || placement_slot != "short_post"
+        || proof.kind != "publication_created"
+        || proof.schema_version != "geo.publication.created.v1"
+        || proof.external_id.is_empty()
+        || proof.external_id.starts_with('0')
+        || proof.external_id.len() > 40
+        || !proof.external_id.bytes().all(|b| b.is_ascii_digit())
+        || proof.url != format!("https://www.zhihu.com/pin/{}", proof.external_id)
+        || proof.expected_sha256 != expected
+        || proof.request_method != "POST"
+        || proof.request_url != "https://www.zhihu.com/api/v4/content/publish"
+        || !(200..300).contains(&proof.http_status)
+        || proof.observed_at < attempt.claimed_at
+        || proof.observed_at > received_at
+        || connector_version.is_empty()
+        || connector_version.len() > 100
+        || connector_version.starts_with("fixture")
+    {
+        return None;
+    }
+    Some(
+        json!({"kind":"publication_created","schema_version":"geo.publication.created.v1",
+        "external_id":proof.external_id,"url":proof.url,"expected_sha256":expected,
+        "request_method":"POST","request_url":"https://www.zhihu.com/api/v4/content/publish",
+        "http_status":proof.http_status,"observed_at":proof.observed_at,
+        "attempt_id":attempt.attempt_id,"target_id":target.target_id,"account_id":target.input.account_id(),"connector_version":connector_version}),
+    )
+}
+
+fn retain_publication_creation(
+    result: &mut crate::browser_bridge::BrowserExecution,
+    target: &ChannelTarget,
+    attempt: &geo_domain::ChannelAttempt,
+    received_at: DateTime<Utc>,
+    fixture: bool,
+    status: ChannelOutcomeStatus,
+) {
+    let proofs: Vec<_> = result
+        .evidence
+        .iter()
+        .filter(|p| p["kind"] == "publication_created")
+        .collect();
+    let created = if !fixture
+        && proofs.len() == 1
+        && matches!(
+            status,
+            ChannelOutcomeStatus::Unknown
+                | ChannelOutcomeStatus::Published
+                | ChannelOutcomeStatus::Verified
+        ) {
+        publication_created(
+            proofs[0],
+            target,
+            attempt,
+            received_at,
+            result.connector_version.as_deref().unwrap_or_default(),
+        )
+    } else {
+        None
+    };
+    result
+        .evidence
+        .retain(|p| p["kind"] != "publication_created");
+    if let Some(created) = created {
+        result.evidence.push(created);
+    }
+}
+
 fn retain_publication_candidate(
     result: &mut crate::browser_bridge::BrowserExecution,
     target: &ChannelTarget,
@@ -513,7 +637,14 @@ fn retain_publication_candidate(
         .iter()
         .filter(|proof| proof["kind"] == "publication_candidate")
         .collect();
-    let candidate = if !fixture && status == ChannelOutcomeStatus::Unknown && candidates.len() == 1
+    let candidate = if !fixture
+        && matches!(
+            status,
+            ChannelOutcomeStatus::Unknown
+                | ChannelOutcomeStatus::Published
+                | ChannelOutcomeStatus::Verified
+        )
+        && candidates.len() == 1
     {
         publication_candidate(
             candidates[0],
@@ -2087,6 +2218,14 @@ async fn execute_reserved_channel_target(
                 fixture,
                 status,
             );
+            retain_publication_creation(
+                &mut result,
+                &target,
+                &attempt,
+                received_at,
+                fixture,
+                status,
+            );
             ChannelOutcome {
                 status,
                 detail: result.reason.or_else(|| {
@@ -2162,6 +2301,81 @@ mod tests {
     };
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    #[test]
+    fn short_publication_creation_requires_one_exact_correlated_response_contract() {
+        let now = Utc::now();
+        let attempt = geo_domain::ChannelAttempt {
+            attempt_id: Uuid::new_v4(),
+            target_id: Uuid::new_v4(),
+            claimed_at: now,
+            outcome: None,
+            received_at: None,
+        };
+        let mut target = ChannelTarget {
+            target_id: attempt.target_id,
+            input: ChannelTargetInput::Publish {
+                source_id: Uuid::new_v4(),
+                source_version_id: Uuid::new_v4(),
+                platform: "zhihu".into(),
+                placement_slot: "short_post".into(),
+                account_id: Uuid::new_v4(),
+                title: "Synthetic label".into(),
+                body: "Synthetic body".into(),
+                body_sha256: sha256_hex(b"Synthetic body"),
+            },
+        };
+        let proof = json!({"kind":"publication_created","schema_version":"geo.publication.created.v1",
+            "external_id":"42","url":"https://www.zhihu.com/pin/42",
+            "expected_sha256":plain_text_publication_readback_hash("short_post","","Synthetic body"),
+            "request_method":"POST","request_url":"https://www.zhihu.com/api/v4/content/publish","http_status":201,"observed_at":now});
+        let sanitized =
+            publication_created(&proof, &target, &attempt, now, "synthetic.v1").unwrap();
+        assert_eq!(sanitized["attempt_id"], attempt.attempt_id.to_string());
+        assert_eq!(sanitized["target_id"], target.target_id.to_string());
+        for (field, value) in [
+            ("external_id", json!("43")),
+            ("request_method", json!("GET")),
+            ("request_url", json!("https://www.zhihu.com/api/v4/pins/42")),
+            ("http_status", json!(403)),
+            ("expected_sha256", json!("unrelated")),
+            ("account_id", json!(Uuid::new_v4())),
+            ("observed_at", json!(now - chrono::Duration::seconds(1))),
+        ] {
+            let mut invalid = proof.clone();
+            invalid[field] = value;
+            assert!(
+                publication_created(&invalid, &target, &attempt, now, "synthetic.v1").is_none(),
+                "{field}"
+            );
+        }
+        for (fixture, count, expected) in [(false, 1, 1), (true, 1, 0), (false, 2, 0)] {
+            let mut receipt = BrowserExecution {
+                execution_id: attempt.attempt_id,
+                provenance: Some(crate::browser_bridge::BrowserReceiptProvenance::Live),
+                status: "unknown".into(),
+                reason: None,
+                evidence: vec![proof.clone(); count],
+                public_url: None,
+                occurred_at: Some(now),
+                connector_version: Some("synthetic.v1".into()),
+                stage: Some("submit".into()),
+            };
+            retain_publication_creation(
+                &mut receipt,
+                &target,
+                &attempt,
+                now,
+                fixture,
+                ChannelOutcomeStatus::Unknown,
+            );
+            assert_eq!(receipt.evidence.len(), expected);
+        }
+        if let ChannelTargetInput::Publish { platform, .. } = &mut target.input {
+            *platform = "unsupported_platform".into();
+        }
+        assert!(publication_created(&proof, &target, &attempt, now, "synthetic.v1").is_none());
+    }
 
     #[test]
     fn legacy_target_id_golden_bytes_remain_unchanged_when_binding_is_absent() {
@@ -2623,7 +2837,7 @@ mod tests {
         for (fixture, status, hint_count, expected_count) in [
             (false, ChannelOutcomeStatus::Unknown, 1, 1),
             (true, ChannelOutcomeStatus::Unknown, 1, 0),
-            (false, ChannelOutcomeStatus::Verified, 1, 0),
+            (false, ChannelOutcomeStatus::Verified, 1, 1),
             (false, ChannelOutcomeStatus::Unknown, 2, 0),
         ] {
             let mut result = BrowserExecution {

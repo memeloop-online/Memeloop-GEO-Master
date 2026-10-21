@@ -22,11 +22,66 @@ let decoyConfirmations;
 let deleteRequests;
 let deleted;
 let pendingDelete;
+let pendingCreate;
+let createCalls;
 let ownReads;
 let publicCookies;
 const BODY = "Synthetic thought body\nSecond paragraph";
 const escape = (text) =>
   text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+
+function createPayload() {
+  const data = {
+    publish: { traceId: "synthetic-trace" },
+    commentsPermission: { comment_permission: "all" },
+    extra_info: { view_permission: "all", publisher: "pc" },
+    draft: { disabled: 1 },
+    hybrid: {
+      html: BODY.split("\n")
+        .map((line) => `<p>${escape(line)}</p>`)
+        .join(""),
+      textLength: BODY.length,
+    },
+  };
+  if (mode === "edit-request") data.draft.isPublished = true;
+  if (mode === "existing-draft-id") data.draft.id = "42";
+  if (mode === "scheduled-request") data.schedule = { publishAt: 1234567890 };
+  if (mode === "wrong-request-body")
+    data.hybrid.html = "<p>Other synthetic body</p>";
+  return { action: mode === "wrong-action" ? "article" : "pin", data };
+}
+
+function createResponse() {
+  const id =
+    mode === "wrong-created-id" ||
+    (mode === "old-response-with-new-create" && createCalls > 1)
+      ? "99"
+      : "42";
+  const created = {
+    id:
+      mode === "numeric-created-id"
+        ? 42
+        : mode === "invalid-created-id"
+          ? "42/../99"
+          : mode === "zero-created-id"
+            ? "0"
+            : mode === "long-created-id"
+              ? "1".repeat(41)
+              : id,
+    author: {
+      id: mode === "wrong-created-author" ? "other-owner" : "synthetic-account",
+      url_token: "synthetic-owner",
+    },
+  };
+  return mode === "wrong-create-envelope"
+    ? created
+    : {
+        data: {
+          result: JSON.stringify(created),
+          ...(mode === "write-blocked" ? { write: { instruction: true } } : {}),
+        },
+      };
+}
 
 function card(id = "42", body = BODY, token = "synthetic-owner") {
   return `<section class="PinItem" data-fixture-id="${id}">
@@ -59,8 +114,46 @@ before(async () => {
     }
     if (url.pathname === "/fixture-submit") {
       submits++;
+      pendingCreate?.writeHead(200, { "content-type": "application/json" });
+      pendingCreate?.end(JSON.stringify(createResponse()));
+      pendingCreate = undefined;
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    if (url.pathname === "/fixture-create-redirect") {
+      response.writeHead(307, { location: "/api/v4/content/publish" });
+      response.end();
+      return;
+    }
+    if (["/api/v4/content/publish", "/fixture-create"].includes(url.pathname)) {
+      createCalls++;
+      if (
+        [
+          "preexisting-create-response",
+          "old-response-with-new-create",
+        ].includes(mode) &&
+        createCalls === 1
+      ) {
+        pendingCreate = response;
+        return;
+      }
+      if (
+        mode === "redirect-create" &&
+        url.pathname === "/api/v4/content/publish"
+      ) {
+        response.writeHead(302, { location: "/fixture-create" });
+        response.end();
+        return;
+      }
+      response.writeHead(mode === "failed-create" ? 500 : 200, {
+        "content-type": "application/json",
+      });
+      response.end(
+        mode === "invalid-create-json"
+          ? "invalid"
+          : JSON.stringify(createResponse()),
+      );
       return;
     }
     if (url.pathname.startsWith("/api/v4/pins/")) {
@@ -100,6 +193,7 @@ before(async () => {
     }
     response.writeHead(
       (mode === "public-404" ||
+        mode === "no-navigation-unreadable" ||
         deleted ||
         [
           "failed-delete",
@@ -120,6 +214,7 @@ before(async () => {
       response.end(`<!doctype html><html><body>
         ${existing}<button onclick="openComposer()">发想法</button><div id="composer"></div>
         <script>
+          ${["preexisting-create-response", "old-response-with-new-create"].includes(mode) ? `fetch('/api/v4/content/publish', {method:'POST',headers:{'Content-Type':'application/json'},body:${JSON.stringify(JSON.stringify(createPayload()))}});` : ""}
           function openComposer() {
             setTimeout(() => {
               document.querySelector('#composer').innerHTML = '<div class="WritePinV2-Form"><div class="TitleArea"><textarea></textarea></div><div class="public-DraftEditor-content" contenteditable="true">${draft}</div><div class="WritePinToolbar"><button onclick="submitThought()">发布</button></div></div>';
@@ -127,7 +222,10 @@ before(async () => {
           }
           async function submitThought() {
             await fetch('/fixture-submit', {method:'POST'});
-            ${mode === "no-candidate" ? "return;" : mode === "insert-item" || mode === "preexisting" ? `document.body.insertAdjacentHTML('beforeend', ${JSON.stringify(card())});` : "location.assign('/pin/42');"}
+            ${mode === "early-navigation" ? `fetch('/api/v4/content/publish', {method:'POST',headers:{'Content-Type':'application/json'},body:${JSON.stringify(JSON.stringify(createPayload()))}}).then(() => location.assign('/pin/42')); return;` : ""}
+            ${["old-navigation", "preexisting-create-response", "no-candidate", "insert-item", "preexisting"].includes(mode) ? "" : `await fetch(${JSON.stringify(mode === "wrong-create-endpoint" ? "/fixture-create" : mode === "redirected-create-request" ? "/fixture-create-redirect" : "/api/v4/content/publish")}, {method:${JSON.stringify(mode === "wrong-create-method" ? "PUT" : "POST")},headers:{'Content-Type':'application/json'},body:${JSON.stringify(JSON.stringify(createPayload()))}}).then(response => response.json()).catch(() => null);`}
+            ${mode === "duplicate-create" ? `await fetch('/api/v4/content/publish', {method:'POST',headers:{'Content-Type':'application/json'},body:${JSON.stringify(JSON.stringify(createPayload()))}}).then(response => response.json());` : ""}
+            ${["no-candidate", "no-navigation", "no-navigation-unreadable"].includes(mode) ? "return;" : mode === "insert-item" || mode === "preexisting" ? `document.body.insertAdjacentHTML('beforeend', ${JSON.stringify(card())});` : "location.assign('/pin/42');"}
           }
         </script></body></html>`);
       return;
@@ -207,6 +305,8 @@ beforeEach(async () => {
   deleteRequests = [];
   deleted = false;
   pendingDelete = undefined;
+  pendingCreate = undefined;
+  createCalls = 0;
   ownReads = 0;
   publicCookies = [];
 });
@@ -247,6 +347,186 @@ test("body-only publish waits for the asynchronously mounted composer and submit
       .digest("hex"),
   );
   assert.deepEqual(publicCookies, [null]);
+  const created = outcome.evidence[2];
+  assert.ok(created);
+  assert.deepEqual(Object.keys(created).sort(), [
+    "expected_sha256",
+    "external_id",
+    "http_status",
+    "kind",
+    "observed_at",
+    "request_method",
+    "request_url",
+    "schema_version",
+    "url",
+  ]);
+  assert.equal(created.kind, "publication_created");
+  assert.equal(created.schema_version, "geo.publication.created.v1");
+  assert.equal(created.external_id, "42");
+  assert.equal(created.request_method, "POST");
+  assert.equal(created.request_url, `${origin}/api/v4/content/publish`);
+  assert.equal(created.url, outcome.public_url);
+  assert.equal(created.expected_sha256, outcome.evidence[0].expected_sha256);
+  assert.equal(created.http_status, 200);
+  assert.equal(page.listenerCount("request"), 0);
+});
+
+test("old identical navigation and an earlier request response remain read-only candidates", async () => {
+  for (const testMode of ["old-navigation", "preexisting-create-response"]) {
+    mode = testMode;
+    const outcome = await publishShortPost(page, { body: BODY }, network(250));
+    assert.equal(outcome.evidence[0]?.kind, "publication_candidate", testMode);
+    assert.equal(outcome.evidence[1]?.content_matched, true, testMode);
+    assert.equal(
+      outcome.evidence.some((entry) => entry.kind === "publication_created"),
+      false,
+      testMode,
+    );
+    assert.deepEqual(deleteClicks, []);
+    assert.equal(page.listenerCount("request"), 0);
+  }
+});
+
+test("creation response is retained before immediate navigation without resending", async () => {
+  mode = "early-navigation";
+  const outcome = await publishShortPost(page, { body: BODY }, network());
+  assert.equal(outcome.status, "completed");
+  assert.equal(outcome.evidence[2]?.kind, "publication_created");
+  assert.equal(submits, 1);
+  assert.equal(createCalls, 1);
+  assert.equal(page.listenerCount("request"), 0);
+});
+
+test("unavailable browser response capture prevents submission", async () => {
+  const createSession = context.newCDPSession.bind(context);
+  context.newCDPSession = (target) =>
+    target === page
+      ? Promise.reject(new Error("Synthetic capture unavailable"))
+      : createSession(target);
+  try {
+    const outcome = await publishShortPost(page, { body: BODY }, network());
+    assert.equal(outcome.status, "unsupported");
+    assert.equal(outcome.reason, "short_post_create_capture_unavailable");
+    assert.equal(
+      outcome.evidence.some((entry) => entry.kind === "publication_created"),
+      false,
+    );
+    assert.equal(createCalls, 0);
+    assert.equal(submits, 0);
+    assert.equal(page.listenerCount("request"), 0);
+  } finally {
+    context.newCDPSession = createSession;
+  }
+});
+
+test("unsupported or editing request payloads are stopped before the backend", async () => {
+  for (const testMode of [
+    "wrong-create-method",
+    "redirected-create-request",
+    "edit-request",
+    "existing-draft-id",
+    "scheduled-request",
+    "wrong-action",
+    "wrong-request-body",
+  ]) {
+    mode = testMode;
+    createCalls = 0;
+    const outcome = await publishShortPost(page, { body: BODY }, network(350));
+    assert.equal(outcome.status, "unsupported", testMode);
+    assert.equal(
+      outcome.reason,
+      "short_post_create_request_unverified",
+      testMode,
+    );
+    assert.equal(createCalls, 0, testMode);
+    assert.equal(outcome.evidence.length, 0, testMode);
+    assert.equal(page.listenerCount("request"), 0, testMode);
+  }
+});
+
+test("creation proof survives a separate anonymous readback failure", async () => {
+  for (const testMode of ["public-404", "body-mismatch", "foreign-author"]) {
+    mode = testMode;
+    createCalls = 0;
+    const outcome = await publishShortPost(page, { body: BODY }, network());
+    assert.equal(outcome.status, "unknown", testMode);
+    assert.equal(createCalls, 1, testMode);
+    assert.equal(outcome.evidence[0]?.kind, "publication_candidate", testMode);
+    assert.equal(outcome.evidence[1]?.kind, "publication_created", testMode);
+  }
+});
+
+test("the exact created response ID wins over unrelated older navigation", async () => {
+  for (const testMode of ["wrong-created-id", "old-response-with-new-create"]) {
+    mode = testMode;
+    createCalls = 0;
+    const outcome = await publishShortPost(page, { body: BODY }, network());
+    const created = outcome.evidence.find(
+      (entry) => entry.kind === "publication_created",
+    );
+    assert.equal(outcome.external_id, "99", testMode);
+    assert.equal(outcome.public_url, `${origin}/pin/99`, testMode);
+    assert.equal(created?.external_id, "99", testMode);
+    assert.equal(created?.url, `${origin}/pin/99`, testMode);
+    assert.equal(outcome.evidence[0]?.url, `${origin}/pin/42`, testMode);
+    assert.deepEqual(deleteClicks, [], testMode);
+  }
+});
+
+test("a valid response creates authority without navigation or public readability", async () => {
+  for (const testMode of [
+    "no-navigation",
+    "no-navigation-unreadable",
+    "duplicate-create",
+  ]) {
+    mode = testMode;
+    createCalls = 0;
+    const outcome = await publishShortPost(page, { body: BODY }, network());
+    const created = outcome.evidence.find(
+      (entry) => entry.kind === "publication_created",
+    );
+    assert.equal(created?.external_id, "42", testMode);
+    assert.equal(created?.url, `${origin}/pin/42`, testMode);
+    assert.equal(createCalls, 1, testMode);
+    assert.equal(
+      outcome.status,
+      testMode === "no-navigation-unreadable" ? "unknown" : "completed",
+      testMode,
+    );
+    assert.equal(
+      outcome.evidence.some((entry) => entry.kind === "publication_candidate"),
+      false,
+      testMode,
+    );
+  }
+});
+
+test("creation authority requires the exact fresh request, wire envelope, ID, author, and readback", async () => {
+  for (const testMode of [
+    "wrong-create-endpoint",
+    "zero-created-id",
+    "invalid-created-id",
+    "long-created-id",
+    "wrong-created-author",
+    "numeric-created-id",
+    "wrong-create-envelope",
+    "invalid-create-json",
+    "failed-create",
+    "redirect-create",
+    "write-blocked",
+  ]) {
+    mode = testMode;
+    createCalls = 0;
+    const outcome = await publishShortPost(page, { body: BODY }, network(350));
+    assert.equal(outcome.evidence[0]?.kind, "publication_candidate", testMode);
+    assert.equal(
+      outcome.evidence.some((entry) => entry.kind === "publication_created"),
+      false,
+      testMode,
+    );
+    assert.equal(page.listenerCount("request"), 0, testMode);
+    assert.deepEqual(deleteClicks, [], testMode);
+  }
 });
 
 test("matching preview with additional content is neither verified nor deleted", async () => {

@@ -406,6 +406,29 @@ impl ChannelService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn resume_publication_withdrawal_browser_reserved(
+        &self,
+        scope: &TenantScope,
+        account_id: Uuid,
+        attempt_id: Uuid,
+        binding: &ChannelSecret,
+        session_id: Uuid,
+        reservation_id: Uuid,
+    ) -> Result<(Uuid, String, String), AppError> {
+        self.resume_publication_lookup_browser_inner(
+            scope,
+            account_id,
+            attempt_id,
+            binding,
+            session_id,
+            Some(reservation_id),
+            "short_post",
+            geo_domain::BrowserOperationPurpose::Withdraw,
+        )
+        .await
+    }
+
     async fn resume_available_browser_bound_inner(
         &self,
         scope: &TenantScope,
@@ -478,6 +501,7 @@ impl ChannelService {
             Uuid::new_v4(),
             None,
             placement_slot,
+            geo_domain::BrowserOperationPurpose::Lookup,
         )
         .await
     }
@@ -501,6 +525,7 @@ impl ChannelService {
             session_id,
             Some(reservation_id),
             placement_slot,
+            geo_domain::BrowserOperationPurpose::Lookup,
         )
         .await
     }
@@ -515,10 +540,20 @@ impl ChannelService {
         session_id: Uuid,
         reservation_id: Option<Uuid>,
         placement_slot: &str,
+        purpose: geo_domain::BrowserOperationPurpose,
     ) -> Result<(Uuid, String, String), AppError> {
         let bytes = self.decrypt(scope, attempt_id, "publication_execution", binding)?;
         let original: PublicationBrowserBinding = serde_json::from_slice(&bytes)
             .map_err(|_| AppError::conflict("publication browser binding is invalid"))?;
+        if purpose == geo_domain::BrowserOperationPurpose::Withdraw
+            && (original.version != 2
+                || original.owner_kind != geo_domain::ChannelOwnerKind::Customer
+                || placement_slot != "short_post")
+        {
+            return Err(AppError::conflict(
+                "withdrawal browser binding is unavailable",
+            ));
+        }
         if !matches!(original.version, 1 | 2)
             || original.account_id != account_id
             || original.placement_slot != placement_slot
@@ -541,7 +576,15 @@ impl ChannelService {
             ));
         }
         if self
-            .publication_connector_version(&current.platform, placement_slot, "lookup")
+            .publication_connector_version(
+                &current.platform,
+                placement_slot,
+                if purpose == geo_domain::BrowserOperationPurpose::Withdraw {
+                    "withdraw"
+                } else {
+                    "lookup"
+                },
+            )
             .await?
             != original.connector_version
         {
@@ -578,7 +621,7 @@ impl ChannelService {
             scope,
             account_id,
             session_id,
-            geo_domain::BrowserOperationPurpose::Lookup,
+            purpose,
             reservation_id,
             &current.platform,
             &current.storage_state,

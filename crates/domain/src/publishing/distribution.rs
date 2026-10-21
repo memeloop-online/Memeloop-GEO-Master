@@ -1241,6 +1241,19 @@ impl MemoryDistributionRepository {
             .get(&(key.clone(), candidate.logical_key.clone()))
             .cloned();
         let intent = prior.unwrap_or_else(|| candidate.clone());
+        if state
+            .intents
+            .contains_key(&(key.clone(), candidate.logical_key.clone()))
+            && state
+                .requests
+                .get(&(key.clone(), intent.intent_id))
+                .is_some_and(|origin| origin.withdraw_after_publish)
+                != request.withdraw_after_publish
+        {
+            return Err(AppError::conflict(
+                "logical publication withdrawal policy differs",
+            ));
+        }
         if intent.intent_id != candidate.intent_id
             || intent.account_id != request.account_id
             || intent.variant_id != variant.variant_id
@@ -1734,6 +1747,16 @@ impl DistributionRepository for MemoryDistributionRepository {
             prepare_publication_intent(scope, &manifest, &old, &variant, account_id, Utc::now());
         let intent_key = (scope.storage_key(), candidate.logical_key.clone());
         let previous = state.intents.get(&intent_key).cloned();
+        if previous.as_ref().is_some_and(|intent| {
+            state
+                .requests
+                .get(&(scope.storage_key(), intent.intent_id))
+                .is_some_and(|request| request.withdraw_after_publish)
+        }) {
+            return Err(AppError::conflict(
+                "logical publication withdrawal policy differs",
+            ));
+        }
         let intent = previous.clone().unwrap_or(candidate);
         if let Some(bound) = old.publication_intent_id
             && (bound != intent.intent_id || old.account_id != Some(account_id))
@@ -2079,6 +2102,7 @@ mod report_evidence_tests {
                     account: account.clone(),
                     placement_slot: placement.into(),
                     format: TEXT_DISTRIBUTION_FORMAT.into(),
+                    withdraw_after_publish: false,
                     idempotency_key: key.into(),
                 },
             )

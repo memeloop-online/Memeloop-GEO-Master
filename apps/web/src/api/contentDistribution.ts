@@ -19,6 +19,7 @@ export interface ContentDistributionInput {
   account_id: string;
   placement_slot: DistributionPlacement;
   format: DistributionFormat;
+  withdraw_after_publish: boolean;
 }
 
 export interface ContentDistributionRequest extends ContentDistributionInput {

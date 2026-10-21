@@ -368,6 +368,7 @@ async fn rich_single_request_reuses_original_intent_and_outbox() {
         account_id: Uuid::from_u128(52),
         account_owner_kind: "customer".into(),
         format: RICH_DISTRIBUTION_FORMAT.into(),
+        withdraw_after_publish: false,
         idempotency_key_hash: "key".into(),
         request_hash: "request".into(),
         publication_intent_id: None,
