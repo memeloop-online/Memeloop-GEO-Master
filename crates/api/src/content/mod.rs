@@ -27,7 +27,7 @@ use geo_domain::{
     ContentStep, DocumentManifest, DocumentManifestItemState, DocumentManifestPlanRequest,
     ErrorCode, EvidenceRef, KnowledgePurpose, KnowledgeRepository, ProjectId, ProjectRepository,
     ProjectStatus, RICH_CHECK_POLICY_VERSION, RICH_GENERATION_POLICY_VERSION,
-    RICH_REPAIR_POLICY_VERSION, SourceState, StructuredDocument, TenantScope,
+    RICH_REPAIR_POLICY_VERSION, RichContent, SourceState, StructuredDocument, TenantScope,
 };
 #[cfg(test)]
 use geo_worker::ModelCompletionRequest;
@@ -1673,6 +1673,8 @@ struct GeneratedBlock {
     citation_ids: Vec<Uuid>,
     #[serde(default)]
     items: Vec<String>,
+    #[serde(default)]
+    rich: Option<RichContent>,
 }
 fn parse_generated(
     text: &str,
@@ -1698,7 +1700,7 @@ fn parse_generated(
                 text: b.text,
                 citation_ids: b.citation_ids,
                 items: b.items,
-                rich: None,
+                rich: b.rich,
             })
             .collect(),
         schema_version: generated.schema_version,
@@ -4751,6 +4753,7 @@ mod tests {
         let second = parse_generated(&output, std::slice::from_ref(&evidence), "second").unwrap();
         assert_ne!(first.blocks[0].block_id, second.blocks[0].block_id);
         assert_eq!(first.blocks[0].citation_ids, vec![citation]);
+        assert!(first.blocks[0].rich.is_none());
         assert_eq!(first.schema_version, 2);
         for invalid in [
             serde_json::Value::Null,
@@ -4786,6 +4789,85 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn generated_tables_preserve_typed_structure_through_markdown_and_html_export() {
+        let evidence = located();
+        let citation = evidence.chunk_id.unwrap();
+        let cell = |kind: &str, text: &str| {
+            serde_json::json!({
+                "type":kind,"content":[{"type":"paragraph","content":[{"type":"text","text":text}]}]
+            })
+        };
+        let output = serde_json::json!({
+            "schema_version":2,"title":"Supported comparison","blocks":[{
+                "kind":"rich","text":"","items":[],"citation_ids":[citation],
+                "rich":{"version":1,"node":{"type":"table","content":[
+                    {"type":"tableRow","content":[cell("tableHeader", "Option"),cell("tableHeader", "Capability")]},
+                    {"type":"tableRow","content":[cell("tableCell", "A"),cell("tableCell", "Source fact")]}
+                ]}}
+            }]
+        });
+        let document = parse_generated(
+            &output.to_string(),
+            std::slice::from_ref(&evidence),
+            "table",
+        )
+        .unwrap();
+        assert_eq!(document.blocks[0].kind, ContentBlockKind::Rich);
+        assert_eq!(
+            document.blocks[0].block_id,
+            stable_id("content-block:table:0")
+        );
+        assert_eq!(document.blocks[0].citation_ids, vec![citation]);
+        assert_eq!(
+            serde_json::to_value(&document.blocks[0].rich).unwrap(),
+            output["blocks"][0]["rich"]
+        );
+        let markdown = document.markdown();
+        let mut revision = export_revision(document, &markdown);
+        revision.evidence = vec![evidence.clone()];
+        for format in ["markdown", "html"] {
+            let exported = render_revision_export(revision.clone(), format).unwrap();
+            assert!(exported.content.contains("<table>"));
+            assert!(exported.content.contains("<th>"));
+            assert!(exported.content.contains("<td>"));
+            assert!(exported.content.contains("Source fact"));
+        }
+        for (path, invalid) in [
+            (
+                "/blocks/0/citation_ids",
+                serde_json::json!([Uuid::new_v4()]),
+            ),
+            ("/blocks/0/citation_ids", serde_json::json!([])),
+            ("/blocks/0/kind", serde_json::json!("paragraph")),
+            ("/blocks/0/text", serde_json::json!("Flattened table")),
+            ("/blocks/0/rich/version", serde_json::json!(2)),
+            (
+                "/blocks/0/rich/node/content/1/content",
+                serde_json::json!([cell("tableCell", "Uneven")]),
+            ),
+            (
+                "/blocks/0/rich/node/content/0/type",
+                serde_json::json!("paragraph"),
+            ),
+        ] {
+            let mut malformed = output.clone();
+            *malformed.pointer_mut(path).unwrap() = invalid;
+            assert!(
+                parse_generated(
+                    &malformed.to_string(),
+                    std::slice::from_ref(&evidence),
+                    "table"
+                )
+                .is_err(),
+                "accepted invalid {path}"
+            );
+        }
+        let mut unknown = output;
+        unknown["blocks"][0]["rich"]["node"]["attrs"] = serde_json::json!({"unknown":true});
+        assert!(parse_generated(&unknown.to_string(), &[evidence], "table").is_err());
     }
 
     #[test]

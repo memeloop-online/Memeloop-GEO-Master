@@ -1073,6 +1073,22 @@ test("generation uses the frozen semantic descriptor and submits only the stored
   });
   assert.equal(input.document.key, "synthetic-document-0");
   assert.equal(input.evidence[0].quote, "Source fact 0");
+  assert.ok(request.system.includes("never Markdown pipe text in a paragraph"));
+  const table = JSON.parse(
+    request.system.split("Example block: ")[1].split(". Keep every row")[0],
+  );
+  assert.equal(table.kind, "rich");
+  assert.equal(table.text, "");
+  assert.deepEqual(table.items, []);
+  assert.equal(table.rich.version, 1);
+  assert.equal(table.rich.node.type, "table");
+  assert.deepEqual(
+    table.rich.node.content.map((row) => row.content.map((cell) => cell.type)),
+    [
+      ["tableHeader", "tableHeader"],
+      ["tableCell", "tableCell"],
+    ],
+  );
   assert.deepEqual(Object.keys(result.generationFinishes[0]).sort(), [
     "execution_id",
     "item_id",
@@ -1080,6 +1096,52 @@ test("generation uses the frozen semantic descriptor and submits only the stored
     "token",
   ]);
   assert.equal(result.generationFinishes[0].outcome.status, "completed");
+});
+
+test("generation forwards typed tables unchanged to the Rust validation boundary", async () => {
+  const document = {
+    schema_version: 2,
+    title: "Supported comparison",
+    blocks: [
+      {
+        kind: "rich",
+        text: "",
+        items: [],
+        citation_ids: ["chunk-0"],
+        rich: {
+          version: 1,
+          node: {
+            type: "table",
+            content: [
+              {
+                type: "tableRow",
+                content: [
+                  {
+                    type: "tableCell",
+                    content: [
+                      {
+                        type: "paragraph",
+                        content: [{ type: "text", text: "Source fact 0" }],
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    ],
+  };
+  const text = JSON.stringify(document);
+  const result = await run({
+    initial: "prepared",
+    generationCompletion: { text },
+  });
+  assert.deepEqual(result.generationFinishes[0].outcome, {
+    status: "completed",
+    text,
+  });
 });
 
 test("a current generation result skips the model after a stale prepared read", async () => {
