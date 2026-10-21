@@ -13,6 +13,37 @@ pub fn spawn(state: AppState) {
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticks.tick().await;
+            let mut withdrawal_after = None;
+            loop {
+                match state
+                    .channel_job_repository()
+                    .scan_withdrawals(withdrawal_after, 100)
+                    .await
+                {
+                    Ok(rows) => {
+                        let count = rows.len();
+                        for row in rows {
+                            withdrawal_after = Some(row.attempt_id);
+                            let task_state = state.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) =
+                                    geo_api::execute_publication_withdrawal(&task_state, row).await
+                                {
+                                    warn!(code = ?error.code, "publication withdrawal dispatch failed");
+                                }
+                            });
+                        }
+                        if count < 100 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => {
+                        warn!(code = ?error.code, "publication withdrawal scan failed");
+                        break;
+                    }
+                }
+            }
             // Persist each frozen distribution command as an ordinary channel
             // target before scanning due work. Command IDs are the keyset;
             // a restarted dispatcher safely revisits unmaterialized rows.

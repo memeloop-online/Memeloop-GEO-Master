@@ -26,6 +26,7 @@ pub struct SingleArticleDistributionRequest {
     pub account_id: Uuid,
     pub placement_slot: String,
     pub format: String,
+    pub withdraw_after_publish: bool,
 }
 
 async fn replay_request(
@@ -46,6 +47,7 @@ async fn replay_request(
         || saved.account_id != request.account_id
         || saved.placement_slot != request.placement_slot
         || saved.format != request.format
+        || saved.withdraw_after_publish != request.withdraw_after_publish
     {
         return Err(AppError::conflict(
             "idempotency key reused for another request",
@@ -109,6 +111,7 @@ pub async fn accept_content_distribution_request(
                 account,
                 placement_slot: request.placement_slot.clone(),
                 format: request.format.clone(),
+                withdraw_after_publish: request.withdraw_after_publish,
                 idempotency_key: idempotency_key.clone(),
             },
         )

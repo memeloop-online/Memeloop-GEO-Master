@@ -26,6 +26,7 @@ pub(crate) use projects::{
     appearance, cycles, project_ai_model, project_ai_settings, project_tools,
 };
 pub use publishing::distribution;
+pub use publishing::publication_withdrawal::execute_publication_withdrawal;
 pub(crate) use publishing::{
     channel_jobs, connector_capabilities, content_distribution_requests, publication_lookup,
     publication_send_callback,
@@ -310,7 +311,10 @@ impl AppState {
             ),
             channel_service: ChannelService::development(),
             desktop_grants: desktop_gateway::DesktopGrants::default(),
-            channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
+            channel_job_repository: Arc::new(
+                geo_domain::MemoryChannelJobRepository::default()
+                    .with_withdrawal_requests(Arc::new(memory_request_repository.clone())),
+            ),
             publication_lookup_repository: None,
             publication_send_callback: None,
             observation_capture_callback: None,
@@ -478,7 +482,10 @@ impl AppState {
             ),
             channel_service: ChannelService::development(),
             desktop_grants: desktop_gateway::DesktopGrants::default(),
-            channel_job_repository: Arc::new(geo_domain::MemoryChannelJobRepository::default()),
+            channel_job_repository: Arc::new(
+                geo_domain::MemoryChannelJobRepository::default()
+                    .with_withdrawal_requests(Arc::new(memory_request_repository.clone())),
+            ),
             publication_lookup_repository: None,
             publication_send_callback: None,
             observation_capture_callback: None,
@@ -2520,6 +2527,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/projects/{id}/content-distribution-requests/{request_id}/publication",
             get(content_distribution_requests::get_publication),
+        )
+        .route(
+            "/projects/{id}/content-distribution-requests/{request_id}/withdrawal",
+            get(publishing::publication_withdrawal::get_withdrawal),
         )
         .route(
             "/projects/{id}/content-media/bindings",

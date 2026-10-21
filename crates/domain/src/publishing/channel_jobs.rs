@@ -227,6 +227,177 @@ pub struct ChannelAttempt {
     pub received_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationWithdrawalState {
+    AwaitingPublication,
+    Ready,
+    Claimed,
+    Unknown,
+    Withdrawn,
+}
+
+/// Cleanup authority is frozen with the original publication claim. It never
+/// changes the original receipt and never accepts a caller-selected asset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationWithdrawal {
+    pub scope: TenantScope,
+    pub request_id: Uuid,
+    pub target_id: Uuid,
+    pub attempt_id: Uuid,
+    pub account_id: Uuid,
+    pub state: PublicationWithdrawalState,
+    pub external_id: Option<String>,
+    pub public_url: Option<String>,
+    pub execution_id: Option<Uuid>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub evidence: serde_json::Value,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub error_code: Option<String>,
+}
+
+pub fn resolve_publication_withdrawal(
+    row: &mut PublicationWithdrawal,
+    target: &ChannelTarget,
+    attempt: &ChannelAttempt,
+) -> Result<(), AppError> {
+    if row.state != PublicationWithdrawalState::AwaitingPublication {
+        return Ok(());
+    }
+    let ChannelTargetInput::GeneratedPublish {
+        origin_request_id: Some(request_id),
+        platform,
+        placement_slot,
+        account_id,
+        title,
+        body,
+        rich_payload: None,
+        ..
+    } = &target.input
+    else {
+        return Err(AppError::conflict("withdrawal publication binding differs"));
+    };
+    if target.target_id != row.target_id
+        || attempt.attempt_id != row.attempt_id
+        || attempt.target_id != row.target_id
+        || *request_id != row.request_id
+        || *account_id != row.account_id
+        || placement_slot != "short_post"
+        || platform != "zhihu"
+    {
+        return Err(AppError::conflict("withdrawal publication binding differs"));
+    }
+    let Some(outcome) = &attempt.outcome else {
+        return Ok(());
+    };
+    let Some(received_at) = attempt.received_at else {
+        return Ok(());
+    };
+    if outcome.fixture
+        || outcome
+            .connector_version
+            .as_ref()
+            .is_none_or(|v| v.is_empty() || v.len() > 100 || v.starts_with("fixture"))
+    {
+        return Ok(());
+    }
+    // A matching page or post-submit navigation can identify an old post.
+    // Only the original operation's correlated creation response authorizes
+    // destructive cleanup; navigation candidates remain read-only evidence.
+    let candidates: Vec<_> = outcome
+        .runner_evidence
+        .iter()
+        .filter(|p| p["kind"] == "publication_created")
+        .collect();
+    if candidates.len() != 1 {
+        return Ok(());
+    }
+    let p = candidates[0];
+    let Some(url) = p["url"].as_str() else {
+        return Ok(());
+    };
+    let Some(id) = url.strip_prefix("https://www.zhihu.com/pin/") else {
+        return Ok(());
+    };
+    let expected = crate::plain_text_publication_readback_hash(placement_slot, title, body);
+    let observed = p["observed_at"]
+        .as_str()
+        .and_then(|v| v.parse::<DateTime<Utc>>().ok());
+    if id.is_empty()
+        || id.starts_with('0')
+        || id.len() > 40
+        || !id.bytes().all(|b| b.is_ascii_digit())
+        || p["schema_version"] != "geo.publication.created.v1"
+        || p["external_id"] != id
+        || p["request_method"] != "POST"
+        || p["request_url"] != "https://www.zhihu.com/api/v4/content/publish"
+        || !p["http_status"]
+            .as_u64()
+            .is_some_and(|s| (200..300).contains(&s))
+        || p["expected_sha256"] != expected
+        || p["attempt_id"] != row.attempt_id.to_string()
+        || p["target_id"] != row.target_id.to_string()
+        || p["account_id"] != row.account_id.to_string()
+        || p["connector_version"].as_str() != outcome.connector_version.as_deref()
+        || !observed.is_some_and(|at| at >= attempt.claimed_at && at <= received_at)
+    {
+        return Ok(());
+    }
+    row.external_id = Some(id.into());
+    row.public_url = Some(url.into());
+    row.evidence = serde_json::json!({"expected_sha256":expected,"connector_version":outcome.connector_version});
+    row.state = PublicationWithdrawalState::Ready;
+    Ok(())
+}
+
+pub fn finish_publication_withdrawal(
+    row: &mut PublicationWithdrawal,
+    execution_id: Uuid,
+    evidence: serde_json::Value,
+    received_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    if row.state != PublicationWithdrawalState::Claimed
+        || row.execution_id != Some(execution_id)
+        || row.claimed_at.is_none_or(|at| at > received_at)
+        || serde_json::to_vec(&evidence).map_or(true, |v| v.len() > 4096)
+    {
+        return Err(AppError::conflict(
+            "withdrawal completion differs from claim",
+        ));
+    }
+    let at = evidence["observed_at"]
+        .as_str()
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok());
+    let verified = evidence["schema_version"] == "geo.publication.withdrawal.v1"
+        && evidence["execution_id"] == execution_id.to_string()
+        && evidence["external_id"].as_str() == row.external_id.as_deref()
+        && row.external_id.is_some()
+        && row.public_url.is_some()
+        && evidence["public_url"].as_str() == row.public_url.as_deref()
+        && evidence["expected_sha256"] == row.evidence["expected_sha256"]
+        && evidence["connector_version"] == row.evidence["connector_version"]
+        && evidence["provenance"] == "live"
+        && evidence["delete_confirmed"] == true
+        && evidence["delete_status"]
+            .as_u64()
+            .is_some_and(|s| (200..300).contains(&s))
+        && evidence["absence_status"]
+            .as_u64()
+            .is_some_and(|s| [404, 410].contains(&s))
+        && at.is_some_and(|at| at >= row.claimed_at.expect("checked") && at <= received_at);
+    row.state = if verified {
+        PublicationWithdrawalState::Withdrawn
+    } else {
+        PublicationWithdrawalState::Unknown
+    };
+    row.error_code = (!verified).then(|| "withdrawal_unverified".into());
+    if verified {
+        row.evidence = evidence;
+    }
+    row.finished_at = Some(received_at);
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelTargetView {
     pub target: ChannelTarget,
@@ -485,6 +656,37 @@ pub trait ChannelJobRepository:
     + Send
     + Sync
 {
+    async fn get_withdrawal(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+    ) -> Result<PublicationWithdrawal, AppError>;
+    async fn scan_withdrawals(
+        &self,
+        after_attempt_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<PublicationWithdrawal>, AppError>;
+    async fn resolve_withdrawal(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+    ) -> Result<PublicationWithdrawal, AppError>;
+    async fn claim_withdrawal(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+        execution_id: Uuid,
+        reservation_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<PublicationWithdrawal, AppError>;
+    async fn finish_withdrawal(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+        execution_id: Uuid,
+        evidence: serde_json::Value,
+        received_at: DateTime<Utc>,
+    ) -> Result<PublicationWithdrawal, AppError>;
     async fn replay_measurement_plan(
         &self,
         scope: &TenantScope,
@@ -772,6 +974,7 @@ pub struct MemoryChannelJobRepository(
     pub(crate) Arc<Mutex<HashMap<Uuid, crate::BrowserOperation>>>,
     pub(crate) Arc<Mutex<crate::account_networks::MemoryAccountNetworks>>,
     pub(crate) Arc<Mutex<HashMap<Uuid, crate::OperatorLoginQueue>>>,
+    Option<Arc<dyn crate::ContentDistributionRequestRepository>>,
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1229,6 +1432,7 @@ struct MemoryCycle {
     generated: HashMap<Uuid, ChannelTarget>,
     attempts: HashMap<Uuid, Vec<ChannelAttempt>>,
     publication_bindings: HashMap<Uuid, ChannelSecret>,
+    withdrawals: HashMap<Uuid, PublicationWithdrawal>,
     publication_send: HashMap<Uuid, crate::publication_send_authorization::MemorySendRegistration>,
 }
 
@@ -1255,6 +1459,13 @@ impl MemoryCycle {
 }
 
 impl MemoryChannelJobRepository {
+    pub fn with_withdrawal_requests(
+        mut self,
+        requests: Arc<dyn crate::ContentDistributionRequestRepository>,
+    ) -> Self {
+        self.5 = Some(requests);
+        self
+    }
     /// Internal trusted preflight only. This lock is shared with `finish`, so
     /// completion cannot race a successful registration or a send grant.
     pub(crate) async fn register_rich_send(
@@ -1478,6 +1689,134 @@ impl MemoryChannelJobRepository {
 
 #[async_trait]
 impl ChannelJobRepository for MemoryChannelJobRepository {
+    async fn get_withdrawal(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+    ) -> Result<PublicationWithdrawal, AppError> {
+        let key = scope_key(scope)?;
+        self.0
+            .lock()
+            .await
+            .iter()
+            .filter(|((o, t, p, _), _)| (*o, *t, *p) == key)
+            .find_map(|(_, cycle)| cycle.withdrawals.get(&attempt_id).cloned())
+            .ok_or_else(|| AppError::not_found("publication withdrawal not found"))
+    }
+
+    async fn scan_withdrawals(
+        &self,
+        after_attempt_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<PublicationWithdrawal>, AppError> {
+        if limit == 0 || limit > 1000 {
+            return Err(AppError::invalid_request("invalid withdrawal page size"));
+        }
+        let mut all = self.0.lock().await;
+        let mut rows: Vec<_> = all
+            .values_mut()
+            .flat_map(|cycle| cycle.withdrawals.values_mut())
+            .filter_map(|row| {
+                if row.state == PublicationWithdrawalState::Claimed
+                    && row
+                        .claimed_at
+                        .is_some_and(|at| at + CHANNEL_EXECUTION_LEASE <= Utc::now())
+                {
+                    row.state = PublicationWithdrawalState::Unknown;
+                    row.error_code = Some("withdrawal_interrupted".into());
+                }
+                (after_attempt_id.is_none_or(|after| row.attempt_id > after)
+                    && matches!(
+                        row.state,
+                        PublicationWithdrawalState::AwaitingPublication
+                            | PublicationWithdrawalState::Ready
+                    ))
+                .then(|| row.clone())
+            })
+            .collect();
+        rows.sort_by_key(|row| row.attempt_id);
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    async fn resolve_withdrawal(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+    ) -> Result<PublicationWithdrawal, AppError> {
+        let key = scope_key(scope)?;
+        let mut all = self.0.lock().await;
+        let cycle = all
+            .iter_mut()
+            .filter(|((o, t, p, _), _)| (*o, *t, *p) == key)
+            .find_map(|(_, cycle)| cycle.withdrawals.contains_key(&attempt_id).then_some(cycle))
+            .ok_or_else(|| AppError::not_found("publication withdrawal not found"))?;
+        let row = cycle.withdrawals.get(&attempt_id).expect("found");
+        let target = cycle
+            .target(row.target_id)
+            .cloned()
+            .ok_or_else(|| AppError::not_found("publication target not found"))?;
+        let attempt = cycle
+            .attempts
+            .get(&row.target_id)
+            .and_then(|rows| rows.iter().find(|a| a.attempt_id == attempt_id))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("publication attempt not found"))?;
+        let row = cycle.withdrawals.get_mut(&attempt_id).expect("found");
+        resolve_publication_withdrawal(row, &target, &attempt)?;
+        Ok(row.clone())
+    }
+
+    async fn claim_withdrawal(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+        execution_id: Uuid,
+        reservation_id: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<PublicationWithdrawal, AppError> {
+        let reservations = self.1.lock().await;
+        let key = scope_key(scope)?;
+        let mut all = self.0.lock().await;
+        let row = all
+            .iter_mut()
+            .filter(|((o, t, p, _), _)| (*o, *t, *p) == key)
+            .find_map(|(_, cycle)| cycle.withdrawals.get_mut(&attempt_id))
+            .ok_or_else(|| AppError::not_found("publication withdrawal not found"))?;
+        if row.state != PublicationWithdrawalState::Ready
+            || row.execution_id.is_some()
+            || !reservations
+                .get(&(scope.operator_id.as_uuid(), row.account_id))
+                .is_some_and(|(id, expiry)| *id == reservation_id && *expiry > at)
+        {
+            return Err(AppError::conflict(
+                "withdrawal already claimed or reservation expired",
+            ));
+        }
+        row.state = PublicationWithdrawalState::Claimed;
+        row.execution_id = Some(execution_id);
+        row.claimed_at = Some(at);
+        Ok(row.clone())
+    }
+
+    async fn finish_withdrawal(
+        &self,
+        scope: &TenantScope,
+        attempt_id: Uuid,
+        execution_id: Uuid,
+        evidence: serde_json::Value,
+        received_at: DateTime<Utc>,
+    ) -> Result<PublicationWithdrawal, AppError> {
+        let key = scope_key(scope)?;
+        let mut all = self.0.lock().await;
+        let row = all
+            .iter_mut()
+            .filter(|((o, t, p, _), _)| (*o, *t, *p) == key)
+            .find_map(|(_, cycle)| cycle.withdrawals.get_mut(&attempt_id))
+            .ok_or_else(|| AppError::not_found("publication withdrawal not found"))?;
+        finish_publication_withdrawal(row, execution_id, evidence, received_at)?;
+        Ok(row.clone())
+    }
     async fn replay_measurement_plan(
         &self,
         scope: &TenantScope,
@@ -1913,8 +2252,11 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
             .target(target_id)
             .cloned()
             .ok_or_else(|| AppError::not_found("target not found"))?;
-        let attempts = cycle.attempts.entry(target_id).or_default();
-        if !attempts.is_empty() {
+        if cycle
+            .attempts
+            .get(&target_id)
+            .is_some_and(|attempts| !attempts.is_empty())
+        {
             return Err(AppError::conflict(
                 "target already attempted; inspect or reconcile existing outcome",
             ));
@@ -1926,7 +2268,58 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
             outcome: None,
             received_at: None,
         };
-        attempts.push(attempt.clone());
+        // Request policy is immutable. Hold the same ledger lock until both
+        // the original attempt and its cleanup authority exist.
+        let withdrawal = if let ChannelTargetInput::GeneratedPublish {
+            origin_request_id: Some(id),
+            ..
+        } = &target.input
+        {
+            match &self.5 {
+                Some(requests) => {
+                    let request = requests.get(scope, *id).await?;
+                    if request.withdraw_after_publish
+                        && !matches!(&target.input,
+                        ChannelTargetInput::GeneratedPublish { platform, placement_slot, account_id, rich_payload: None, .. }
+                        if platform == "zhihu" && placement_slot == "short_post" && *account_id == request.account_id
+                            && request.platform_id == *platform && request.placement_slot == *placement_slot
+                            && request.account_owner_kind == "customer" && request.format == crate::TEXT_DISTRIBUTION_FORMAT)
+                    {
+                        return Err(AppError::conflict(
+                            "withdrawal publication authority differs",
+                        ));
+                    }
+                    request
+                        .withdraw_after_publish
+                        .then(|| PublicationWithdrawal {
+                            scope: scope.clone(),
+                            request_id: *id,
+                            target_id,
+                            attempt_id,
+                            account_id: target.input.account_id(),
+                            state: PublicationWithdrawalState::AwaitingPublication,
+                            external_id: None,
+                            public_url: None,
+                            execution_id: None,
+                            claimed_at: None,
+                            evidence: serde_json::json!({}),
+                            finished_at: None,
+                            error_code: None,
+                        })
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        cycle
+            .attempts
+            .entry(target_id)
+            .or_default()
+            .push(attempt.clone());
+        if let Some(row) = withdrawal {
+            cycle.withdrawals.insert(attempt_id, row);
+        }
         Ok((target, attempt))
     }
 
@@ -2113,6 +2506,205 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
                 measurements: None,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod withdrawal_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fixture() -> (PublicationWithdrawal, ChannelTarget, ChannelAttempt) {
+        let now = Utc::now();
+        let request_id = Uuid::new_v4();
+        let account_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+        let attempt_id = Uuid::new_v4();
+        let row = PublicationWithdrawal {
+            scope: TenantScope::new(
+                Uuid::new_v4().into(),
+                Uuid::new_v4().into(),
+                Some(Uuid::new_v4().into()),
+            ),
+            request_id,
+            target_id,
+            attempt_id,
+            account_id,
+            state: PublicationWithdrawalState::AwaitingPublication,
+            external_id: None,
+            public_url: None,
+            execution_id: None,
+            claimed_at: None,
+            evidence: json!({}),
+            finished_at: None,
+            error_code: None,
+        };
+        let target = ChannelTarget {
+            target_id,
+            input: ChannelTargetInput::GeneratedPublish {
+                content_revision_id: Uuid::new_v4(),
+                variant_id: Uuid::new_v4(),
+                publication_intent_id: Uuid::new_v4(),
+                distribution_target_id: Uuid::nil(),
+                origin_request_id: Some(request_id),
+                platform: "zhihu".into(),
+                placement_slot: "short_post".into(),
+                account_id,
+                title: "Synthetic thought".into(),
+                body: "Synthetic body".into(),
+                body_sha256: sha256_hex(b"Synthetic body"),
+                payload_hash: "synthetic".into(),
+                evidence: vec![],
+                rich_payload: None,
+            },
+        };
+        let attempt = ChannelAttempt {
+            attempt_id,
+            target_id,
+            claimed_at: now,
+            received_at: Some(now),
+            outcome: Some(ChannelOutcome {
+                status: ChannelOutcomeStatus::Unknown,
+                detail: None,
+                occurred_at: now,
+                raw_answer: None,
+                citations: vec![],
+                public_url: None,
+                screenshot_ref: None,
+                connector_version: Some("synthetic.v1".into()),
+                fixture: false,
+                runner_evidence: vec![
+                    json!({"kind":"publication_created","schema_version":"geo.publication.created.v1",
+                    "url":"https://www.zhihu.com/pin/42","external_id":"42","request_method":"POST",
+                    "request_url":"https://www.zhihu.com/api/v4/content/publish","http_status":201,
+                    "expected_sha256":crate::plain_text_publication_readback_hash("short_post", "", "Synthetic body"),
+                    "attempt_id":attempt_id,"target_id":target_id,"account_id":account_id,
+                    "connector_version":"synthetic.v1","observed_at":now}),
+                ],
+            }),
+        };
+        (row, target, attempt)
+    }
+
+    #[test]
+    fn withdrawal_requires_original_causal_candidate_and_keeps_original_outcome() {
+        let (row, target, attempt) = fixture();
+        let mut resolved = row.clone();
+        resolve_publication_withdrawal(&mut resolved, &target, &attempt).unwrap();
+        assert_eq!(resolved.state, PublicationWithdrawalState::Ready);
+        assert_eq!(resolved.external_id.as_deref(), Some("42"));
+        for field in [
+            "external_id",
+            "request_method",
+            "request_url",
+            "http_status",
+            "expected_sha256",
+            "attempt_id",
+            "target_id",
+            "account_id",
+            "url",
+            "connector_version",
+        ] {
+            let mut wrong = attempt.clone();
+            wrong.outcome.as_mut().unwrap().runner_evidence[0][field] = json!("unrelated");
+            let mut rejected = row.clone();
+            resolve_publication_withdrawal(&mut rejected, &target, &wrong).unwrap();
+            assert_eq!(
+                rejected.state,
+                PublicationWithdrawalState::AwaitingPublication,
+                "{field}"
+            );
+        }
+        let mut navigation_only = attempt.clone();
+        navigation_only.outcome.as_mut().unwrap().runner_evidence = vec![json!({
+            "kind":"publication_candidate","schema_version":"geo.publication.candidate.v1",
+            "url":"https://www.zhihu.com/pin/42","source":"post_submit_navigation",
+            "expected_sha256":crate::plain_text_publication_readback_hash("short_post","","Synthetic body"),
+            "attempt_id":attempt.attempt_id,"target_id":target.target_id,"account_id":row.account_id,
+            "connector_version":"synthetic.v1","observed_at":attempt.claimed_at})];
+        let mut rejected = row.clone();
+        resolve_publication_withdrawal(&mut rejected, &target, &navigation_only).unwrap();
+        assert_eq!(
+            rejected.state,
+            PublicationWithdrawalState::AwaitingPublication
+        );
+        assert_eq!(
+            attempt.outcome.as_ref().unwrap().status,
+            ChannelOutcomeStatus::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn withdrawal_claim_is_scoped_once_only_and_unknown_cannot_retry() {
+        let (mut row, target, attempt) = fixture();
+        resolve_publication_withdrawal(&mut row, &target, &attempt).unwrap();
+        let repository = MemoryChannelJobRepository::default();
+        let (o, t, p) = scope_key(&row.scope).unwrap();
+        repository
+            .0
+            .lock()
+            .await
+            .entry((o, t, p, ChannelOwner::Cycle(Uuid::new_v4())))
+            .or_default()
+            .withdrawals
+            .insert(row.attempt_id, row.clone());
+        let mut other = row.scope.clone();
+        other.project_id = Some(Uuid::new_v4().into());
+        assert!(
+            repository
+                .get_withdrawal(&other, row.attempt_id)
+                .await
+                .is_err()
+        );
+        let now = Utc::now();
+        let reservation = Uuid::new_v4();
+        repository
+            .reserve_account(
+                &row.scope,
+                row.account_id,
+                reservation,
+                now,
+                now + CHANNEL_EXECUTION_LEASE,
+            )
+            .await
+            .unwrap();
+        let execution = Uuid::new_v4();
+        let (first, second) = tokio::join!(
+            repository.claim_withdrawal(&row.scope, row.attempt_id, execution, reservation, now),
+            repository.claim_withdrawal(
+                &row.scope,
+                row.attempt_id,
+                Uuid::new_v4(),
+                reservation,
+                now
+            )
+        );
+        assert_ne!(first.is_ok(), second.is_ok());
+        let claimed = first.or(second).unwrap();
+        let finished = repository
+            .finish_withdrawal(
+                &row.scope,
+                row.attempt_id,
+                claimed.execution_id.unwrap(),
+                json!({}),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(finished.state, PublicationWithdrawalState::Unknown);
+        assert!(
+            repository
+                .claim_withdrawal(&row.scope, row.attempt_id, Uuid::new_v4(), reservation, now)
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .scan_withdrawals(None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 

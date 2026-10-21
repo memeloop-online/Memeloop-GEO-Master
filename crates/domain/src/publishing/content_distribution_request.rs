@@ -106,6 +106,7 @@ pub struct AcceptContentDistributionRequest {
     pub account: ChannelAccount,
     pub placement_slot: String,
     pub format: String,
+    pub withdraw_after_publish: bool,
     pub idempotency_key: String,
 }
 
@@ -121,6 +122,7 @@ pub struct ContentDistributionRequest {
     pub account_id: Uuid,
     pub account_owner_kind: String,
     pub format: String,
+    pub withdraw_after_publish: bool,
     pub idempotency_key_hash: String,
     pub request_hash: String,
     /// An existing intent; its attempt, unknown outcome and verification remain
@@ -178,6 +180,16 @@ pub fn prepare_content_distribution_request(
             "single-article format does not match content structure",
         ));
     }
+    if input.withdraw_after_publish
+        && (input.account.owner_kind != crate::ChannelOwnerKind::Customer
+            || input.account.platform != "zhihu"
+            || input.placement_slot != "short_post"
+            || input.format != TEXT_DISTRIBUTION_FORMAT)
+    {
+        return Err(AppError::invalid_request(
+            "automatic withdrawal requires a supported owned plain short post",
+        ));
+    }
     Ok(ContentDistributionRequest {
         request_id: Uuid::new_v4(),
         scope: scope.clone(),
@@ -193,6 +205,7 @@ pub fn prepare_content_distribution_request(
         }
         .into(),
         format: input.format.clone(),
+        withdraw_after_publish: input.withdraw_after_publish,
         idempotency_key_hash: hash(&[&input.idempotency_key]),
         request_hash: hash(&[
             &input.revision.revision_id.to_string(),
@@ -205,6 +218,11 @@ pub fn prepare_content_distribution_request(
                 crate::ChannelOwnerKind::OperatorPool => "operator_pool",
             },
             &input.format,
+            if input.withdraw_after_publish {
+                "withdraw"
+            } else {
+                "retain"
+            },
         ]),
         publication_intent_id: None,
         materialization_deferral: None,
@@ -803,6 +821,15 @@ impl ContentDistributionRequestRepository for MemoryContentDistributionRequestRe
             .get_mut(&(scope.clone(), request_id))
             .ok_or_else(|| AppError::not_found("distribution request not found"))?;
         validate_distribution_request_intent(request, &bundle.intent, &bundle.variant)?;
+        let original_policy = match &bundle.origin {
+            crate::PublicationOrigin::ContentRequest { request } => request.withdraw_after_publish,
+            crate::PublicationOrigin::CoverageTarget { .. } => false,
+        };
+        if original_policy != request.withdraw_after_publish {
+            return Err(AppError::conflict(
+                "logical publication withdrawal policy differs",
+            ));
+        }
         if request
             .publication_intent_id
             .is_some_and(|old| old != intent_id)
@@ -1011,6 +1038,7 @@ mod tests {
             account: account.clone(),
             placement_slot: "primary".into(),
             format: TEXT_DISTRIBUTION_FORMAT.into(),
+            withdraw_after_publish: false,
             idempotency_key: "same-key".into(),
         };
         let variant = ChannelVariant {
@@ -1072,6 +1100,31 @@ mod tests {
                 command,
             },
         )
+    }
+
+    #[test]
+    fn withdrawal_choice_is_owned_plain_short_only_and_changes_request_identity() {
+        let scope = TenantScope::new(
+            Uuid::new_v4().into(),
+            Uuid::new_v4().into(),
+            Some(Uuid::new_v4().into()),
+        );
+        let (mut input, _) = fixture(&scope);
+        input.placement_slot = "short_post".into();
+        input.account.platform = "zhihu".into();
+        let retained = prepare_content_distribution_request(&scope, &input).unwrap();
+        input.withdraw_after_publish = true;
+        let opted_in = prepare_content_distribution_request(&scope, &input).unwrap();
+        assert_ne!(retained.request_hash, opted_in.request_hash);
+        assert!(opted_in.withdraw_after_publish);
+        input.placement_slot = "primary".into();
+        assert!(prepare_content_distribution_request(&scope, &input).is_err());
+        input.placement_slot = "short_post".into();
+        input.account.platform = "unsupported_platform".into();
+        assert!(prepare_content_distribution_request(&scope, &input).is_err());
+        input.account.platform = "zhihu".into();
+        input.account.owner_kind = crate::ChannelOwnerKind::OperatorPool;
+        assert!(prepare_content_distribution_request(&scope, &input).is_err());
     }
 
     #[tokio::test]

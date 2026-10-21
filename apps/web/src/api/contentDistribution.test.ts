@@ -83,6 +83,7 @@ describe("single-article distribution API", () => {
         account_id: "account-1",
         placement_slot: placement,
         format: "markdown.v1" as const,
+        withdraw_after_publish: false,
       };
       await submitContentDistributionRequest(
         "tenant-1",
@@ -112,4 +113,31 @@ describe("single-article distribution API", () => {
       );
     },
   );
+
+  it("preserves an explicit withdrawal instruction in the frozen request", async () => {
+    const input = {
+      content_asset_id: "asset-1",
+      content_revision_id: "rev-1",
+      account_id: "account-1",
+      placement_slot: "short_post" as const,
+      format: "markdown.v1" as const,
+      withdraw_after_publish: true,
+    };
+    await submitContentDistributionRequest(
+      "tenant-1",
+      "project-1",
+      input,
+      "retry-withdrawal",
+    );
+    expect(apiFetch).toHaveBeenLastCalledWith(
+      "/projects/project-1/content-distribution-requests",
+      {
+        tenantId: "tenant-1",
+        projectId: "project-1",
+        method: "POST",
+        body: input,
+        idempotencyKey: "retry-withdrawal",
+      },
+    );
+  });
 });

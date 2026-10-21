@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { adapters } from "../src/adapters.mjs";
 import { createRunner } from "../src/runner.mjs";
+import { createRunnerServer } from "../src/server.mjs";
 
 const unidentifiedPage = {
   context() {
@@ -29,7 +30,12 @@ test("one platform login advertises separate article and short publication place
       ["primary", "short_post"],
     );
     for (const connector of publication) {
-      assert.deepEqual(connector.operations, ["publish", "lookup"]);
+      assert.deepEqual(
+        connector.operations,
+        connector.placement_slot === "short_post"
+          ? ["publish", "lookup", "withdraw"]
+          : ["publish", "lookup"],
+      );
       assert.equal(connector.login_entry_available, true);
       assert.equal(connector.login_supported, true);
       assert.equal(connector.verified, false);
@@ -38,9 +44,11 @@ test("one platform login advertises separate article and short publication place
         adapters.zhihu.connectorVersion,
       );
     }
-    assert.equal(
-      connectors.some((item) => item.operations.includes("withdraw")),
-      false,
+    assert.deepEqual(
+      connectors
+        .filter((item) => item.operations.includes("withdraw"))
+        .map(({ platform, placement_slot }) => ({ platform, placement_slot })),
+      [{ platform: "zhihu", placement_slot: "short_post" }],
     );
     assert.equal(
       Object.keys(adapters).some((key) => key.includes("short_post")),
@@ -54,6 +62,52 @@ test("one platform login advertises separate article and short publication place
     );
   } finally {
     await runner.shutdown();
+  }
+});
+
+test("withdrawal dispatches only an exact short post payload to the actual helper", async () => {
+  const outcome = await adapters.zhihu.execute(unidentifiedPage, "withdraw", {
+    placement_slot: "short_post",
+    external_id: "42",
+    body: "Synthetic short body",
+  });
+  assert.equal(outcome.status, "unknown");
+  assert.equal(outcome.reason, "account_ownership_unverified");
+  assert.equal(outcome.stage, "withdraw");
+
+  for (const payload of [
+    { body: "Synthetic short body" },
+    { external_id: "0", body: "Synthetic short body" },
+    { external_id: 42, body: "Synthetic short body" },
+    { external_id: "42", body: "" },
+    { external_id: "42", body: "Synthetic short body", title: "Unexpected" },
+    {
+      external_id: "42",
+      body: "Synthetic short body",
+      public_url: "https://www.zhihu.com/pin/42",
+    },
+  ]) {
+    const rejected = await adapters.zhihu.execute(null, "withdraw", {
+      placement_slot: "short_post",
+      ...payload,
+    });
+    assert.equal(rejected.status, "unsupported");
+    assert.equal(rejected.reason, "invalid_content_payload");
+  }
+
+  for (const placement_slot of [undefined, "primary", "unavailable"]) {
+    const rejected = await adapters.zhihu.execute(null, "withdraw", {
+      ...(placement_slot === undefined ? {} : { placement_slot }),
+      external_id: "42",
+      body: "Synthetic short body",
+    });
+    assert.equal(rejected.status, "unsupported");
+    assert.equal(
+      rejected.reason,
+      placement_slot === "unavailable"
+        ? "placement_not_supported"
+        : "operation_not_supported",
+    );
   }
 });
 
@@ -142,10 +196,10 @@ async function fixtureRunner() {
       fixture: {
         connectorVersion: "fixture.placement.v1",
         entry: "https://example.invalid/",
-        operations: ["publish", "lookup"],
+        operations: ["publish", "lookup", "withdraw"],
         placements: {
           primary: { operations: ["publish"] },
-          short_post: { operations: ["lookup"] },
+          short_post: { operations: ["lookup", "withdraw"] },
         },
         async identify() {
           return {
@@ -212,12 +266,13 @@ test("runner checks the selected placement operations and retains its JSON execu
     assert.equal(calls[0].network.expectedAccountId, "fixture-owner");
     assert.deepEqual(
       runner.capabilities().connectors.map((item) => item.operations),
-      [["publish"], ["lookup"]],
+      [["publish"], ["lookup", "withdraw"]],
     );
 
     for (const [id, operation, placement_slot] of [
       ["short-publish", "publish", "short_post"],
       ["article-lookup", "lookup", "primary"],
+      ["article-withdraw", "withdraw", "primary"],
       ["unknown-placement", "publish", "unknown"],
       ["null-placement", "publish", null],
       ["object-placement", "publish", {}],
@@ -269,6 +324,76 @@ test("runner checks the selected placement operations and retains its JSON execu
       /invalid_execution/,
     );
   } finally {
+    await runner.shutdown();
+  }
+});
+
+test("JSON withdrawal preserves account routing, dispatches once, and rejects changed payloads", async () => {
+  const { runner, calls } = await fixtureRunner();
+  const token = "synthetic-runner-token";
+  const api = createRunnerServer({ token, runner });
+  await new Promise((resolve) => api.listen(0, "127.0.0.1", resolve));
+  const input = {
+    execution_id: "short-withdraw",
+    session_id: "fixture-session",
+    operation: "withdraw",
+    payload: {
+      placement_slot: "short_post",
+      external_id: "42",
+      body: "Synthetic original body",
+    },
+  };
+  const execute = async (body) => {
+    const response = await fetch(
+      `http://127.0.0.1:${api.address().port}/v1/executions`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      },
+    );
+    return { status: response.status, body: await response.json() };
+  };
+  try {
+    const [first, duplicate] = await Promise.all([
+      execute(input),
+      execute(input),
+    ]);
+    assert.equal(first.status, 200);
+    assert.equal(first.body.status, "completed");
+    assert.deepEqual(duplicate, first);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].operation, "withdraw");
+    assert.deepEqual(calls[0].payload, input.payload);
+    assert.equal(calls[0].network.expectedAccountId, "fixture-owner");
+    assert.ok(calls[0].network.signal instanceof AbortSignal);
+    assert.ok(Number.isFinite(calls[0].network.deadlineAt));
+
+    for (const payload of [
+      { ...input.payload, external_id: "43" },
+      { ...input.payload, body: "Changed body" },
+      { ...input.payload, placement_slot: "primary" },
+    ]) {
+      const conflict = await execute({ ...input, payload });
+      assert.equal(conflict.status, 409);
+      assert.equal(conflict.body.error, "execution_conflict");
+    }
+    const article = await execute({
+      ...input,
+      execution_id: "article-withdraw",
+      payload: { ...input.payload, placement_slot: "primary" },
+    });
+    assert.equal(article.status, 200);
+    assert.equal(article.body.status, "unsupported");
+    assert.equal(article.body.reason, "operation_not_supported");
+    assert.equal(calls.length, 1);
+  } finally {
+    await new Promise((resolve, reject) =>
+      api.close((error) => (error ? reject(error) : resolve())),
+    );
     await runner.shutdown();
   }
 });

@@ -113,6 +113,73 @@ function sameOwner(first, second) {
   );
 }
 
+function exactFields(value, fields) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === fields.length &&
+    fields.every((field) => Object.hasOwn(value, field))
+  );
+}
+
+async function freshShortPostRequest(page, raw, expected) {
+  try {
+    if (typeof raw !== "string" || !raw || raw.length > 600_000) return false;
+    const payload = JSON.parse(raw);
+    const data = payload.data;
+    // This endpoint also edits and schedules content. Only the observed fresh,
+    // body-only composer request can attest to a new publication.
+    if (
+      !exactFields(payload, ["action", "data"]) ||
+      payload.action !== "pin" ||
+      !exactFields(data, [
+        "publish",
+        "commentsPermission",
+        "extra_info",
+        "draft",
+        "hybrid",
+      ]) ||
+      !exactFields(data.draft, ["disabled"]) ||
+      data.draft.disabled !== 1 ||
+      !exactFields(data.extra_info, ["view_permission", "publisher"]) ||
+      data.extra_info.view_permission !== "all" ||
+      data.extra_info.publisher !== "pc" ||
+      !exactFields(data.publish, ["traceId"]) ||
+      typeof data.publish.traceId !== "string" ||
+      !data.publish.traceId ||
+      data.publish.traceId.length > 128 ||
+      !exactFields(data.commentsPermission, ["comment_permission"]) ||
+      typeof data.commentsPermission.comment_permission !== "string" ||
+      !exactFields(data.hybrid, ["html", "textLength"]) ||
+      typeof data.hybrid.html !== "string" ||
+      !data.hybrid.html ||
+      !Number.isSafeInteger(data.hybrid.textLength) ||
+      data.hybrid.textLength < 1
+    )
+      return false;
+    const text = await page.evaluate((html) => {
+      const document = new DOMParser().parseFromString(html, "text/html");
+      const body = document.body;
+      if (
+        document.head.childNodes.length ||
+        [...body.querySelectorAll("*")].some(
+          (node) => !["P", "DIV", "SPAN", "BR"].includes(node.tagName),
+        )
+      )
+        return null;
+      for (const br of body.querySelectorAll("br")) br.replaceWith("\n");
+      for (const block of body.querySelectorAll("p,div")) block.append("\n");
+      return body.textContent;
+    }, data.hybrid.html);
+    return (
+      typeof text === "string" && normalized(text) === normalized(expected.body)
+    );
+  } catch {
+    return false;
+  }
+}
+
 // The observed text region excludes the item's timestamp, media and toolbar.
 // Truncated text or multiple body regions leave the result unknown.
 async function item(page, url, expected, account, config) {
@@ -245,6 +312,10 @@ export async function publishShortPost(page, payload, network = {}) {
     return result("unsupported", "short_post_title_unverified", "draft");
   let stage = "draft";
   let submitted = false;
+  let captureRequest;
+  let captureSession;
+  let requestBlocked = false;
+  let forwardedRequestId;
   try {
     const account = await owner(page, config);
     if (!account)
@@ -281,39 +352,216 @@ export async function publishShortPost(page, payload, network = {}) {
     if ((await submit.count()) !== 1)
       return result("unsupported", "editor_submit_unverified", stage);
     stage = "submit";
+    const createUrl = `${config.origin}/api/v4/content/publish`;
+    let createRequest;
+    captureRequest = (request) => {
+      if (
+        request.method() === "POST" &&
+        request.url() === createUrl &&
+        request.frame() === page.mainFrame()
+      ) {
+        createRequest ??= request;
+      }
+    };
+    page.on("request", captureRequest);
+    let capturedBody;
+    let responseCount = 0;
+    let requestAttempts = 0;
+    // Keep the original browser transport, cookies and proxy. Validate the
+    // first request before forwarding, then retain its bounded response before
+    // navigation can discard the resource. No request is replayed.
+    try {
+      captureSession = await page.context().newCDPSession(page);
+      const session = captureSession;
+      const { frameTree } = await session.send("Page.getFrameTree");
+      const capturePaused = (event) => {
+        void (async () => {
+          let bodyTimeout;
+          let resume = true;
+          try {
+            const matches =
+              event.frameId === frameTree.frame.id &&
+              event.request.url === createUrl &&
+              event.request.method === "POST";
+            if (event.responseStatusCode === undefined) {
+              requestAttempts++;
+              if (
+                !matches ||
+                requestAttempts !== 1 ||
+                forwardedRequestId ||
+                event.redirectedRequestId ||
+                !(await freshShortPostRequest(
+                  page,
+                  event.request.postData,
+                  expected,
+                ))
+              ) {
+                requestBlocked = true;
+                resume = false;
+                await session.send("Fetch.failRequest", {
+                  requestId: event.requestId,
+                  errorReason: "BlockedByClient",
+                });
+              } else {
+                forwardedRequestId = event.requestId;
+              }
+              return;
+            }
+            if (!matches || event.requestId !== forwardedRequestId) return;
+            responseCount++;
+            if (
+              responseCount !== 1 ||
+              event.responseStatusCode < 200 ||
+              event.responseStatusCode >= 300 ||
+              event.responseHeaders?.some(
+                (header) =>
+                  header.name.toLowerCase() === "content-length" &&
+                  Number(header.value) > 1_000_000,
+              )
+            )
+              return;
+            const body = await Promise.race([
+              session.send("Fetch.getResponseBody", {
+                requestId: event.requestId,
+              }),
+              new Promise((_, reject) => {
+                bodyTimeout = setTimeout(
+                  () => reject(new Error()),
+                  config.timeout,
+                );
+              }),
+            ]);
+            if (body.body.length <= 1_400_000) {
+              const bytes = Buffer.from(
+                body.body,
+                body.base64Encoded ? "base64" : "utf8",
+              );
+              if (bytes.length <= 1_000_000) capturedBody = bytes;
+            }
+          } catch {
+            // An unavailable capture cannot grant creation authority.
+          } finally {
+            clearTimeout(bodyTimeout);
+            if (resume)
+              await session
+                .send("Fetch.continueRequest", {
+                  requestId: event.requestId,
+                })
+                .catch(() => {});
+          }
+        })();
+      };
+      captureSession.on("Fetch.requestPaused", capturePaused);
+      await captureSession.send("Fetch.enable", {
+        patterns: [
+          { urlPattern: createUrl, requestStage: "Request" },
+          { urlPattern: createUrl, requestStage: "Response" },
+        ],
+      });
+    } catch {
+      await captureSession?.detach().catch(() => {});
+      captureSession = undefined;
+    }
+    if (!captureSession)
+      return result(
+        "unsupported",
+        "short_post_create_capture_unavailable",
+        stage,
+      );
+    const pendingReceipt = page
+      .waitForResponse((response) => response.request() === createRequest, {
+        timeout: config.timeout,
+      })
+      .catch(() => null);
     // There is exactly one click. Any exception after this point is unknown.
     submitted = true;
     await submit.click({ timeout: config.timeout });
-    await page.waitForURL((url) => pinUrl(url.href, config.origin) !== null, {
-      timeout: config.timeout,
-    });
-    const candidate = {
-      url: pinUrl(page.url(), config.origin),
-      source: "post_submit_navigation",
-    };
-    const externalId = new URL(candidate.url).pathname.slice("/pin/".length);
-    const observedAt = new Date().toISOString();
-    const evidence = {
-      kind: "publication_candidate",
-      schema_version: "geo.publication.candidate.v1",
-      url: candidate.url,
-      expected_sha256: hash(expected.body),
-      observed_at: observedAt,
-      source: candidate.source,
-    };
+    const receipt = await pendingReceipt;
+    if (requestBlocked && !forwardedRequestId)
+      return result(
+        "unsupported",
+        "short_post_create_request_unverified",
+        stage,
+      );
+    const creation = [];
+    if (
+      capturedBody &&
+      responseCount === 1 &&
+      forwardedRequestId &&
+      receipt?.ok() &&
+      receipt.url() === createUrl &&
+      !createRequest.redirectedFrom() &&
+      !createRequest.redirectedTo()
+    ) {
+      // The response decoder is intentionally tied to the observed client
+      // envelope; navigation and public readback cannot mint creation proof.
+      try {
+        const responseData = JSON.parse(capturedBody.toString("utf8"));
+        const encoded = responseData?.data?.result;
+        const created =
+          typeof encoded === "string" ? JSON.parse(encoded) : null;
+        if (
+          typeof created?.id === "string" &&
+          /^[1-9][0-9]{0,39}$/u.test(created.id) &&
+          created.author?.id === account.id &&
+          responseData.data.write?.instruction !== true &&
+          responseCount === 1
+        ) {
+          creation.push({
+            kind: "publication_created",
+            schema_version: "geo.publication.created.v1",
+            external_id: created.id,
+            url: `${config.origin}/pin/${created.id}`,
+            expected_sha256: hash(expected.body),
+            request_method: "POST",
+            request_url: createUrl,
+            http_status: receipt.status(),
+            observed_at: new Date().toISOString(),
+          });
+        }
+      } catch {
+        // An unreadable response preserves the read-only navigation candidate.
+      }
+    }
+    if (!creation.length)
+      await page.waitForURL((url) => pinUrl(url.href, config.origin) !== null, {
+        timeout: config.timeout,
+      });
+    const externalId =
+      creation[0]?.external_id ??
+      new URL(pinUrl(page.url(), config.origin)).pathname.slice("/pin/".length);
     const outcome = await readback(
       page,
       { ...expected, external_id: externalId },
       config,
       account,
     );
+    const navigationUrl = pinUrl(page.url(), config.origin);
+    const evidence = navigationUrl
+      ? [
+          {
+            kind: "publication_candidate",
+            schema_version: "geo.publication.candidate.v1",
+            url: navigationUrl,
+            expected_sha256: hash(expected.body),
+            observed_at: new Date().toISOString(),
+            source: "post_submit_navigation",
+          },
+        ]
+      : [];
     return {
       ...outcome,
       external_id: externalId,
-      public_url: candidate.url,
-      evidence: [evidence, ...outcome.evidence],
+      public_url: `${config.origin}/pin/${externalId}`,
+      evidence: [...evidence, ...outcome.evidence, ...creation],
     };
   } catch {
+    if (requestBlocked && !forwardedRequestId)
+      return result(
+        "unsupported",
+        "short_post_create_request_unverified",
+        stage,
+      );
     return result(
       submitted ? "unknown" : "unsupported",
       submitted
@@ -321,6 +569,9 @@ export async function publishShortPost(page, payload, network = {}) {
         : "editor_selectors_unverified",
       stage,
     );
+  } finally {
+    if (captureRequest) page.off("request", captureRequest);
+    await captureSession?.detach().catch(() => {});
   }
 }
 

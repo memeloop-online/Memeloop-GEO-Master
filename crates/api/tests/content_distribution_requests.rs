@@ -482,7 +482,8 @@ impl Fixture {
             "content_revision_id":self.content_revision_id,
             "account_id":self.account_id,
             "placement_slot":"primary",
-            "format":"markdown.v1"
+            "format":"markdown.v1",
+            "withdraw_after_publish":false
         })
     }
 

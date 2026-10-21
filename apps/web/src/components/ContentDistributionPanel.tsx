@@ -73,6 +73,7 @@ function readPending(
       record.input?.content_asset_id !== assetId ||
       typeof record.input.content_revision_id !== "string" ||
       typeof record.input.account_id !== "string" ||
+      typeof record.input.withdraw_after_publish !== "boolean" ||
       !placementSlots.includes(
         record.input.placement_slot as DistributionPlacement,
       ) ||
@@ -116,7 +117,8 @@ function pendingMatchesReceipt(
     pending.input.content_revision_id === receipt.content_revision_id &&
     pending.input.account_id === receipt.account_id &&
     pending.input.placement_slot === receipt.placement_slot &&
-    pending.input.format === receipt.format
+    pending.input.format === receipt.format &&
+    pending.input.withdraw_after_publish === receipt.withdraw_after_publish
   );
 }
 
@@ -321,6 +323,7 @@ export function ContentDistributionPanel({
         account_id: selectedAccount.account_id,
         placement_slot: selectedPlacement,
         format: distributionFormat(revision),
+        withdraw_after_publish: false,
       },
     };
     // Fail closed if this tab cannot keep the retry key across a lost response.

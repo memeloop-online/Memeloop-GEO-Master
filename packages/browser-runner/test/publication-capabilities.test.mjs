@@ -4,7 +4,11 @@ import { adapters } from "../src/adapters.mjs";
 import { createRunner } from "../src/runner.mjs";
 
 test("publication operations distinguish public readback, submit-only, and unavailable adapters", () => {
-  assert.deepEqual(adapters.zhihu.operations, ["publish", "lookup"]);
+  assert.deepEqual(adapters.zhihu.operations, [
+    "publish",
+    "lookup",
+    "withdraw",
+  ]);
   assert.deepEqual(adapters.baidu_creator.operations, ["publish"]);
   assert.deepEqual(adapters.xiaohongshu.operations, []);
 });

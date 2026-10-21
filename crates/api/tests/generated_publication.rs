@@ -847,6 +847,13 @@ async fn fixture_command_never_opens_a_runner_context_or_claims() {
 }
 
 async fn requested_fixture_at(placement_slot: &str) -> FrozenFixture {
+    requested_fixture_at_with_withdrawal(placement_slot, false).await
+}
+
+async fn requested_fixture_at_with_withdrawal(
+    placement_slot: &str,
+    withdraw_after_publish: bool,
+) -> FrozenFixture {
     // The unused frozen fixture retains the existing coverage tests' setup;
     // this separate command is a real checked, on-demand content request.
     let mut fixture = frozen_fixture(true).await;
@@ -973,6 +980,7 @@ async fn requested_fixture_at(placement_slot: &str) -> FrozenFixture {
                 account,
                 placement_slot: placement_slot.into(),
                 format: geo_domain::TEXT_DISTRIBUTION_FORMAT.into(),
+                withdraw_after_publish,
                 idempotency_key: "first-article".into(),
             },
         )
@@ -1020,6 +1028,60 @@ async fn requested_fixture_at(placement_slot: &str) -> FrozenFixture {
 
 async fn requested_fixture() -> FrozenFixture {
     requested_fixture_at("primary").await
+}
+
+#[tokio::test]
+async fn requested_cleanup_requires_withdraw_on_the_same_connector_before_sending() {
+    let fixture = requested_fixture_at_with_withdrawal("short_post", true).await;
+    for connectors in [
+        json!([{"platform":"zhihu","placement_slot":"short_post","connector_version":"test-live.v1","operations":["publish","lookup"],"verified":false}]),
+        json!([
+            {"platform":"zhihu","placement_slot":"short_post","connector_version":"test-live.v1","operations":["publish","lookup"],"verified":false},
+            {"platform":"zhihu","placement_slot":"primary","connector_version":"test-live.v1","operations":["publish","lookup","withdraw"],"verified":false}
+        ]),
+    ] {
+        *fixture.calls.advertised_connectors.lock().await = Some(connectors);
+        assert!(matches!(
+            execute_channel_target(&fixture.state, &fixture.scope, fixture.command_id)
+                .await
+                .unwrap(),
+            ChannelDispatchResult::Deferred(ChannelDispatchDeferred::ConnectorUnavailable)
+        ));
+        assert!(fixture.calls.sends.lock().await.is_empty());
+        assert!(
+            fixture
+                .state
+                .channel_job_repository()
+                .get_target(&fixture.scope, fixture.command_id)
+                .await
+                .unwrap()
+                .attempts
+                .is_empty()
+        );
+        assert!(
+            fixture
+                .state
+                .channel_job_repository()
+                .scan_pending(None, Utc::now(), 100)
+                .await
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.target_id == fixture.command_id)
+        );
+    }
+    *fixture.calls.advertised_connectors.lock().await = Some(json!([
+        {"platform":"zhihu","placement_slot":"short_post","connector_version":"test-live.v1","operations":["publish","lookup","withdraw"],"verified":false}
+    ]));
+    assert!(matches!(
+        execute_channel_target(&fixture.state, &fixture.scope, fixture.command_id)
+            .await
+            .unwrap(),
+        ChannelDispatchResult::Executed(_)
+    ));
+    let sends = fixture.calls.sends.lock().await;
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0]["operation"], "publish");
+    fixture.server.abort();
 }
 
 #[tokio::test]

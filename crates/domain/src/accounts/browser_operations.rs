@@ -33,6 +33,7 @@ pub enum BrowserOperationPurpose {
     Discovery,
     Measure,
     Publish,
+    Withdraw,
     Lookup,
     Cleanup,
     CompletionRecovery,
