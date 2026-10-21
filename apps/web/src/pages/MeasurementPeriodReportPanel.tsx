@@ -557,7 +557,10 @@ export function MeasurementPeriodReportPanel({
               </details>
             )}
             {recommendations.length > 0 && (
-              <details className="measurement-report-evidence">
+              <details
+                className="measurement-report-evidence"
+                open={Boolean(questionSet)}
+              >
                 <summary>{t("compareMeasurements")}</summary>
                 <RecommendationTrend samples={recommendations} />
               </details>
