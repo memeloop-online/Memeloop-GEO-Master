@@ -173,11 +173,9 @@ async function selectEvidence(
   if (!Array.isArray(selected?.evidence)) {
     throw new PreparationError("evidence_validation", "invalid_evidence_shape");
   }
-  if (selected.evidence.length > EVIDENCE_LIMIT) {
-    throw new PreparationError("evidence_validation", "evidence_limit");
-  }
   const seen = new Set();
-  return selected.evidence.map((choice) => {
+  const evidence = [];
+  for (const choice of selected.evidence) {
     if (
       !choice ||
       typeof choice.source_version_id !== "string" ||
@@ -210,7 +208,6 @@ async function selectEvidence(
     const text = fromCandidates ? source?.exact_quote : source?.text;
     let reason;
     if (!source) reason = "unknown_chunk";
-    else if (seen.has(key)) reason = "duplicate_chunk";
     else if (!choice.exact_quote.trim()) reason = "blank_quote";
     else if ([...choice.exact_quote].length > QUOTE_CHAR_LIMIT)
       reason = "quote_limit";
@@ -227,18 +224,26 @@ async function selectEvidence(
     )
       reason = "quote_mismatch";
     if (reason) throw new PreparationError("evidence_validation", reason);
+    // Validate every choice before retaining the first quote per distinct chunk.
+    if (seen.has(key)) continue;
+    if (seen.size >= EVIDENCE_LIMIT) {
+      throw new PreparationError("evidence_validation", "evidence_limit");
+    }
     seen.add(key);
-    return fromCandidates
-      ? source
-      : {
-          reference: {
-            source_version_id: source.source_version_id,
-            chunk_id: source.chunk_id,
-            locator: source.locator,
+    evidence.push(
+      fromCandidates
+        ? source
+        : {
+            reference: {
+              source_version_id: source.source_version_id,
+              chunk_id: source.chunk_id,
+              locator: source.locator,
+            },
+            exact_quote: choice.exact_quote,
           },
-          exact_quote: choice.exact_quote,
-        };
-  });
+    );
+  }
+  return evidence;
 }
 
 async function combineEvidence(item, context, left, right, capability, ctx) {
