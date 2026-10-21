@@ -606,7 +606,11 @@ async fn publication_withdrawal_is_scoped_one_shot_and_preserves_the_send_receip
         };
         let expected = plain_text_publication_readback_hash("short_post", title, body);
         let url = "https://www.zhihu.com/pin/123456789";
-        let observed = at + chrono::Duration::milliseconds(1);
+        // Runner receipts use JavaScript ISO timestamps (milliseconds).
+        // Do not put nanoseconds in JSON evidence while PostgreSQL truncates
+        // the same received_at value to microseconds.
+        let observed =
+            chrono::DateTime::<Utc>::from_timestamp_millis(at.timestamp_millis() + 1).unwrap();
         let outcome = ChannelOutcome {
             status: ChannelOutcomeStatus::Unknown,
             detail: None,
