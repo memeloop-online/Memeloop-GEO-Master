@@ -24,6 +24,35 @@ const result = (items: unknown[], status = "verified") => ({
 });
 
 describe("recommendation results", () => {
+  it("highlights only the explicit target and summarizes its actual rank", () => {
+    render(
+      <RecommendationResults
+        value={result([
+          item,
+          {
+            ...item,
+            name: "Sample purifier Pro",
+            mention_order: 2,
+            rank: null,
+          },
+        ])}
+        focusNames={["Sample purifier"]}
+      />,
+    );
+    expect(screen.getByText("推荐第 2 位")).toBeVisible();
+    expect(screen.getAllByText("关注对象")).toHaveLength(1);
+  });
+
+  it("does not call missing analysis an absent recommendation", () => {
+    const { rerender } = render(
+      <RecommendationResults value={null} focusNames={["Example"]} />,
+    );
+    expect(screen.queryByText(/本次推荐名单/)).not.toBeInTheDocument();
+    rerender(
+      <RecommendationResults value={result([item])} focusNames={["Example"]} />,
+    );
+    expect(screen.getByText("本次推荐名单中没有“Example”")).toBeVisible();
+  });
   it("shows extracted entity order separately from explicit ranking", () => {
     render(
       <RecommendationResults

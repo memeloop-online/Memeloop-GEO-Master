@@ -1,0 +1,58 @@
+import i18n from "./index";
+
+const translations = {
+  "zh-CN": {
+    title: "关注对象",
+    empty: "想了解哪个产品或品牌的推荐表现？",
+    optional: "也可以不设置，直接测量任何问题。",
+    edit: "修改",
+    add: "设置关注对象",
+    brand: "品牌",
+    product: "具体产品（可选）",
+    productHint: "填写具体产品后，将查看它的推荐表现。",
+    save: "保存",
+    saving: "保存中…",
+    cancel: "取消",
+    loading: "正在读取关注对象…",
+    loadFailed: "暂时无法读取关注对象",
+    retry: "重试",
+    saveFailed: "未能保存，请重试。",
+    conflict: "项目信息已更新，请重新打开修改。",
+    comparison: "对比对象：{{names}}",
+    focused: "关注对象",
+    resultTitle: "{{name}}的推荐表现",
+    ranked: "推荐第 {{rank}} 位",
+    unranked: "已推荐，未明确排名",
+    notFound: "本次推荐名单中没有“{{name}}”",
+    evidenceHint: "查看下方推荐理由和回答原文，了解 AI 的选择依据。",
+  },
+  en: {
+    title: "Tracked product or brand",
+    empty: "Which product or brand do you want to track?",
+    optional: "You can also measure any question without setting a target.",
+    edit: "Edit",
+    add: "Set a target",
+    brand: "Brand",
+    product: "Specific product (optional)",
+    productHint: "Results will highlight this product when it is recommended.",
+    save: "Save",
+    saving: "Saving…",
+    cancel: "Cancel",
+    loading: "Loading your target…",
+    loadFailed: "Your target could not be loaded",
+    retry: "Retry",
+    saveFailed: "Could not save. Please try again.",
+    conflict: "Project details have changed. Reopen the editor to continue.",
+    comparison: "Compare with: {{names}}",
+    focused: "Your target",
+    resultTitle: "Recommendations for {{name}}",
+    ranked: "Recommended at #{{rank}}",
+    unranked: "Recommended without an explicit rank",
+    notFound: "“{{name}}” is not in this recommendation list",
+    evidenceHint: "Review the reasons and original answer below to see why.",
+  },
+};
+
+for (const [language, translation] of Object.entries(translations)) {
+  i18n.addResourceBundle(language, "measurementFocus", translation, true, true);
+}

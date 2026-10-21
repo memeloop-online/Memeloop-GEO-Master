@@ -1,0 +1,77 @@
+.measurement-history-folders {
+  display: grid;
+  gap: 16px;
+  margin-block: 16px;
+}
+
+.measurement-history-folder {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--colorNeutralStroke2);
+  border-radius: var(--borderRadiusLarge);
+  background: var(--colorNeutralBackground1);
+}
+
+.measurement-history-folder > summary {
+  padding-block: 4px;
+  font-size: var(--fontSizeBase400);
+  font-weight: var(--fontWeightSemibold);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.measurement-history-folder[open] > summary {
+  margin-bottom: 16px;
+}
+
+.measurement-history-version {
+  margin-top: 20px;
+}
+
+.measurement-history-version > summary {
+  color: var(--colorNeutralForeground2);
+  cursor: pointer;
+}
+
+.measurement-history-records {
+  display: grid;
+  gap: 8px;
+  padding: 0;
+  margin-block: 12px;
+  list-style: none;
+}
+
+.measurement-history-record {
+  min-width: 0;
+}
+
+.measurement-history-record-button {
+  width: 100%;
+  justify-content: flex-start !important;
+  text-align: start;
+  padding: 12px !important;
+  border: 1px solid var(--colorNeutralStroke2) !important;
+}
+
+.measurement-history-record-button[aria-current="true"] {
+  border-color: var(--colorBrandStroke1) !important;
+  background: var(--colorBrandBackground2);
+}
+
+.measurement-history-record-content {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.measurement-history-question {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.measurement-history-meta {
+  color: var(--colorNeutralForeground2);
+  font-size: var(--fontSizeBase200);
+  font-weight: var(--fontWeightRegular);
+  overflow-wrap: anywhere;
+}

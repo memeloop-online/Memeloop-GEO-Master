@@ -15,6 +15,17 @@ import { MeasurementPeriodReportPanel } from "./MeasurementPeriodReportPanel";
 import i18n from "../i18n";
 
 const auth = vi.hoisted(() => ({ role: "member" }));
+const focus = vi.hoisted(() => ({ name: "" }));
+vi.mock("../api/projects", () => ({
+  useProjectQuery: () => ({
+    data: {
+      revision: 1,
+      settings: { brand_name: focus.name, competitors: [] },
+    },
+    isPending: false,
+  }),
+  useUpdateProjectMutation: () => ({ isPending: false, mutateAsync: vi.fn() }),
+}));
 vi.mock("../auth/AuthProvider", () => ({
   useAuth: () => ({
     session: {
@@ -88,13 +99,16 @@ const saved: api.MeasurementPeriodReport = {
   revision: 2,
   correction_of: "older-report",
 };
-function setup(input: api.MeasurementPeriodPreview = preview) {
+function setup(
+  input: api.MeasurementPeriodPreview = preview,
+  reports: api.MeasurementPeriodReport[] = [],
+) {
   const load = vi
     .spyOn(api, "getMeasurementReportPreview")
     .mockResolvedValue(input);
   const list = vi
     .spyOn(api, "listMeasurementReports")
-    .mockResolvedValue({ items: [] });
+    .mockResolvedValue({ items: reports });
   const detail = vi.spyOn(api, "getMeasurementReport").mockResolvedValue(saved);
   const save = vi.spyOn(api, "saveMeasurementReport").mockResolvedValue(saved);
   const client = new QueryClient({
@@ -113,11 +127,220 @@ function setup(input: api.MeasurementPeriodPreview = preview) {
 }
 afterEach(async () => {
   auth.role = "member";
+  focus.name = "";
   cleanup();
   vi.restoreAllMocks();
   await i18n.changeLanguage("zh-CN");
 });
 describe("cycle-free measurement report", () => {
+  it("shows newest answers first and filters both cards and comparisons without changing saved report input", async () => {
+    const base = preview.samples[0];
+    const samples = [
+      {
+        ...base,
+        target_id: "older",
+        plan_id: "older",
+        observation: {
+          ...base.observation!,
+          observed_at: "2026-10-02T00:00:00Z",
+        },
+      },
+      {
+        ...base,
+        target_id: "other",
+        plan_id: "other",
+        conditions: {
+          ...base.conditions,
+          question: "Which desk suits a small room?",
+        },
+        observation: {
+          ...base.observation!,
+          observed_at: "2026-10-03T00:00:00Z",
+        },
+      },
+      {
+        ...base,
+        target_id: "newer",
+        plan_id: "newer",
+        observation: {
+          ...base.observation!,
+          observed_at: "2026-10-04T00:00:00Z",
+        },
+      },
+    ];
+    const input = { ...preview, samples };
+    const { save } = setup(input);
+    const filter = await screen.findByRole("combobox", { name: "AI 测量问题" });
+    const recordOrder = () =>
+      screen
+        .getAllByRole("link", { name: "查看测量记录" })
+        .map((link) =>
+          new URL(
+            link.getAttribute("href")!,
+            "http://localhost",
+          ).searchParams.get("record"),
+        );
+    expect(recordOrder()).toEqual(["newer", "other", "older"]);
+    await userEvent.selectOptions(filter, base.conditions.question);
+    expect(recordOrder()).toEqual(["newer", "older"]);
+    expect(screen.getByText(/当前问题 · 测量样本 2 项/)).toBeVisible();
+    await userEvent.click(screen.getByText("对比历次推荐排名"));
+    const trend = screen.getByRole("region", { name: "推荐排名变化" });
+    expect(
+      within(trend).queryByText("Which desk suits a small room?"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(trend).getByRole("heading", { name: base.conditions.question }),
+    ).toBeVisible();
+    expect(samples.map((sample) => sample.target_id)).toEqual([
+      "older",
+      "other",
+      "newer",
+    ]);
+    await userEvent.click(
+      screen.getByRole("button", { name: "保存此范围的报告" }),
+    );
+    await waitFor(() =>
+      expect(save).toHaveBeenCalledWith("tenant", "project", input),
+    );
+  });
+  it("preserves frozen citations and provenance for a saved sample with a blank answer", async () => {
+    const observation = {
+      ...preview.samples[0].observation!,
+      raw_answer: " \n ",
+      citations: ["https://example.org/frozen-source", "javascript:alert(1)"],
+      provenance: {
+        ...preview.samples[0].observation!.provenance!,
+        revision_id: "frozen-analysis",
+        source_sha256: "frozen-digest",
+      },
+    };
+    const frozen = {
+      ...saved,
+      samples: [{ ...preview.samples[0], observation }],
+    };
+    const { detail } = setup(preview, [frozen]);
+    detail.mockResolvedValue(frozen);
+    await userEvent.selectOptions(
+      await screen.findByRole("combobox", { name: "报告时间" }),
+      frozen.report_id,
+    );
+    await screen.findByRole("heading", { name: "报告版本 2" });
+    const raw = screen.getByText(
+      (_, element) =>
+        element?.tagName === "PRE" &&
+        element.textContent === JSON.stringify(observation, null, 2),
+    );
+    expect(raw).not.toBeVisible();
+    await userEvent.click(screen.getByText("1 项测量尚无回答"));
+    await userEvent.click(raw.closest("details")!.querySelector("summary")!);
+    expect(raw).toBeVisible();
+    expect(JSON.parse(raw.textContent!)).toEqual(observation);
+    const receipt = within(raw.closest("details")!);
+    expect(
+      receipt.getByRole("link", { name: "https://example.org/frozen-source" }),
+    ).toHaveAttribute("href", "https://example.org/frozen-source");
+    expect(
+      receipt.queryByRole("link", { name: "javascript:alert(1)" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "查看测量记录" })).toHaveAttribute(
+      "href",
+      expect.stringContaining("analysisRevision=frozen-analysis"),
+    );
+  });
+  it("switches between a saved snapshot and the latest preview from the report selector", async () => {
+    const { detail, save } = setup(preview, [saved]);
+    const selector = await screen.findByRole("combobox", { name: "报告时间" });
+    await userEvent.selectOptions(selector, saved.report_id);
+    await waitFor(() =>
+      expect(detail).toHaveBeenCalledWith("tenant", "project", saved.report_id),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "报告版本 2" }),
+    ).toBeVisible();
+    await userEvent.selectOptions(selector, "");
+    expect(
+      await screen.findByRole("heading", { name: "最近七天 · 预览" }),
+    ).toBeVisible();
+    expect(save).not.toHaveBeenCalled();
+  });
+  it("leads with verified entities and reasons, keeps explicit rank distinct from mention order, and expands evidence on request", async () => {
+    focus.name = "Trail light";
+    setup({
+      ...preview,
+      samples: [
+        {
+          ...preview.samples[0],
+          recommendations: {
+            version: "geo.recommendations.v1",
+            status: "verified",
+            items: [
+              {
+                name: "Trail light",
+                kind: "product",
+                mention_order: 1,
+                rank: null,
+                reason: "Compact enough for a backpack",
+                evidence_quote: "Trail light is compact.",
+                citation_urls: [
+                  "https://example.org/review",
+                  "javascript:alert(1)",
+                ],
+              },
+            ],
+          },
+        },
+      ],
+    });
+    const table = await screen.findByRole("table", { name: "AI 推荐了什么" });
+    expect(screen.getByText("当前关注：Trail light")).toBeVisible();
+    expect(screen.getByText(/已获推荐，未明确排名/)).toBeVisible();
+    expect(within(table).getByText("Trail light").closest("tr")).toHaveClass(
+      "measurement-report-focus-row",
+    );
+    expect(within(table).getByText("Trail light")).toBeVisible();
+    expect(
+      within(table).getByText("Compact enough for a backpack"),
+    ).toBeVisible();
+    expect(within(table).getByText("未明确排名")).toBeVisible();
+    expect(within(table).queryByText("第 1 名")).not.toBeInTheDocument();
+    expect(
+      within(table).getByText("Trail light is compact."),
+    ).not.toBeVisible();
+    expect(screen.getByText("Saved response answer")).not.toBeVisible();
+    await userEvent.click(within(table).getByText("查看原文依据"));
+    expect(within(table).getByText("Trail light is compact.")).toBeVisible();
+    expect(within(table).getByRole("link")).toHaveAttribute(
+      "href",
+      "https://example.org/review",
+    );
+    expect(
+      within(table).queryByText("javascript:alert(1)"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText("对比历次推荐排名").parentElement,
+    ).not.toHaveAttribute("open");
+  });
+
+  it("does not display unverified entities as recommendations", async () => {
+    setup({
+      ...preview,
+      samples: [
+        {
+          ...preview.samples[0],
+          recommendations: {
+            version: "geo.recommendations.v1",
+            status: "pending",
+            items: [{ name: "Unverified product" }],
+          },
+        },
+      ],
+    });
+    expect(
+      await screen.findByText("暂无法确认推荐结果，可查看完整回答。"),
+    ).toBeVisible();
+    expect(screen.queryByText("Unverified product")).not.toBeInTheDocument();
+  });
   it.each(["zh-CN", "en"])(
     "summarizes persisted answers and stably prioritizes them in %s without changing receipts",
     async (language) => {
@@ -199,6 +422,11 @@ describe("cycle-free measurement report", () => {
         "unsupported-plan",
       ]);
       expect(screen.getAllByText("Saved response answer")).toHaveLength(1);
+      expect(screen.getByText("Second saved answer")).not.toBeVisible();
+      for (const summary of screen.getAllByText(
+        language === "en" ? "Full answer and sources" : "完整回答与引用",
+      ))
+        await userEvent.click(summary);
       expect(screen.getByText("Second saved answer")).toBeVisible();
       expect(
         screen.getAllByRole("link", { name: "https://example.org/evidence" }),
@@ -222,6 +450,13 @@ describe("cycle-free measurement report", () => {
           : "原测量结果：暂不支持",
       );
       expect(unsupportedReceipt).not.toBeVisible();
+      await userEvent.click(
+        screen.getByText(
+          language === "en"
+            ? "3 measurements without answers"
+            : "3 项测量尚无回答",
+        ),
+      );
       await userEvent.click(
         unsupportedReceipt.closest("details")!.querySelector("summary")!,
       );
@@ -454,7 +689,7 @@ describe("cycle-free measurement report", () => {
     expect(screen.getByText("analysis-model")).toBeInTheDocument();
     expect(screen.getByText("analysis-revision")).toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "provider-a · model-a" }),
+      screen.getAllByRole("heading", { name: "Which lamp suits camping?" })[0],
     ).toBeVisible();
     expect(
       screen.queryByRole("heading", {
@@ -466,6 +701,8 @@ describe("cycle-free measurement report", () => {
     ).not.toBeVisible();
     expect(screen.getByText("analysis-revision")).not.toBeVisible();
     expect(screen.getByText("digest")).not.toBeVisible();
+    expect(screen.getByText("Saved response answer")).not.toBeVisible();
+    await userEvent.click(screen.getByText("完整回答与引用"));
     expect(screen.getByText("Saved response answer")).toBeVisible();
     expect(screen.getByText(/报告范围：/)).toHaveTextContent("UTC");
     await userEvent.click(screen.getByText("记录详情"));

@@ -147,6 +147,14 @@ function mockApi({
       return Promise.resolve(response(session));
     if (url.pathname.endsWith("/projects"))
       return Promise.resolve(response({ items: [], next_cursor: null }));
+    if (url.pathname.endsWith("/projects/project-1"))
+      return Promise.resolve(
+        response({
+          project_id: "project-1",
+          revision: 1,
+          settings: { brand_name: "", product_name: null, competitors: [] },
+        }),
+      );
     if (url.pathname.endsWith("/projects/project-1/cycles/current"))
       return Promise.resolve(
         response(
