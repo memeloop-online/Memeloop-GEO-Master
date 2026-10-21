@@ -2,18 +2,19 @@ use chrono::Utc;
 use geo_api::{AppState, RepositoryHostOps};
 use geo_domain::{
     AttachmentId, AttachmentReference, CONTENT_SEMANTIC_DESCRIPTOR_VERSION, ContentBlock,
-    ContentBlockKind, ContentBrief, ContentEvidence, ContentReuseDecision, ContentReuseRequest,
-    ContentSemanticDescriptor, ContentStep, DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID,
-    DocumentManifest, DocumentManifestPlanRequest, EvidenceRef, ImportItem, InitialSource,
-    InitialSourceKind, InitialSourceVisibility, KnowledgePurpose, ProjectCreate, ProjectSettings,
-    ProjectStartCommand, RICH_CHECK_POLICY_VERSION, RICH_GENERATION_POLICY_VERSION,
-    RICH_REPAIR_POLICY_VERSION, SourceKind, StructuredDocument, TenantScope, UploadSessionCommand,
-    hash_idempotency_key, settings_hash, start_request_hash,
+    ContentBlockKind, ContentBrief, ContentEvidence, ContentItemStatus, ContentReuseDecision,
+    ContentReuseRequest, ContentSemanticDescriptor, ContentStep, DEVELOPMENT_OPERATOR_ID,
+    DEVELOPMENT_TENANT_ID, DocumentManifest, DocumentManifestPlanRequest, EvidenceRef, ImportItem,
+    InitialSource, InitialSourceKind, InitialSourceVisibility, KnowledgePurpose, ProjectCreate,
+    ProjectSettings, ProjectStartCommand, RICH_CHECK_POLICY_VERSION,
+    RICH_GENERATION_POLICY_VERSION, RICH_REPAIR_POLICY_VERSION, RichContent, RichNode, SourceKind,
+    StructuredDocument, TenantScope, UploadSessionCommand, hash_idempotency_key, settings_hash,
+    start_request_hash,
 };
 use geo_persistence::{Database, DatabaseConfig};
 use geo_worker::{
-    ContentDocumentReadRequest, ContentMediaBindRequest, ContentMediaInsertRequest,
-    ContentMediaListRequest, HostOpErrorCode, HostOps,
+    ContentDocumentReadRequest, ContentDocumentReviseRequest, ContentMediaBindRequest,
+    ContentMediaInsertRequest, ContentMediaListRequest, HostOpErrorCode, HostOps,
 };
 use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
 use sha2::{Digest, Sha256};
@@ -319,6 +320,541 @@ async fn drafted_content(
         manifest,
         descriptor,
     )
+}
+
+#[tokio::test]
+async fn host_revise_saves_rich_table_preserves_other_blocks_and_replays_exact_child() {
+    let state = AppState::development();
+    let scope = project(&state).await;
+    let (execution_id, item_id, original, _, _) = drafted_content(&state, &scope).await;
+    let content = state.content_service().repository();
+    let mut document = original.document.clone();
+    document.blocks[0].citation_ids = vec![original.evidence[0].chunk_id.unwrap()];
+    document.blocks.push(ContentBlock {
+        block_id: Uuid::new_v4(),
+        kind: ContentBlockKind::Paragraph,
+        text: "Option | Detail\nA | Original text".into(),
+        citation_ids: document.blocks[0].citation_ids.clone(),
+        items: Vec::new(),
+        rich: None,
+    });
+    let base = state
+        .content_service()
+        .edit(&scope, original.asset_id, original.revision_id, document)
+        .await
+        .unwrap();
+    let check = content
+        .claim(
+            &scope,
+            execution_id,
+            item_id,
+            ContentStep::Check,
+            RICH_CHECK_POLICY_VERSION,
+            Utc::now(),
+            60,
+        )
+        .await
+        .unwrap();
+    content
+        .complete_check(&scope, &check, Vec::new())
+        .await
+        .unwrap();
+    let base_checks = content.list_checks(&scope, base.revision_id).await.unwrap();
+    assert_eq!(base_checks.len(), 1);
+    let host = RepositoryHostOps::new(state.knowledge_repository()).with_content(state.clone());
+    let read = host
+        .content_document_read(
+            &scope,
+            ContentDocumentReadRequest {
+                execution_id,
+                item_id,
+                revision_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.revision_id, base.revision_id);
+    let mut document = read.document;
+    let target = &mut document.blocks[1];
+    target.kind = ContentBlockKind::Rich;
+    target.text.clear();
+    target.rich = Some(RichContent {
+        version: 1,
+        node: RichNode::Table {
+            content: vec![
+                RichNode::TableRow {
+                    content: vec![table_cell("Option", true), table_cell("Detail", true)],
+                },
+                RichNode::TableRow {
+                    content: vec![table_cell("A", false), table_cell("Original text", false)],
+                },
+            ],
+        },
+    });
+    let request = ContentDocumentReviseRequest {
+        execution_id,
+        item_id,
+        base_revision_id: read.revision_id,
+        document: document.clone(),
+    };
+    let (saved, duplicate) = tokio::join!(
+        host.content_document_revise(&scope, request.clone()),
+        host.content_document_revise(&scope, request.clone()),
+    );
+    let saved = saved.unwrap();
+    assert_eq!(duplicate.unwrap(), saved);
+    assert_eq!(saved.asset_id, original.asset_id);
+    assert_eq!(saved.base_revision_id, base.revision_id);
+    assert_eq!(saved.revision, 3);
+    let current = host
+        .content_document_read(
+            &scope,
+            ContentDocumentReadRequest {
+                execution_id,
+                item_id,
+                revision_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(current.revision_id, saved.revision_id);
+    assert_eq!(current.document, document);
+    assert_eq!(current.document.blocks[0], base.document.blocks[0]);
+    assert_eq!(
+        current.document.blocks[1].block_id,
+        base.document.blocks[1].block_id
+    );
+    assert_eq!(
+        current.document.blocks[1].citation_ids,
+        base.document.blocks[1].citation_ids
+    );
+    let persisted = content
+        .get_revision(&scope, saved.asset_id, saved.revision_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(persisted.markdown.contains("<table><tbody><tr><th>"));
+    assert!(persisted.markdown.contains("<td><p>Original text</p></td>"));
+    assert_eq!(persisted.evidence, base.evidence);
+    assert_eq!(persisted.quotes, base.quotes);
+    assert!(
+        content
+            .list_checks(&scope, saved.revision_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        content.list_checks(&scope, base.revision_id).await.unwrap(),
+        base_checks
+    );
+    let item = content
+        .get_item(&scope, execution_id, item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.status, ContentItemStatus::Drafted);
+    assert_eq!(item.ready_revision_id, None);
+    let later = state
+        .content_service()
+        .edit(
+            &scope,
+            saved.asset_id,
+            saved.revision_id,
+            StructuredDocument {
+                title: "Later saved draft".into(),
+                ..document
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        host.content_document_revise(&scope, request.clone())
+            .await
+            .unwrap(),
+        saved
+    );
+    let mut stale = request;
+    stale.document.title.push_str(" differs");
+    assert_eq!(
+        host.content_document_revise(&scope, stale)
+            .await
+            .unwrap_err()
+            .code,
+        HostOpErrorCode::Conflict
+    );
+    let historical = host
+        .content_document_read(
+            &scope,
+            ContentDocumentReadRequest {
+                execution_id,
+                item_id,
+                revision_id: Some(original.revision_id),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical.document, original.document);
+    assert_eq!(
+        content
+            .get_revision(&scope, original.asset_id, original.revision_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        original
+    );
+    assert_eq!(
+        content
+            .get_asset(&scope, saved.asset_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .current_revision_id,
+        later.revision_id
+    );
+    assert_eq!(
+        content
+            .list_revisions(&scope, saved.asset_id)
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+}
+
+fn table_cell(text: &str, header: bool) -> RichNode {
+    let content = vec![RichNode::Paragraph {
+        content: vec![RichNode::Text {
+            text: text.into(),
+            marks: Vec::new(),
+        }],
+    }];
+    if header {
+        RichNode::TableHeader {
+            attrs: None,
+            content,
+        }
+    } else {
+        RichNode::TableCell {
+            attrs: None,
+            content,
+        }
+    }
+}
+
+#[tokio::test]
+async fn host_revise_rejects_foreign_scope_item_revision_and_unsupported_citations() {
+    let state = AppState::development();
+    let scope = project(&state).await;
+    let (execution_id, item_id, base, _, _) = drafted_content(&state, &scope).await;
+    let host = RepositoryHostOps::new(state.knowledge_repository()).with_content(state.clone());
+    let request = ContentDocumentReviseRequest {
+        execution_id,
+        item_id,
+        base_revision_id: base.revision_id,
+        document: StructuredDocument {
+            title: "Revised title".into(),
+            ..base.document.clone()
+        },
+    };
+    let other_scope = project(&state).await;
+    let other_tenant = TenantScope::new(scope.operator_id, Uuid::new_v4().into(), scope.project_id);
+    let other_operator = TenantScope::new(Uuid::new_v4().into(), scope.tenant_id, scope.project_id);
+    for denied in [&other_scope, &other_tenant, &other_operator] {
+        assert_eq!(
+            host.content_document_revise(denied, request.clone())
+                .await
+                .unwrap_err()
+                .code,
+            HostOpErrorCode::NotFound
+        );
+    }
+    assert_eq!(
+        host.content_document_revise(
+            &TenantScope::new(scope.operator_id, scope.tenant_id, None),
+            request.clone(),
+        )
+        .await
+        .unwrap_err()
+        .code,
+        HostOpErrorCode::Denied
+    );
+    for invalid in [
+        ContentDocumentReviseRequest {
+            item_id: Uuid::new_v4(),
+            ..request.clone()
+        },
+        ContentDocumentReviseRequest {
+            execution_id: Uuid::new_v4(),
+            ..request.clone()
+        },
+        ContentDocumentReviseRequest {
+            base_revision_id: Uuid::new_v4(),
+            ..request.clone()
+        },
+    ] {
+        assert_eq!(
+            host.content_document_revise(&scope, invalid)
+                .await
+                .unwrap_err()
+                .code,
+            HostOpErrorCode::NotFound
+        );
+    }
+    let mut unsupported = request.clone();
+    unsupported.document.blocks[0].citation_ids = vec![Uuid::new_v4()];
+    assert_eq!(
+        host.content_document_revise(&scope, unsupported)
+            .await
+            .unwrap_err()
+            .code,
+        HostOpErrorCode::InvalidRequest
+    );
+    let mut malformed = request;
+    malformed.document.blocks[0].kind = ContentBlockKind::Rich;
+    malformed.document.blocks[0].text.clear();
+    malformed.document.blocks[0].rich = Some(RichContent {
+        version: 1,
+        node: RichNode::Table {
+            content: vec![table_cell("Missing row", false)],
+        },
+    });
+    assert_eq!(
+        host.content_document_revise(&scope, malformed)
+            .await
+            .unwrap_err()
+            .code,
+        HostOpErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        state
+            .content_service()
+            .repository()
+            .list_revisions(&scope, base.asset_id)
+            .await
+            .unwrap(),
+        vec![base]
+    );
+}
+
+#[tokio::test]
+async fn host_revise_conflicting_concurrent_documents_create_one_revision() {
+    let state = AppState::development();
+    let scope = project(&state).await;
+    let (execution_id, item_id, base, _, _) = drafted_content(&state, &scope).await;
+    let host = RepositoryHostOps::new(state.knowledge_repository()).with_content(state.clone());
+    let first = ContentDocumentReviseRequest {
+        execution_id,
+        item_id,
+        base_revision_id: base.revision_id,
+        document: StructuredDocument {
+            title: "First revision".into(),
+            ..base.document.clone()
+        },
+    };
+    let second = ContentDocumentReviseRequest {
+        document: StructuredDocument {
+            title: "Second revision".into(),
+            ..base.document.clone()
+        },
+        ..first.clone()
+    };
+    let (first, second) = tokio::join!(
+        host.content_document_revise(&scope, first),
+        host.content_document_revise(&scope, second),
+    );
+    let (saved, rejected) = match (first, second) {
+        (Ok(saved), Err(error)) | (Err(error), Ok(saved)) => (saved, error),
+        unexpected => panic!("one document must win the base revision: {unexpected:?}"),
+    };
+    assert_eq!(saved.revision, 2);
+    assert_eq!(rejected.code, HostOpErrorCode::Conflict);
+    assert_eq!(
+        state
+            .content_service()
+            .repository()
+            .list_revisions(&scope, base.asset_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn host_revise_reused_destination_forks_replays_and_preserves_origin() {
+    let state = AppState::development();
+    let scope = project(&state).await;
+    let (_, _, origin, manifest, descriptor) = drafted_content(&state, &scope).await;
+    let content = state.content_service().repository();
+    let settings = state
+        .project_repository()
+        .get(&scope, scope.project_id.unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .settings;
+    let mut document_scope = settings.document_scope.clone();
+    document_scope.markets = settings.effective_markets();
+    document_scope.languages = settings.effective_languages();
+    let manifest = state
+        .knowledge_repository()
+        .plan_document_manifest(
+            &scope,
+            DocumentManifestPlanRequest {
+                manifest_id: Uuid::new_v4(),
+                knowledge_release_id: manifest.knowledge_release_id,
+            },
+            document_scope,
+        )
+        .await
+        .unwrap();
+    let item_id = manifest.items[0].document_manifest_item_id;
+    let destination = content
+        .start(
+            &scope,
+            Uuid::new_v4(),
+            manifest,
+            RICH_GENERATION_POLICY_VERSION,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        content
+            .prepare_or_reuse(
+                &scope,
+                ContentReuseRequest {
+                    execution_id: destination.execution_id,
+                    item_id,
+                    descriptor,
+                    owner: RICH_GENERATION_POLICY_VERSION.into(),
+                    now: Utc::now(),
+                    ttl_seconds: 60,
+                }
+            )
+            .await
+            .unwrap(),
+        ContentReuseDecision::Ready(_)
+    ));
+    let host = RepositoryHostOps::new(state.knowledge_repository()).with_content(state.clone());
+    let read = host
+        .content_document_read(
+            &scope,
+            ContentDocumentReadRequest {
+                execution_id: destination.execution_id,
+                item_id,
+                revision_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(read.is_reused);
+    let request = ContentDocumentReviseRequest {
+        execution_id: destination.execution_id,
+        item_id,
+        base_revision_id: read.revision_id,
+        document: StructuredDocument {
+            title: "Destination draft".into(),
+            ..read.document
+        },
+    };
+    let (fork, duplicate) = tokio::join!(
+        host.content_document_revise(&scope, request.clone()),
+        host.content_document_revise(&scope, request.clone()),
+    );
+    let fork = fork.unwrap();
+    assert_eq!(duplicate.unwrap(), fork);
+    assert_ne!(fork.asset_id, origin.asset_id);
+    assert_eq!(fork.revision, 1);
+    let forked = host
+        .content_document_read(
+            &scope,
+            ContentDocumentReadRequest {
+                execution_id: destination.execution_id,
+                item_id,
+                revision_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!forked.is_reused);
+    assert_eq!(forked.document, request.document);
+    let revision = content
+        .get_revision(&scope, fork.asset_id, fork.revision_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(revision.derived_from_revision_id, Some(origin.revision_id));
+    assert_eq!(revision.evidence, origin.evidence);
+    assert_eq!(revision.quotes, origin.quotes);
+    let item = content
+        .get_item(&scope, destination.execution_id, item_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(item.status, ContentItemStatus::Drafted);
+    assert_eq!(item.ready_revision_id, None);
+    let later = state
+        .content_service()
+        .edit(
+            &scope,
+            fork.asset_id,
+            fork.revision_id,
+            StructuredDocument {
+                title: "Later destination draft".into(),
+                ..forked.document
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        host.content_document_revise(&scope, request.clone())
+            .await
+            .unwrap(),
+        fork
+    );
+    let mut different = request;
+    different.document.title.push('!');
+    assert_eq!(
+        host.content_document_revise(&scope, different)
+            .await
+            .unwrap_err()
+            .code,
+        HostOpErrorCode::Conflict
+    );
+    assert_eq!(
+        content
+            .list_revisions(&scope, origin.asset_id)
+            .await
+            .unwrap(),
+        vec![origin.clone()]
+    );
+    assert_eq!(
+        content
+            .get_asset(&scope, origin.asset_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .current_revision_id,
+        origin.revision_id
+    );
+    assert_eq!(
+        content
+            .get_asset(&scope, fork.asset_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .current_revision_id,
+        later.revision_id
+    );
+    assert_eq!(
+        content
+            .list_revisions(&scope, fork.asset_id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[tokio::test]

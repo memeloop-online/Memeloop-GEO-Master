@@ -1790,6 +1790,31 @@ impl HostOps for RepositoryHostOps {
         Ok(result)
     }
 
+    async fn content_document_revise(
+        &self,
+        scope: &TenantScope,
+        request: geo_worker::ContentDocumentReviseRequest,
+    ) -> Result<geo_worker::ContentDocumentReviseReceipt, HostOpError> {
+        let op = HostOp::ContentDocumentRevise;
+        request
+            .validate()
+            .map_err(|reason| HostOpError::invalid_request(op, reason))?;
+        let result =
+            crate::content_media_tools::revise(self.content_state(op)?, scope, request.clone())
+                .await
+                .map_err(|error| {
+                    if error.code == ErrorCode::Conflict {
+                        HostOpError::conflict(op, error.message)
+                    } else {
+                        worker_error(op, error)
+                    }
+                })?;
+        result
+            .validate_for(&request)
+            .map_err(|reason| HostOpError::internal(op, reason))?;
+        Ok(result)
+    }
+
     async fn content_media_insert(
         &self,
         scope: &TenantScope,

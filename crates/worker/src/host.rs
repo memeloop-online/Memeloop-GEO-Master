@@ -595,6 +595,11 @@ fn validate_recorded_return(
             let response: ContentDocumentSnapshot = typed(op, result)?;
             response.validate_for(&requested).map_err(invalid)?;
         }
+        HostOp::ContentDocumentRevise => {
+            let requested: ContentDocumentReviseRequest = typed(op, request)?;
+            let response: ContentDocumentReviseReceipt = typed(op, result)?;
+            response.validate_for(&requested).map_err(invalid)?;
+        }
         HostOp::ContentMediaInsert => {
             let requested: ContentMediaInsertRequest = typed(op, request)?;
             let response: ContentMediaInsertReceipt = typed(op, result)?;
@@ -661,7 +666,7 @@ fn validate_import_status(
 ///
 /// A run records the version it was accepted against, so an operator can tell
 /// which script/worker pair produced a result.
-pub const HOST_OPS_VERSION: &str = "geo.hostops.v25";
+pub const HOST_OPS_VERSION: &str = "geo.hostops.v26";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -829,6 +834,65 @@ impl ContentDocumentSnapshot {
             {
                 return Err("content document contains an invalid block".into());
             }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentDocumentReviseRequest {
+    pub execution_id: Uuid,
+    pub item_id: Uuid,
+    pub base_revision_id: Uuid,
+    pub document: geo_domain::StructuredDocument,
+}
+
+impl ContentDocumentReviseRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.execution_id.is_nil()
+            || self.item_id.is_nil()
+            || self.base_revision_id.is_nil()
+            || self
+                .document
+                .blocks
+                .iter()
+                .any(|block| block.block_id.is_nil() || block.citation_ids.iter().any(Uuid::is_nil))
+        {
+            return Err("invalid content document revision references".into());
+        }
+        // Only structural validation belongs here. The scoped capability checks
+        // citations against the loaded base revision's actual evidence.
+        let mut shape = self.document.clone();
+        for block in &mut shape.blocks {
+            block.citation_ids.clear();
+        }
+        shape.validate(&[]).map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentDocumentReviseReceipt {
+    pub execution_id: Uuid,
+    pub item_id: Uuid,
+    pub asset_id: Uuid,
+    pub base_revision_id: Uuid,
+    pub revision_id: Uuid,
+    pub revision: i32,
+}
+
+impl ContentDocumentReviseReceipt {
+    pub fn validate_for(&self, request: &ContentDocumentReviseRequest) -> Result<(), String> {
+        if self.execution_id != request.execution_id
+            || self.item_id != request.item_id
+            || self.base_revision_id != request.base_revision_id
+            || self.asset_id.is_nil()
+            || self.revision_id.is_nil()
+            || self.revision_id == self.base_revision_id
+            || self.revision < 1
+        {
+            return Err("revision receipt is missing exact persisted revision references".into());
         }
         Ok(())
     }
@@ -1131,11 +1195,13 @@ pub enum HostOp {
     KnowledgeImportUrl,
     /// Freeze and dispatch a manually requested, project-scoped content run.
     ContentCreate,
+    /// Append a draft revision to an exact scoped content item.
+    ContentDocumentRevise,
 }
 
 impl HostOp {
     /// The number of declared capabilities.
-    pub const COUNT: usize = 53;
+    pub const COUNT: usize = 54;
 
     /// Every declared capability, in budget-array order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -1192,6 +1258,7 @@ impl HostOp {
         Self::SerpReparse,
         Self::KnowledgeImportUrl,
         Self::ContentCreate,
+        Self::ContentDocumentRevise,
     ];
 
     /// The JS-visible name.  The trailing version is part of the contract.
@@ -1250,6 +1317,7 @@ impl HostOp {
             Self::SerpReparse => "serp.reparse.v1",
             Self::KnowledgeImportUrl => "knowledge.import_url.v1",
             Self::ContentCreate => "content.create.v1",
+            Self::ContentDocumentRevise => "content.document.revise.v1",
         }
     }
 
@@ -1309,6 +1377,7 @@ impl HostOp {
             Self::SerpReparse => "op_host_serp_reparse_v1",
             Self::KnowledgeImportUrl => "op_host_knowledge_import_url_v1",
             Self::ContentCreate => "op_host_content_create_v1",
+            Self::ContentDocumentRevise => "op_host_content_document_revise_v1",
         }
     }
 
@@ -1428,6 +1497,7 @@ impl Default for HostOpBudgets {
                 HostOpLimits::new(30_000, 8),   // local saved-response parsing
                 HostOpLimits::new(120_000, 16), // scoped single-page knowledge import
                 HostOpLimits::new(30_000, 4),   // on-demand content acceptance
+                HostOpLimits::new(60_000, 16),  // durable optimistic document revision
             ],
         }
     }
@@ -2149,6 +2219,17 @@ pub trait HostOps: Send + Sync {
         Err(HostOpError::capability_missing(
             HostOp::ContentDocumentRead,
             "content document reading is not configured",
+        ))
+    }
+
+    async fn content_document_revise(
+        &self,
+        _scope: &TenantScope,
+        _request: ContentDocumentReviseRequest,
+    ) -> Result<ContentDocumentReviseReceipt, HostOpError> {
+        Err(HostOpError::capability_missing(
+            HostOp::ContentDocumentRevise,
+            "content document revision is not configured",
         ))
     }
 
@@ -5280,6 +5361,7 @@ mod tests {
             (HostOp::SerpReparse, 30_000, 8),
             (HostOp::ContentStart, 30_000, 4),
             (HostOp::ContentCreate, 30_000, 4),
+            (HostOp::ContentDocumentRevise, 60_000, 16),
         ] {
             assert_eq!(
                 budgets.limits(op),
@@ -5313,6 +5395,7 @@ mod tests {
         assert_eq!(budgets.limits(HostOp::ContentStart).max_calls, 4);
         assert_eq!(HostOp::KnowledgeImportUrl.index(), 51);
         assert_eq!(HostOp::ContentCreate.index(), 52);
+        assert_eq!(HostOp::ContentDocumentRevise.index(), 53);
         assert_eq!(budgets.limits(HostOp::DistributionStart).max_calls, 4);
         assert_eq!(
             budgets.limits(HostOp::DistributionTargetsRead).max_calls,

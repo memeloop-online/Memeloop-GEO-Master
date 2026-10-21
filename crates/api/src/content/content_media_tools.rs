@@ -1,4 +1,4 @@
-//! AI media operations over the same scoped attachment, image and content services as HTTP.
+//! AI document and media operations over the same scoped services as HTTP.
 
 use geo_domain::{
     AppError, AttachmentReference, ContentBlock, ContentBlockKind, ContentItem,
@@ -6,9 +6,9 @@ use geo_domain::{
     RichContent, RichNode, TenantScope,
 };
 use geo_worker::{
-    ContentDocumentReadRequest, ContentDocumentSnapshot, ContentMediaBindRequest,
-    ContentMediaInsertReceipt, ContentMediaInsertRequest, ContentMediaListRequest,
-    ContentMediaPage, ContentMediaRef,
+    ContentDocumentReadRequest, ContentDocumentReviseReceipt, ContentDocumentReviseRequest,
+    ContentDocumentSnapshot, ContentMediaBindRequest, ContentMediaInsertReceipt,
+    ContentMediaInsertRequest, ContentMediaListRequest, ContentMediaPage, ContentMediaRef,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -291,7 +291,7 @@ async fn replay(
     state: &AppState,
     scope: &TenantScope,
     located: &LocatedItem,
-    request: &ContentMediaInsertRequest,
+    base_revision_id: Uuid,
     document: &geo_domain::StructuredDocument,
 ) -> Result<Option<ContentRevision>, AppError> {
     // After a fork the original asset is different. Search only the owned
@@ -304,10 +304,104 @@ async fn replay(
     let revision = state
         .content_service()
         .repository()
-        .find_exact_child_revision(scope, asset_id, request.base_revision_id, document)
+        .find_exact_child_revision(scope, asset_id, base_revision_id, document)
         .await?;
-    Ok(revision
-        .filter(|revision| is_exact_child(revision, asset_id, request.base_revision_id, document)))
+    Ok(revision.filter(|revision| is_exact_child(revision, asset_id, base_revision_id, document)))
+}
+
+pub(crate) async fn revise(
+    state: &AppState,
+    scope: &TenantScope,
+    request: ContentDocumentReviseRequest,
+) -> Result<ContentDocumentReviseReceipt, AppError> {
+    request
+        .validate()
+        .map_err(|reason| AppError::invalid_request(&reason))?;
+    let project_id = scope
+        .project_id
+        .ok_or_else(|| AppError::forbidden("project scope required"))?;
+    let scope = crate::content::scoped(state, scope, project_id).await?;
+    let mut located = locate(state, &scope, request.execution_id, request.item_id).await?;
+    let base_asset = if located.is_reused {
+        located.asset_id
+    } else {
+        located
+            .item
+            .reuse_history
+            .iter()
+            .find(|binding| binding.revision_id == request.base_revision_id)
+            .map_or(located.asset_id, |binding| binding.asset_id)
+    };
+    let base = state
+        .content_service()
+        .repository()
+        .get_revision(&scope, base_asset, request.base_revision_id)
+        .await?
+        .filter(|revision| {
+            revision.asset_id == base_asset && revision.revision_id == request.base_revision_id
+        })
+        .ok_or_else(|| AppError::not_found("content base revision not found"))?;
+    request.document.validate(&base.evidence)?;
+    let saved = if let Some(existing) = replay(
+        state,
+        &scope,
+        &located,
+        request.base_revision_id,
+        &request.document,
+    )
+    .await?
+    {
+        existing
+    } else {
+        if located.current_revision_id != request.base_revision_id {
+            return Err(AppError::conflict("base revision changed"));
+        }
+        let service = state.content_service();
+        let result = if located.is_reused {
+            service
+                .fork_reused_item(
+                    &scope,
+                    request.execution_id,
+                    request.item_id,
+                    request.base_revision_id,
+                    request.document.clone(),
+                )
+                .await
+        } else {
+            service
+                .edit(
+                    &scope,
+                    located.asset_id,
+                    request.base_revision_id,
+                    request.document.clone(),
+                )
+                .await
+        };
+        match result {
+            Ok(revision) => revision,
+            Err(error) if error.code == ErrorCode::Conflict => {
+                located = locate(state, &scope, request.execution_id, request.item_id).await?;
+                replay(
+                    state,
+                    &scope,
+                    &located,
+                    request.base_revision_id,
+                    &request.document,
+                )
+                .await?
+                .ok_or(error)?
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    Ok(ContentDocumentReviseReceipt {
+        execution_id: request.execution_id,
+        item_id: request.item_id,
+        asset_id: saved.asset_id,
+        base_revision_id: request.base_revision_id,
+        revision_id: saved.revision_id,
+        revision: saved.revision,
+    })
 }
 
 pub(crate) async fn insert(
@@ -351,7 +445,9 @@ pub(crate) async fn insert(
         .ok_or_else(|| AppError::not_found("image binding not found"))?;
     let block_id = stable_block_id(&scope, &request);
     let document = inserted_document(&base, &request, &binding, block_id)?;
-    if let Some(existing) = replay(state, &scope, &located, &request, &document).await? {
+    if let Some(existing) =
+        replay(state, &scope, &located, request.base_revision_id, &document).await?
+    {
         return Ok(receipt(&request, existing, block_id));
     }
     if binding.state != ContentMediaBindingState::Active {
@@ -385,7 +481,9 @@ pub(crate) async fn insert(
         Ok(revision) => Ok(receipt(&request, revision, block_id)),
         Err(error) if error.code == ErrorCode::Conflict => {
             located = locate(state, &scope, request.execution_id, request.item_id).await?;
-            if let Some(existing) = replay(state, &scope, &located, &request, &document).await? {
+            if let Some(existing) =
+                replay(state, &scope, &located, request.base_revision_id, &document).await?
+            {
                 return Ok(receipt(&request, existing, block_id));
             }
             Err(error)
