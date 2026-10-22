@@ -172,6 +172,30 @@ impl ReportRepository for PgReportRepository {
         values.into_iter().map(decode_measurement).collect()
     }
 
+    async fn list_measurement_periods_in_window(
+        &self,
+        scope: &TenantScope,
+        question_set: Option<geo_domain::MeasurementReportQuestionSet>,
+        window: &geo_domain::MeasurementPeriodWindow,
+    ) -> Result<Vec<MeasurementPeriodReport>, AppError> {
+        let project = scope
+            .project_id
+            .ok_or_else(|| AppError::forbidden("project scope required"))?;
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        crate::set_local_scope(&mut tx, scope)
+            .await
+            .map_err(database_error)?;
+        let values: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT snapshot FROM measurement_period_reports WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND report_window_start_at=$4 AND report_window_end_at=$5 AND report_timezone=$6 AND question_set_id IS NOT DISTINCT FROM $7 AND question_set_version_id IS NOT DISTINCT FROM $8 ORDER BY revision",
+        ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+            .bind(window.start_at).bind(window.end_at).bind(&window.report_timezone)
+            .bind(question_set.as_ref().map(|selected| selected.question_set_id))
+            .bind(question_set.as_ref().map(|selected| selected.question_set_version_id))
+            .fetch_all(&mut *tx).await.map_err(database_error)?;
+        tx.commit().await.map_err(database_error)?;
+        values.into_iter().map(decode_measurement).collect()
+    }
+
     async fn get_measurement_period(
         &self,
         scope: &TenantScope,

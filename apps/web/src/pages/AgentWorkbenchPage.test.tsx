@@ -18,7 +18,8 @@ import {
 import userEvent from "@testing-library/user-event";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
+import type { ReactNode } from "react";
 import { AppRoutes } from "../app";
 import { AuthProvider } from "../auth/AuthProvider";
 import type { AuthSession } from "../auth/types";
@@ -28,12 +29,13 @@ const originalScrollTo = Object.getOwnPropertyDescriptor(
   HTMLElement.prototype,
   "scrollTo",
 );
-beforeAll(() => {
+beforeAll(async () => {
   // jsdom has no layout scrolling; populated native transcripts invoke it.
   Object.defineProperty(HTMLElement.prototype, "scrollTo", {
     configurable: true,
     value: vi.fn(),
   });
+  await import("./AgentWorkbenchPage");
 });
 afterAll(() => {
   if (originalScrollTo) {
@@ -69,7 +71,7 @@ function response(body: unknown, status = 200) {
   });
 }
 
-function renderApp(path: string) {
+function renderApp(path: string, observer?: ReactNode) {
   return render(
     <FluentProvider theme={webLightTheme}>
       <QueryClientProvider
@@ -82,6 +84,7 @@ function renderApp(path: string) {
         <AuthProvider>
           <MemoryRouter initialEntries={[path]}>
             <AppRoutes />
+            {observer}
           </MemoryRouter>
         </AuthProvider>
       </QueryClientProvider>
@@ -97,6 +100,97 @@ afterEach(async () => {
 });
 
 describe("P00 AI workbench routing", () => {
+  it.each(["unsent", "invalid-reference", "saved-conversation"])(
+    "handles a report handoff in the native composer: %s",
+    async (destination) => {
+      const reportId = "11111111-2222-4333-8444-555555555555";
+      const conversation = {
+        id: "synthetic-conversation",
+        title: "Synthetic saved conversation",
+        status: "active",
+        revision: 1,
+        created_at: "2026-09-19T00:00:00Z",
+        updated_at: "2026-09-19T00:00:00Z",
+      };
+      const requests: Array<{ path: string; init?: RequestInit }> = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((request: RequestInfo | URL, init?: RequestInit) => {
+          const path = new URL(String(request), "http://localhost").pathname;
+          requests.push({ path, init });
+          if (path.endsWith("/auth/session"))
+            return Promise.resolve(response(session));
+          if (path.endsWith(`/agent/conversations/${conversation.id}`))
+            return Promise.resolve(
+              response({ conversation, messages: [], turns: [], runs: [] }),
+            );
+          if (init?.method === "POST")
+            return Promise.resolve(
+              response(
+                path.endsWith("/agent/conversations")
+                  ? conversation
+                  : {
+                      conversation_id: conversation.id,
+                      turn_id: "synthetic-turn",
+                      run_status: "succeeded",
+                    },
+                201,
+              ),
+            );
+          return Promise.resolve(response({ items: [], next_cursor: null }));
+        }),
+      );
+      function LocationProbe() {
+        const { pathname, search } = useLocation();
+        return <output data-testid="chat-location">{pathname + search}</output>;
+      }
+      const chatPath = "/app/tenant-a/project-a/chat";
+      renderApp(
+        `${chatPath}${destination === "saved-conversation" ? `/${conversation.id}` : ""}?measurementReport=${destination === "invalid-reference" ? "invalid" : reportId}`,
+        <LocationProbe />,
+      );
+      const input = await screen.findByLabelText("输入任务");
+      await waitFor(() => {
+        if (destination === "unsent") {
+          expect((input as HTMLTextAreaElement).value).toContain(reportId);
+        } else {
+          expect(input).toHaveValue("");
+        }
+      });
+      expect(
+        requests.filter(({ init }) => init?.method === "POST"),
+      ).toHaveLength(0);
+      expect(
+        requests.some(({ path }) => path.includes("measurement-reports")),
+      ).toBe(false);
+      if (destination !== "unsent") return;
+
+      const user = userEvent.setup();
+      await user.clear(input);
+      await user.type(input, `请只分析报告 ${reportId} 的推荐理由`);
+      await user.click(screen.getByRole("button", { name: "发送" }));
+      await waitFor(() =>
+        expect(screen.getByTestId("chat-location")).toHaveTextContent(
+          `${chatPath}/${conversation.id}`,
+        ),
+      );
+      expect(screen.getByTestId("chat-location")).not.toHaveTextContent("?");
+      const creates = requests.filter(
+        ({ path, init }) =>
+          path.endsWith("/agent/conversations") && init?.method === "POST",
+      );
+      const messages = requests.filter(
+        ({ path, init }) =>
+          path.endsWith("/messages") && init?.method === "POST",
+      );
+      expect(creates).toHaveLength(1);
+      expect(messages).toHaveLength(1);
+      expect(JSON.parse(String(messages[0].init?.body)).content).toBe(
+        `请只分析报告 ${reportId} 的推荐理由`,
+      );
+    },
+  );
+
   it.each([
     ["failed", "这次回复未完成。请刷新查看最新状态，或编辑后发送新消息。"],
     ["cancelled", "这次运行已取消。你可以编辑后发送新消息。"],

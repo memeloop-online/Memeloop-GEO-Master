@@ -3,6 +3,135 @@ use geo_domain::*;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+#[tokio::test]
+async fn memory_window_lookup_isolates_scope_question_set_and_all_window_fields() {
+    let (scope, window, _) = fixture();
+    let repository = MemoryReportRepository::new();
+    let selected = MeasurementReportQuestionSet {
+        question_set_id: Uuid::new_v4(),
+        question_set_version_id: Uuid::new_v4(),
+    };
+    let next_version = MeasurementReportQuestionSet {
+        question_set_version_id: Uuid::new_v4(),
+        ..selected.clone()
+    };
+    let other_set = MeasurementReportQuestionSet {
+        question_set_id: Uuid::new_v4(),
+        ..selected.clone()
+    };
+    let mut expected = None;
+    for question_set in [
+        None,
+        Some(selected.clone()),
+        Some(next_version.clone()),
+        Some(other_set),
+    ] {
+        for candidate in [
+            window.clone(),
+            MeasurementPeriodWindow {
+                start_at: window.start_at + Duration::seconds(1),
+                ..window.clone()
+            },
+            MeasurementPeriodWindow {
+                end_at: window.end_at - Duration::seconds(1),
+                ..window.clone()
+            },
+            MeasurementPeriodWindow {
+                report_timezone: "Etc/UTC".into(),
+                ..window.clone()
+            },
+        ] {
+            let report = freeze_measurement_period(
+                &scope,
+                preview_measurement_period(
+                    &scope,
+                    &candidate,
+                    question_set.clone(),
+                    vec![],
+                    window.end_at,
+                )
+                .unwrap(),
+                1,
+                None,
+            )
+            .unwrap();
+            let report = repository
+                .create_measurement_period(&scope, report)
+                .await
+                .unwrap();
+            assert_eq!(
+                repository
+                    .list_measurement_periods_in_window(&scope, question_set.clone(), &candidate)
+                    .await
+                    .unwrap(),
+                vec![report.clone()]
+            );
+            if question_set.as_ref() == Some(&selected) && candidate == window {
+                expected = Some(report);
+            }
+        }
+    }
+    let first = expected.unwrap();
+    let correction = freeze_measurement_period(
+        &scope,
+        preview_measurement_period(
+            &scope,
+            &window,
+            Some(selected.clone()),
+            vec![],
+            window.end_at,
+        )
+        .unwrap(),
+        2,
+        Some(first.report_id),
+    )
+    .unwrap();
+    let correction = repository
+        .create_measurement_period(&scope, correction.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .create_measurement_period(&scope, correction.clone())
+            .await
+            .unwrap(),
+        correction
+    );
+    assert_eq!(
+        repository
+            .list_measurement_periods_in_window(&scope, Some(selected.clone()), &window)
+            .await
+            .unwrap(),
+        vec![first, correction]
+    );
+    for other in [
+        TenantScope::new(Uuid::new_v4().into(), scope.tenant_id, scope.project_id),
+        TenantScope::new(scope.operator_id, Uuid::new_v4().into(), scope.project_id),
+        TenantScope::new(
+            scope.operator_id,
+            scope.tenant_id,
+            Some(Uuid::new_v4().into()),
+        ),
+    ] {
+        assert!(
+            repository
+                .list_measurement_periods_in_window(&other, Some(selected.clone()), &window)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let no_project = TenantScope::new(scope.operator_id, scope.tenant_id, None);
+    assert_eq!(
+        repository
+            .list_measurement_periods_in_window(&no_project, Some(selected), &window)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Forbidden
+    );
+}
+
 fn fixture() -> (
     TenantScope,
     MeasurementPeriodWindow,

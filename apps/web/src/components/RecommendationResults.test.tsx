@@ -40,7 +40,7 @@ describe("recommendation results", () => {
       />,
     );
     expect(screen.getByText("推荐第 2 位")).toBeVisible();
-    expect(screen.getAllByText("关注对象")).toHaveLength(1);
+    expect(screen.getAllByText("关注对象")).toHaveLength(2);
   });
 
   it("does not call missing analysis an absent recommendation", () => {

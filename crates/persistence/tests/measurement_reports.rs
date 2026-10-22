@@ -469,6 +469,92 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
             .unwrap(),
         scoped
     );
+    // Save preflight reads only its exact window, even when strict history
+    // cannot decode another window in the same question-set series.
+    for question_set in [None, Some(next_selected.clone())] {
+        let new_window = MeasurementPeriodWindow {
+            start_at: first.report_window_start_at - Duration::days(1),
+            ..first.window()
+        };
+        assert!(
+            reopened
+                .list_measurement_periods_in_window(&scope, question_set.clone(), &new_window)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let proposed = freeze_measurement_period(
+            &scope,
+            preview_measurement_period(&scope, &new_window, question_set.clone(), vec![], analyzed)
+                .unwrap(),
+            1,
+            None,
+        )
+        .unwrap();
+        let saved = reopened
+            .create_measurement_period(&scope, proposed.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .create_measurement_period(&scope, proposed)
+                .await
+                .unwrap(),
+            saved
+        );
+        assert_eq!(
+            reopened
+                .list_measurement_periods_in_window(&scope, question_set.clone(), &new_window)
+                .await
+                .unwrap(),
+            vec![saved]
+        );
+        let corrupt_window = MeasurementPeriodWindow {
+            report_timezone: "Etc/UTC".into(),
+            ..first.window()
+        };
+        assert_eq!(
+            reopened
+                .list_measurement_periods_in_window(&scope, question_set.clone(), &corrupt_window)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Internal
+        );
+        let corrupt_replay = freeze_measurement_period(
+            &scope,
+            preview_measurement_period(&scope, &corrupt_window, question_set, vec![], analyzed)
+                .unwrap(),
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .create_measurement_period(&scope, corrupt_replay)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Internal
+        );
+    }
+    let exact = reopened
+        .list_measurement_periods_in_window(&scope, Some(selected.clone()), &first.window())
+        .await
+        .unwrap();
+    assert_eq!(exact.len(), 2);
+    assert!(
+        exact
+            .iter()
+            .all(|row| row.question_set.as_ref() == Some(&selected))
+    );
+    assert!(
+        reopened
+            .list_measurement_periods_in_window(&other, Some(selected), &first.window())
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let mut invalid = next_report;
     invalid.report_id = Uuid::new_v4();
     invalid

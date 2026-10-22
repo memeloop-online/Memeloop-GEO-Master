@@ -221,6 +221,9 @@ jobs:
           if ! cargo test -p geo-api --test content_media_tools -- --ignored 2>&1 | tee "logs/cargo-media-tools-postgres.log"; then
             failed=1
           fi
+          if ! cargo test -p geo-api --test measurement_reports -- --ignored 2>&1 | tee "logs/cargo-measurement-report-api-postgres.log"; then
+            failed=1
+          fi
           exit "$failed"
 
       - name: Diagnose V8 heap pressure with isolated and concurrent probes

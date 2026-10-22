@@ -2,6 +2,7 @@ import i18n from "./index";
 
 const translations = {
   "zh-CN": {
+    analyzeReport: "用 AI 分析这份报告",
     questionFilter: "AI 测量问题",
     allQuestions: "全部问题",
     selectedQuestionScope: "当前问题",
@@ -106,6 +107,7 @@ const translations = {
     scopeError: "此报告不属于当前项目，请重新打开。",
   },
   en: {
+    analyzeReport: "Analyze this report with AI",
     questionFilter: "AI measurement question",
     allQuestions: "All questions",
     selectedQuestionScope: "Selected question",
