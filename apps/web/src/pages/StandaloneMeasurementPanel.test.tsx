@@ -217,6 +217,52 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 describe("standalone arbitrary-topic measurement", () => {
+  it("shows the question, platform, account and timestamp instead of a generic history label", async () => {
+    vi.mocked(listMeasurementPlans).mockResolvedValue({
+      items: [{ ...plan, title: "联网搜索测量", targets: [target] }],
+      next_after: null,
+    });
+    renderPanel(false, true);
+    const record = await screen.findByRole("button", {
+      name: /如何观察流星雨.*Kimi.*测量账号/,
+    });
+    expect(record).toBeVisible();
+    expect(record.querySelector("time")).toHaveAttribute(
+      "dateTime",
+      plan.created_at,
+    );
+    expect(screen.queryByText("联网搜索测量")).not.toBeInTheDocument();
+  });
+  it("does not prompt reconnecting unrelated expired accounts when a ready account is selected", async () => {
+    state.accounts.push({
+      account_id: "expired",
+      platform: "kimi",
+      status: "expired",
+      enabled: true,
+      display_name: "另一个账号",
+    });
+    renderPanel();
+    await screen.findByText("模型：网页当前模型");
+    expect(
+      screen.queryByRole("link", { name: "重新连接已有账号" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "添加测量账号" })).toBeVisible();
+  });
+  it("uses the user's question as the new record title within the API byte limit", async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    await screen.findByText("模型：网页当前模型");
+    const question = "推荐适合出差的轻薄笔记本电脑。".repeat(8);
+    await user.type(screen.getByLabelText("要测量的问题"), question);
+    await user.click(screen.getByRole("button", { name: "开始测量" }));
+    await waitFor(() => expect(createMeasurementPlan).toHaveBeenCalledTimes(1));
+    const input = vi.mocked(createMeasurementPlan).mock.calls[0][2];
+    expect(input.title).toBe(Array.from(question).slice(0, 50).join(""));
+    expect(new TextEncoder().encode(input.title).length).toBeLessThanOrEqual(
+      200,
+    );
+    expect(input.measurements[0].question).toBe(question);
+  });
   it("defers model discovery until the measurement form is active", async () => {
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false } },
@@ -365,7 +411,9 @@ describe("standalone arbitrary-topic measurement", () => {
         expect(listMeasurementPlans).toHaveBeenCalledOnce();
       }
       expect(
-        within(folder).queryByRole("button", { name: /自定义问题测量/ }),
+        within(folder).queryByRole("button", {
+          name: /自定义问题测量|如何观察流星雨/,
+        }),
       ).not.toBeInTheDocument();
       const versionFolder = within(folder)
         .getByText(
@@ -476,7 +524,7 @@ describe("standalone arbitrary-topic measurement", () => {
       );
       if (listed) {
         await userEvent.click(
-          screen.getByRole("button", { name: /自定义问题测量/ }),
+          screen.getByRole("button", { name: /自定义问题测量|如何观察流星雨/ }),
         );
         expect(screen.getByTestId("measurement-url")).not.toHaveTextContent(
           "rankReport=",
@@ -587,7 +635,7 @@ describe("standalone arbitrary-topic measurement", () => {
     expect(folder).toHaveAttribute("open");
     expect(within(folder).getByText("当前版本 v1")).toBeVisible();
     expect(
-      within(folder).getAllByRole("button", { name: /第[一二]次观测/ }),
+      within(folder).getAllByRole("button", { name: /如何观察流星雨/ }),
     ).toHaveLength(2);
     expect(
       within(folder).getByRole("button", { name: "排名变化" }),
@@ -597,10 +645,10 @@ describe("standalone arbitrary-topic measurement", () => {
       .getByText("临时测量 · 本页 1 条记录")
       .closest("details")!;
     expect(
-      within(temporary).getByRole("button", { name: /临时观测/ }),
+      within(temporary).getByRole("button", { name: /如何观察流星雨/ }),
     ).toBeVisible();
     await user.click(
-      within(folder).getByRole("button", { name: /第二次观测/ }),
+      within(folder).getAllByRole("button", { name: /如何观察流星雨/ })[1],
     );
     expect(screen.getByTestId("measurement-url")).toHaveTextContent(
       "record=bound-2",
@@ -697,7 +745,7 @@ describe("standalone arbitrary-topic measurement", () => {
         "false",
       );
       expect(
-        screen.queryByRole("button", { name: /自定义问题测量/ }),
+        screen.queryByRole("button", { name: /自定义问题测量|如何观察流星雨/ }),
       ).not.toBeInTheDocument();
     },
   );
@@ -714,14 +762,20 @@ describe("standalone arbitrary-topic measurement", () => {
     const history = screen.getByRole("button", { name: "测量历史" });
     expect(history).toHaveAttribute("aria-expanded", "true");
     await user.click(
-      await screen.findByRole("button", { name: /自定义问题测量/ }),
+      await screen.findByRole("button", {
+        name: /自定义问题测量|如何观察流星雨/,
+      }),
     );
     expect(await screen.findByText(target.input.question)).toBeVisible();
     expect(history).toHaveAttribute("aria-expanded", "false");
     await user.click(history);
     expect(history).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByText(target.input.question)).toBeVisible();
-    await user.click(screen.getByRole("button", { name: /自定义问题测量/ }));
+    expect(
+      screen.getByRole("heading", { name: target.input.question }),
+    ).toBeVisible();
+    await user.click(
+      screen.getByRole("button", { name: /自定义问题测量|如何观察流星雨/ }),
+    );
     expect(history).toHaveAttribute("aria-expanded", "false");
     expect(screen.getByText(target.input.question)).toBeVisible();
   });
@@ -754,7 +808,9 @@ describe("standalone arbitrary-topic measurement", () => {
     await user.click(screen.getByRole("link", { name: "Clear selection" }));
     expect(history).toHaveAttribute("aria-expanded", "true");
     expect(
-      await screen.findByRole("button", { name: /自定义问题测量/ }),
+      await screen.findByRole("button", {
+        name: /自定义问题测量|如何观察流星雨/,
+      }),
     ).toBeVisible();
   });
 
@@ -837,7 +893,9 @@ describe("standalone arbitrary-topic measurement", () => {
       const user = userEvent.setup();
       renderPanel(false, true);
       await user.click(
-        await screen.findByRole("button", { name: /自定义问题测量/ }),
+        await screen.findByRole("button", {
+          name: /自定义问题测量|如何观察流星雨/,
+        }),
       );
       expect(await screen.findByText(target.input.question)).toBeVisible();
       expect(
@@ -937,7 +995,9 @@ describe("standalone arbitrary-topic measurement", () => {
     const user = userEvent.setup();
     renderPanel(true, true);
     await user.click(
-      await screen.findByRole("button", { name: /自定义问题测量/ }),
+      await screen.findByRole("button", {
+        name: /自定义问题测量|如何观察流星雨/,
+      }),
     );
     expect(await screen.findByText("状态读取失败")).toBeInTheDocument();
     expect(screen.getByText("测量状态暂不可用")).toBeInTheDocument();
@@ -981,7 +1041,9 @@ describe("standalone arbitrary-topic measurement", () => {
     const user = userEvent.setup();
     renderPanel(true, true);
     await user.click(
-      await screen.findByRole("button", { name: /自定义问题测量/ }),
+      await screen.findByRole("button", {
+        name: /自定义问题测量|如何观察流星雨/,
+      }),
     );
     expect(await screen.findByText("测量结果未知")).toBeInTheDocument();
     expect(screen.getByText(/结果接收时间/)).toHaveTextContent(
@@ -1082,7 +1144,7 @@ describe("standalone arbitrary-topic measurement", () => {
     );
     expect(screen.getByRole("button", { name: "开始测量" })).toBeDisabled();
     expect(
-      screen.getByRole("option", { name: "Kimi 账号 · 需要重新连接" }),
+      screen.getByRole("option", { name: "Kimi · 需要重新连接" }),
     ).toBeDisabled();
     expect(
       screen.getByRole("link", { name: "重新连接已有账号" }),
@@ -1155,7 +1217,9 @@ describe("standalone arbitrary-topic measurement", () => {
     const user = userEvent.setup();
     renderPanel(false, true);
     await user.click(
-      await screen.findByRole("button", { name: /自定义问题测量/ }),
+      await screen.findByRole("button", {
+        name: /自定义问题测量|如何观察流星雨/,
+      }),
     );
     await waitFor(() =>
       expect(getMeasurementPlan).toHaveBeenCalledWith(
@@ -1176,7 +1240,9 @@ describe("standalone arbitrary-topic measurement", () => {
     );
     await user.click(screen.getByRole("button", { name: "上一页测量" }));
     expect(
-      await screen.findByRole("button", { name: /自定义问题测量/ }),
+      await screen.findByRole("button", {
+        name: /自定义问题测量|如何观察流星雨/,
+      }),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "开始测量" }),

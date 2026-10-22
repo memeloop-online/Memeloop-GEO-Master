@@ -582,122 +582,129 @@ function ReportListPage({
         tenantId={tenantId}
         projectId={projectId}
       />
-      {cycle.isPending ? (
-        <LoadingState label="正在读取当前周期" compact />
-      ) : cycle.isError ? (
-        <ErrorState
-          title={
-            cycle.error instanceof ApiError && cycle.error.status === 403
-              ? "权限不足"
-              : "无法读取当前周期"
-          }
-          detail={cycle.error.message}
-          onRetry={() => void cycle.refetch()}
-        />
-      ) : !cycle.data ? (
-        <EmptyState
-          title="暂无活动周期"
-          detail="项目尚无可供预览的当前周期；正式周报快照仍可在下方查看。"
-          action={
-            <Button
-              icon={<ArrowSyncRegular />}
-              onClick={() => void cycle.refetch()}
-            >
-              检查当前周期
-            </Button>
-          }
-        />
-      ) : preview.isPending ? (
-        <LoadingState label="正在生成临时报告预览" compact />
-      ) : preview.isError ? (
-        <ErrorState
-          title={
-            preview.error instanceof ApiError && preview.error.status === 403
-              ? "权限不足"
-              : "无法加载临时预览"
-          }
-          detail={preview.error.message}
-          onRetry={() => void preview.refetch()}
-        />
-      ) : preview.data.project_id !== projectId ||
-        preview.data.cycle_id !== cycle.data.cycle_id ||
-        preview.data.kind !== "preview" ? (
-        <ErrorState
-          title="预览不属于当前周期"
-          detail="请刷新当前周期后重试。"
-          onRetry={() => void cycle.refetch()}
-        />
-      ) : (
-        <SnapshotDetail
-          snapshot={preview.data}
-          evidence={preview.data.evidence}
-          evidenceError={null}
-          evidenceLoading={false}
-          onEvidenceRetry={() => {}}
-          refreshing={preview.isFetching}
-          onRefresh={() => void preview.refetch()}
-        />
-      )}
-      <section aria-label="已保存的正式周报">
-        <h2>已保存的正式周报</h2>
-        {query.isPending ? (
-          <LoadingState label="正在读取周报快照" compact />
-        ) : query.isError ? (
+      <details className="measurement-report-evidence">
+        <summary>{t("cycleReports")}</summary>
+        {cycle.isPending ? (
+          <LoadingState label="正在读取当前周期" compact />
+        ) : cycle.isError ? (
           <ErrorState
             title={
-              query.error instanceof ApiError && query.error.status === 403
+              cycle.error instanceof ApiError && cycle.error.status === 403
                 ? "权限不足"
-                : "无法加载报告"
+                : "无法读取当前周期"
             }
-            detail={query.error.message}
-            onRetry={() => void query.refetch()}
+            detail={cycle.error.message}
+            onRetry={() => void cycle.refetch()}
           />
-        ) : query.data.items.length === 0 ? (
+        ) : !cycle.data ? (
           <EmptyState
-            title="尚无周报快照"
-            detail="周期截止或数据收集完成后，将生成正式周报。你可以先查看上方预览。"
+            title="暂无活动周期"
+            detail="项目尚无可供预览的当前周期；正式周报快照仍可在下方查看。"
+            action={
+              <Button
+                icon={<ArrowSyncRegular />}
+                onClick={() => void cycle.refetch()}
+              >
+                检查当前周期
+              </Button>
+            }
+          />
+        ) : preview.isPending ? (
+          <LoadingState label="正在生成临时报告预览" compact />
+        ) : preview.isError ? (
+          <ErrorState
+            title={
+              preview.error instanceof ApiError && preview.error.status === 403
+                ? "权限不足"
+                : "无法加载临时预览"
+            }
+            detail={preview.error.message}
+            onRetry={() => void preview.refetch()}
+          />
+        ) : preview.data.project_id !== projectId ||
+          preview.data.cycle_id !== cycle.data.cycle_id ||
+          preview.data.kind !== "preview" ? (
+          <ErrorState
+            title="预览不属于当前周期"
+            detail="请刷新当前周期后重试。"
+            onRetry={() => void cycle.refetch()}
           />
         ) : (
-          <ul className="report-list">
-            {query.data.items.map((snapshot) => (
-              <li key={snapshot.report_id}>
-                <Card className="report-panel">
-                  <div className="report-list-heading">
-                    <h2>
-                      <Link to={encodeURIComponent(snapshot.report_id)}>
-                        {dateTime(
-                          snapshot.report_window_start_at,
-                          snapshot.report_timezone,
-                        )}{" "}
-                        —{" "}
-                        {dateTime(
-                          snapshot.report_window_end_at,
-                          snapshot.report_timezone,
-                        )}
-                      </Link>
-                    </h2>
-                    <Badge
-                      appearance="tint"
-                      color={
-                        snapshot.status === "partial" ? "warning" : "success"
-                      }
-                    >
-                      {snapshot.status === "partial" ? "部分覆盖" : "完整覆盖"}
-                    </Badge>
-                  </div>
-                  <p>
-                    周期 {snapshot.cycle_id} · 修订 {snapshot.revision} · 截止{" "}
-                    {dateTime(snapshot.cutoff_at, snapshot.report_timezone)}
-                  </p>
-                  {snapshot.correction_of && (
-                    <p>更正版本，原报告 {snapshot.correction_of} 仍可查看。</p>
-                  )}
-                </Card>
-              </li>
-            ))}
-          </ul>
+          <SnapshotDetail
+            snapshot={preview.data}
+            evidence={preview.data.evidence}
+            evidenceError={null}
+            evidenceLoading={false}
+            onEvidenceRetry={() => {}}
+            refreshing={preview.isFetching}
+            onRefresh={() => void preview.refetch()}
+          />
         )}
-      </section>
+        <section aria-label="已保存的正式周报">
+          <h2>已保存的正式周报</h2>
+          {query.isPending ? (
+            <LoadingState label="正在读取周报快照" compact />
+          ) : query.isError ? (
+            <ErrorState
+              title={
+                query.error instanceof ApiError && query.error.status === 403
+                  ? "权限不足"
+                  : "无法加载报告"
+              }
+              detail={query.error.message}
+              onRetry={() => void query.refetch()}
+            />
+          ) : query.data.items.length === 0 ? (
+            <EmptyState
+              title="尚无周报快照"
+              detail="周期截止或数据收集完成后，将生成正式周报。你可以先查看上方预览。"
+            />
+          ) : (
+            <ul className="report-list">
+              {query.data.items.map((snapshot) => (
+                <li key={snapshot.report_id}>
+                  <Card className="report-panel">
+                    <div className="report-list-heading">
+                      <h2>
+                        <Link to={encodeURIComponent(snapshot.report_id)}>
+                          {dateTime(
+                            snapshot.report_window_start_at,
+                            snapshot.report_timezone,
+                          )}{" "}
+                          —{" "}
+                          {dateTime(
+                            snapshot.report_window_end_at,
+                            snapshot.report_timezone,
+                          )}
+                        </Link>
+                      </h2>
+                      <Badge
+                        appearance="tint"
+                        color={
+                          snapshot.status === "partial" ? "warning" : "success"
+                        }
+                      >
+                        {snapshot.status === "partial"
+                          ? "部分覆盖"
+                          : "完整覆盖"}
+                      </Badge>
+                    </div>
+                    <p>
+                      周期 {snapshot.cycle_id} · 修订 {snapshot.revision} · 截止{" "}
+                      {dateTime(snapshot.cutoff_at, snapshot.report_timezone)}
+                    </p>
+                    {snapshot.correction_of && (
+                      <p>
+                        更正版本，原报告 {snapshot.correction_of} 仍可查看。
+                      </p>
+                    )}
+                  </Card>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      </details>
     </div>
   );
 }

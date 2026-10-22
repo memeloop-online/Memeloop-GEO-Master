@@ -1936,6 +1936,10 @@ async function main() {
       !Object.hasOwn(preview, "correction_of"),
     "P14 response is not a distinct non-persisted preview projection",
   );
+  await page
+    .locator("summary")
+    .filter({ hasText: /^运营周报$/ })
+    .click();
   const previewArea = page.getByRole("region", { name: "临时报告预览" });
   await previewArea
     .getByText("临时预览 · 未保存为正式周报", { exact: false })
@@ -1967,6 +1971,10 @@ async function main() {
     "Refreshed preview acquired a saved report identity",
   );
   await page.reload();
+  await page
+    .locator("summary")
+    .filter({ hasText: /^运营周报$/ })
+    .click();
   await page.getByRole("heading", { name: "尚无周报快照" }).waitFor();
   assert(
     writes.length === 0,

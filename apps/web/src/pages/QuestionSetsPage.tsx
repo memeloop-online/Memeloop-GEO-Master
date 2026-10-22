@@ -34,6 +34,7 @@ import { CitationInsightsPanel } from "./CitationInsightsPanel";
 import { StandaloneMeasurementPanel } from "./StandaloneMeasurementPanel";
 import { SerpMeasurementPanel } from "./SerpMeasurementPanel";
 import { TopicQuestionGenerator } from "./TopicQuestionGenerator";
+import { MeasurementFocusPanel } from "../components/MeasurementFocusPanel";
 import "./measurementMessages";
 import "./QuestionSetsPage.css";
 
@@ -373,10 +374,13 @@ export function QuestionSetsPage() {
           <h1>测量与洞察</h1>
           <p>{t("pageIntro")}</p>
         </div>
-        <Link to={`/app/${tenantId}/${projectId}/publications`}>
-          查看发布目标
-        </Link>
       </section>
+      <MeasurementFocusPanel
+        key={`${tenantId}/${projectId}/focus`}
+        tenantId={tenantId}
+        projectId={projectId}
+        canWrite={canWrite}
+      />
       <nav aria-label="测量页面" className="measurement-tabs">
         <TabList
           aria-label="测量页面"

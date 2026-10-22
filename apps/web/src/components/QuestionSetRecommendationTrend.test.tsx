@@ -208,7 +208,9 @@ describe("question set rank reports", () => {
       "project",
       questionSet,
     );
-    const links = within(screen.getByRole("table")).getAllByRole("link");
+    const links = within(
+      screen.getByRole("table", { name: "Which lamp suits camping?" }),
+    ).getAllByRole("link");
     const query = new URL(links[0].getAttribute("href")!, "http://localhost")
       .searchParams;
     expect(Object.fromEntries(query)).toEqual({

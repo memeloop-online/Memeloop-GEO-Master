@@ -37,8 +37,8 @@ import {
 import { ErrorState, LoadingState } from "../components/AsyncState";
 import { QuestionSetRecommendationTrend } from "../components/QuestionSetRecommendationTrend";
 import { PlannedTarget } from "./ChannelJobsPage";
-import { formatUiDate } from "../i18n";
 import "./measurementMessages";
+import "./standaloneMeasurement.css";
 
 const errorText = (error: unknown) =>
   error instanceof Error ? error.message : "请稍后重试。";
@@ -56,7 +56,7 @@ export function StandaloneMeasurementPanel({
   recordsOnly?: boolean;
   active?: boolean;
 }) {
-  const { t } = useTranslation("measurement");
+  const { t, i18n } = useTranslation("measurement");
   const [params, setParams] = useSearchParams();
   const requestedSetId = params.get("set") ?? params.get("questionSetId") ?? "";
   const requestedVersionId =
@@ -266,18 +266,66 @@ export function StandaloneMeasurementPanel({
       if (!groups.get(id)!.has(version.id)) groups.get(id)!.set(version.id, []);
     }
   }
+  const recordTitle = (plan: StandaloneMeasurementPlan) => {
+    const questions = [
+      ...new Set(
+        plan.targets.flatMap((target) =>
+          target.input.kind === "measure" ? [target.input.question] : [],
+        ),
+      ),
+    ];
+    if (!questions.length) return plan.title;
+    return questions.length === 1
+      ? questions[0]
+      : t("historyQuestionGroup", {
+          question: questions[0],
+          count: questions.length,
+        });
+  };
+  const recordAccounts = (plan: StandaloneMeasurementPlan) =>
+    [
+      ...new Set(
+        plan.targets.flatMap((target) => {
+          if (target.input.kind !== "measure") return [];
+          const input = target.input;
+          const provider =
+            channels.platforms.data?.items.find(
+              (platform) => platform.id === input.provider,
+            )?.label ?? input.provider;
+          const name = accounts.find(
+            (account) => account.account_id === input.account_id,
+          )?.display_name;
+          return [name ? `${provider} · ${name}` : provider];
+        }),
+      ),
+    ].join(" / ");
   const recordButton = (
     plan: StandaloneMeasurementPlan,
     setId: string,
     versionId?: string,
   ) => (
-    <li key={plan.plan_id}>
+    <li key={plan.plan_id} className="measurement-history-record">
       <Button
         appearance="subtle"
+        className="measurement-history-record-button"
         aria-current={selectedId === plan.plan_id ? "true" : undefined}
         onClick={() => selectRecord(plan.plan_id, setId, versionId)}
       >
-        {plan.title} · {formatUiDate(plan.created_at)}
+        <span className="measurement-history-record-content">
+          <span className="measurement-history-question">
+            {recordTitle(plan)}
+          </span>
+          <span className="measurement-history-meta">
+            {recordAccounts(plan)}
+            {recordAccounts(plan) && " · "}
+            <time dateTime={plan.created_at}>
+              {new Intl.DateTimeFormat(i18n.language, {
+                dateStyle: "medium",
+                timeStyle: "short",
+              }).format(new Date(plan.created_at))}
+            </time>
+          </span>
+        </span>
       </Button>
     </li>
   );
@@ -391,7 +439,13 @@ export function StandaloneMeasurementPanel({
         fingerprint,
         input: {
           idempotency_key: crypto.randomUUID(),
-          title: mode === "bound" ? "问题集测量" : "自定义问题测量",
+          title: Array.from(
+            mode === "bound"
+              ? (selectedSet?.name ?? t("unnamedQuestionSet"))
+              : question.trim(),
+          )
+            .slice(0, 50)
+            .join(""),
           measurements: values.measurements.map((item) => ({
             ...item,
             scheduled_at: new Date().toISOString(),
@@ -599,14 +653,10 @@ export function StandaloneMeasurementPanel({
                           !supportsMeasurement(account.platform)
                         }
                       >
-                        {account.display_name ??
-                          t("platformAccount", {
-                            platform:
-                              channels.platforms.data?.items.find(
-                                (platform) => platform.id === account.platform,
-                              )?.label ?? account.platform,
-                          })}{" "}
-                        ·{" "}
+                        {channels.platforms.data?.items.find(
+                          (platform) => platform.id === account.platform,
+                        )?.label ?? account.platform}
+                        {account.display_name && ` · ${account.display_name}`} ·{" "}
                         {!supportsMeasurement(account.platform)
                           ? t("measurementUnavailable")
                           : account.enabled && account.status === "ready"
@@ -641,15 +691,16 @@ export function StandaloneMeasurementPanel({
                   )}
                 </div>
               </Field>
-              {accounts.some(
-                (account) => !account.enabled || account.status !== "ready",
-              ) && (
-                <p>
-                  <Link to={`/app/${tenantId}/${projectId}/channels`}>
-                    重新连接已有账号
-                  </Link>
-                </p>
-              )}
+              {!accountReady &&
+                accounts.some(
+                  (account) => !account.enabled || account.status !== "ready",
+                ) && (
+                  <p>
+                    <Link to={`/app/${tenantId}/${projectId}/channels`}>
+                      重新连接已有账号
+                    </Link>
+                  </p>
+                )}
               {accountReady && options.isPending && (
                 <LoadingState label="正在识别网页模型" />
               )}
@@ -791,7 +842,10 @@ export function StandaloneMeasurementPanel({
                     onRetry={() => void sets.refetch()}
                   />
                 )}
-                <nav aria-label={t("measurementFolders")}>
+                <nav
+                  className="measurement-history-folders"
+                  aria-label={t("measurementFolders")}
+                >
                   {[...groups].map(([groupId, versions]) => {
                     const versionHistory =
                       folderVersions[folderIds.indexOf(groupId)];
@@ -803,6 +857,7 @@ export function StandaloneMeasurementPanel({
                     ).size;
                     return (
                       <details
+                        className="measurement-history-folder"
                         key={groupId}
                         open={
                           openFolders[groupId] ?? requestedSetId === groupId
@@ -851,7 +906,11 @@ export function StandaloneMeasurementPanel({
                             (item) => item.id === versionId,
                           );
                           return (
-                            <details key={versionId} open>
+                            <details
+                              className="measurement-history-version"
+                              key={versionId}
+                              open
+                            >
                               <summary>
                                 {set?.current_version_id === versionId
                                   ? t("currentSetVersion", {
@@ -869,7 +928,7 @@ export function StandaloneMeasurementPanel({
                                 questionSetId={groupId}
                                 questionSetVersionId={versionId}
                               />
-                              <ul>
+                              <ul className="measurement-history-records">
                                 {plans.map((plan) =>
                                   recordButton(plan, groupId, versionId),
                                 )}
@@ -880,13 +939,16 @@ export function StandaloneMeasurementPanel({
                       </details>
                     );
                   })}
-                  <details open={!requestedSetId}>
+                  <details
+                    className="measurement-history-folder"
+                    open={!requestedSetId}
+                  >
                     <summary>
                       {t("temporaryMeasurements")} ·{" "}
                       {t("folderRecordCount", { count: temporaryPlans.length })}
                     </summary>
                     {temporaryPlans.length ? (
-                      <ul>
+                      <ul className="measurement-history-records">
                         {temporaryPlans.map((plan) => recordButton(plan, ""))}
                       </ul>
                     ) : (
@@ -929,7 +991,7 @@ export function StandaloneMeasurementPanel({
           )}
           {detail.data && (
             <div className="channel-jobs-list">
-              <p>{detail.data.title}</p>
+              {!detail.data.targets.length && <p>{detail.data.title}</p>}
               <details>
                 <summary>{t("resultPlanDetails")}</summary>
                 <p>{t("resultPlanId", { value: detail.data.plan_id })}</p>

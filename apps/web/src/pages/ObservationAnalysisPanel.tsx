@@ -16,6 +16,8 @@ import {
 import { useAuth } from "../auth/AuthProvider";
 import { ObservationAnswer } from "../components/ObservationAnswer";
 import { RecommendationResults } from "../components/RecommendationResults";
+import { useProjectQuery } from "../api/projects";
+import { measurementFocusNames } from "../api/measurementFocus";
 import { safeOriginalPublicUrl } from "./PublicationLookupPanel";
 import {
   analysisFailureMessageKey,
@@ -43,6 +45,7 @@ export function ObservationAnalysisPanel({
   canWrite: boolean;
 }) {
   const { session } = useAuth();
+  const project = useProjectQuery(tenantId, projectId);
   const { t, i18n } = useTranslation("observationAnalysis");
   const { t: trendT } = useTranslation("questionSetRecommendationTrend");
   const [params] = useSearchParams();
@@ -197,7 +200,10 @@ export function ObservationAnalysisPanel({
         {!grounded && metadata}
         {grounded && (
           <>
-            <RecommendationResults value={grounded.audit.recommendations} />
+            <RecommendationResults
+              value={grounded.audit.recommendations}
+              focusNames={measurementFocusNames(project.data?.settings)}
+            />
             <h5>{t("answer")}</h5>
             <ObservationAnswer text={grounded.raw_answer} />
             <h5>{t("citations")}</h5>

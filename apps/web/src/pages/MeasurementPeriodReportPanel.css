@@ -1,0 +1,75 @@
+.measurement-report-select {
+  max-width: 100%;
+  padding: 8px;
+  border: 1px solid var(--colorNeutralStroke1);
+  border-radius: 4px;
+  background: var(--colorNeutralBackground1);
+  color: var(--colorNeutralForeground1);
+  font: inherit;
+}
+
+.measurement-report-sample {
+  margin-block: 16px;
+}
+
+.measurement-report-sample h4 {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.measurement-report-recommendations {
+  overflow-x: auto;
+}
+
+.measurement-report-recommendations caption {
+  text-align: left;
+  padding-block: 8px;
+  font-weight: 600;
+}
+
+.measurement-report-recommendations th:first-child {
+  min-width: 140px;
+}
+
+.measurement-report-recommendations td {
+  vertical-align: top;
+}
+
+.measurement-report-recommendations td:nth-child(2) {
+  min-width: 90px;
+}
+
+.measurement-report-recommendations a {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.measurement-report-recommendations blockquote {
+  margin-inline: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.measurement-report-evidence {
+  margin-block: 12px;
+}
+
+.measurement-report-evidence > summary {
+  cursor: pointer;
+  padding-block: 8px;
+  font-weight: 600;
+}
+
+.measurement-report-unavailable li {
+  margin-block: 16px;
+}
+
+.measurement-report-focus-row {
+  background: var(--colorBrandBackground2);
+}
+
+.measurement-report-focus {
+  padding-block: 8px;
+}
