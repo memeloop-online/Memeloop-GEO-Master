@@ -10,7 +10,7 @@ const translations = {
     entity: "推荐对象",
     tracked: "关注对象",
     focusChanges: "关注对象最近变化",
-    focusDescription: "对比最近两次同条件测量的 AI 提取结果。",
+    focusDescription: "比较同一问题与条件下，最近两次的推荐表现。",
     previousSample: "上一次：",
     latestSample: "最近一次：",
     improved: "排名上升 {{value}} 位",
@@ -51,7 +51,7 @@ const translations = {
     tracked: "Tracked item",
     focusChanges: "Latest tracked item changes",
     focusDescription:
-      "Compare AI-extracted results from the last two measurements with the same conditions.",
+      "Compare recommendations from the two most recent measurements under the same conditions.",
     previousSample: "Previous:",
     latestSample: "Latest:",
     improved: "Rank improved by {{value}}",
