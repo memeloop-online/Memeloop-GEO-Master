@@ -60,6 +60,7 @@ function setup(
   extraction: ObservationExtractionStatus | null = null,
   nextAfter: string | null = null,
   initialEntry = "/",
+  active = true,
 ) {
   const page: ObservationAnalysisPage = {
     items,
@@ -82,7 +83,7 @@ function setup(
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  render(
+  const panel = (isActive: boolean) => (
     <FluentProvider theme={webLightTheme}>
       <QueryClientProvider client={client}>
         <MemoryRouter initialEntries={[initialEntry]}>
@@ -93,12 +94,20 @@ function setup(
             targetId="target"
             attemptId="attempt"
             canWrite={canWrite}
+            active={isActive}
           />
         </MemoryRouter>
       </QueryClientProvider>
-    </FluentProvider>,
+    </FluentProvider>
   );
-  return { list, create, client, page };
+  const view = render(panel(active));
+  return {
+    list,
+    create,
+    client,
+    page,
+    setActive: (value: boolean) => view.rerender(panel(value)),
+  };
 }
 
 afterEach(async () => {
@@ -109,6 +118,86 @@ afterEach(async () => {
 });
 
 describe("saved response analysis", () => {
+  it("defers hidden analysis reads and linked history pagination until activation", async () => {
+    vi.useFakeTimers();
+    const { list, create, setActive, client, page } = setup(
+      [],
+      true,
+      false,
+      null,
+      "older",
+      "/?target=target&attempt=attempt&analysisRevision=linked",
+      false,
+    );
+    list.mockImplementation(async () => ({ ...page, next_after: null }));
+    await act(async () => {
+      client.setQueryData(
+        [
+          "observation-analyses",
+          "user",
+          "operator",
+          "tenant",
+          "project",
+          "target",
+          "attempt",
+        ],
+        { pages: [page], pageParams: [undefined] },
+      );
+    });
+    await act(() => vi.advanceTimersByTimeAsync(9000));
+    expect(list).not.toHaveBeenCalled();
+    setActive(true);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(list).toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    client.clear();
+  });
+
+  it("pauses pending analysis while hidden and reads persisted completion on return", async () => {
+    vi.useFakeTimers();
+    const { list, create, page, setActive, client } = setup([revision]);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(list).toHaveBeenCalledOnce();
+    await act(() => vi.advanceTimersByTimeAsync(3000));
+    expect(list).toHaveBeenCalledTimes(2);
+    setActive(false);
+    const reads = list.mock.calls.length;
+    list.mockResolvedValue({
+      ...page,
+      items: [
+        {
+          ...revision,
+          state: "completed",
+          result: {
+            actual_model: "saved-model",
+            candidate_json: null,
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            outcome: {
+              status: "grounded",
+              raw_answer: "Completed while this tab was hidden",
+              citations: [],
+              audit: {},
+            },
+          },
+        },
+      ],
+    });
+    await act(() => vi.advanceTimersByTimeAsync(9000));
+    expect(list).toHaveBeenCalledTimes(reads);
+    expect(screen.getByText("等待解析")).toBeInTheDocument();
+    setActive(true);
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(list).toHaveBeenCalledTimes(reads + 1);
+    expect(
+      screen.getByText("Completed while this tab was hidden"),
+    ).toBeInTheDocument();
+    await act(() => vi.advanceTimersByTimeAsync(6000));
+    expect(list).toHaveBeenCalledTimes(reads + 1);
+    expect(create).not.toHaveBeenCalled();
+    client.clear();
+  });
+
   it("opens the exact linked revision from an older page instead of the current result", async () => {
     const current: ObservationAnalysisRevision = {
       ...revision,

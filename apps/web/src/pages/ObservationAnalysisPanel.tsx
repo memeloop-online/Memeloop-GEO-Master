@@ -37,12 +37,14 @@ export function ObservationAnalysisPanel({
   targetId,
   attemptId,
   canWrite,
+  active = true,
 }: {
   tenantId: string;
   projectId: string;
   targetId: string;
   attemptId: string;
   canWrite: boolean;
+  active?: boolean;
 }) {
   const { session } = useAuth();
   const project = useProjectQuery(tenantId, projectId);
@@ -75,13 +77,14 @@ export function ObservationAnalysisPanel({
         signal,
       ),
     getNextPageParam: (last) => last.next_after ?? undefined,
-    enabled: Boolean(session),
+    enabled: active && Boolean(session),
     retry: false,
     refetchInterval: (query) =>
-      isExtractionActive(query.state.data?.pages[0]?.extraction) ||
-      query.state.data?.pages.some((page) =>
-        page.items.some((item) => item.state !== "completed"),
-      )
+      active &&
+      (isExtractionActive(query.state.data?.pages[0]?.extraction) ||
+        query.state.data?.pages.some((page) =>
+          page.items.some((item) => item.state !== "completed"),
+        ))
         ? 3000
         : false,
   });
@@ -133,6 +136,7 @@ export function ObservationAnalysisPanel({
   const { fetchNextPage, hasNextPage, isFetching, isError } = history;
   useEffect(() => {
     if (
+      active &&
       requestedRevisionId &&
       !primary &&
       hasNextPage &&
@@ -142,6 +146,7 @@ export function ObservationAnalysisPanel({
       void fetchNextPage();
     }
   }, [
+    active,
     requestedRevisionId,
     primary,
     hasNextPage,
@@ -151,7 +156,7 @@ export function ObservationAnalysisPanel({
   ]);
   const hasSource = Boolean(history.data?.pages[0]?.sources.length);
   const extraction = history.data?.pages[0]?.extraction;
-  const active = revisions.some((item) => item.state !== "completed");
+  const analysisActive = revisions.some((item) => item.state !== "completed");
   const date = (value: string) =>
     new Date(value).toLocaleString(i18n.resolvedLanguage);
   const renderRevision = (revision: (typeof revisions)[number]) => {
@@ -265,7 +270,7 @@ export function ObservationAnalysisPanel({
       )}
       {hasSource && canWrite && (
         <Button
-          disabled={submission.isPending || active || history.isError}
+          disabled={submission.isPending || analysisActive || history.isError}
           onClick={() => submission.mutate()}
         >
           {t(

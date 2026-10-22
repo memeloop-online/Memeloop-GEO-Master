@@ -143,13 +143,13 @@ export function StandaloneMeasurementPanel({
   const history = useQuery({
     queryKey: [...key, "list", after],
     queryFn: () => listMeasurementPlans(tenantId, projectId, after),
-    enabled: Boolean(session && recordsOnly),
+    enabled: Boolean(session && recordsOnly && active),
     retry: false,
   });
   const detail = useQuery({
     queryKey: [...key, "detail", selectedId],
     queryFn: () => getMeasurementPlan(tenantId, projectId, selectedId!),
-    enabled: Boolean(session && recordsOnly && selectedId),
+    enabled: Boolean(session && recordsOnly && active && selectedId),
     retry: false,
   });
   const accounts = (channels.accounts.data?.items ?? []).filter((account) =>
@@ -182,15 +182,31 @@ export function StandaloneMeasurementPanel({
     supportsMeasurement(selectedAccount.platform),
   );
   const options = useQuery({
-    queryKey: [...key, "options", selectedAccount?.account_id],
+    queryKey: [
+      ...key,
+      "options",
+      selectedAccount?.account_id,
+      selectedAccount?.updated_at,
+      selectedAccount?.status,
+      selectedAccount?.enabled,
+      selectedAccount?.platform,
+      selectedAccount?.platform_account_id,
+      selectedAccount?.proxy_configured,
+      selectedAccount?.proxy_server,
+    ],
     queryFn: () =>
       getMeasurementOptions(tenantId, projectId, selectedAccount!.account_id),
     enabled: Boolean(
       session && accountReady && canWrite && !recordsOnly && active,
     ),
+    // Discovery restores a real browser. Ordinary query refreshes and tab
+    // revisits should reuse it; verified reconnects update account metadata,
+    // while routine encrypted-session renewals deliberately leave it stable.
+    staleTime: 5 * 60 * 1000,
+    gcTime: 30 * 60 * 1000,
     retry: false,
   });
-  const models = options.data?.models ?? [];
+  const models = accountReady ? (options.data?.models ?? []) : [];
   const selectedModel =
     models.find((item) => item.id === model)?.id ??
     models.find((item) => item.id === options.data?.selected_model)?.id ??
@@ -254,6 +270,7 @@ export function StandaloneMeasurementPanel({
       enabled: Boolean(
         session &&
         recordsOnly &&
+        active &&
         historyOpen &&
         !(selectedRankReport && requestedSetId === id) &&
         (openFolders[id] ?? requestedSetId === id),
@@ -334,7 +351,7 @@ export function StandaloneMeasurementPanel({
     queryFn: () =>
       listAllQuestionSetVersions(tenantId, projectId, selectedSet!.id),
     enabled: Boolean(
-      session && !recordsOnly && mode === "bound" && selectedSet,
+      session && !recordsOnly && active && mode === "bound" && selectedSet,
     ),
     retry: false,
   });
@@ -351,6 +368,7 @@ export function StandaloneMeasurementPanel({
     enabled: Boolean(
       session &&
       !recordsOnly &&
+      active &&
       mode === "bound" &&
       selectedSet &&
       activeVersionId,
@@ -704,11 +722,11 @@ export function StandaloneMeasurementPanel({
               {accountReady && options.isPending && (
                 <LoadingState label="正在识别网页模型" />
               )}
-              {options.isError && (
+              {accountReady && options.isError && (
                 <ErrorState
                   title="暂时无法读取网页模型"
                   detail={errorText(options.error)}
-                  onRetry={() => void options.refetch()}
+                  onRetry={() => void options.refetch({ cancelRefetch: false })}
                 />
               )}
               {accountReady && options.data && !models.length && (
@@ -716,7 +734,10 @@ export function StandaloneMeasurementPanel({
                   未发现可用网页模型。
                   <Button
                     appearance="subtle"
-                    onClick={() => void options.refetch()}
+                    disabled={options.isFetching || !active}
+                    onClick={() =>
+                      void options.refetch({ cancelRefetch: false })
+                    }
                   >
                     重新识别模型
                   </Button>
@@ -744,6 +765,20 @@ export function StandaloneMeasurementPanel({
                       ))}
                     </Select>
                   </Field>
+                  <Button
+                    appearance="subtle"
+                    disabled={
+                      !accountReady ||
+                      !active ||
+                      options.isFetching ||
+                      submission.isPending
+                    }
+                    onClick={() =>
+                      void options.refetch({ cancelRefetch: false })
+                    }
+                  >
+                    {t("refreshMeasurementModels")}
+                  </Button>
                   {mode === "bound" && (
                     <Field label="问题集版本">
                       <Select
@@ -1022,6 +1057,7 @@ export function StandaloneMeasurementPanel({
                     tenantId={tenantId}
                     projectId={projectId}
                     canWrite={canWrite}
+                    active={active}
                     accountDisplayName={
                       channels.accounts.data?.items.find(
                         (account) =>

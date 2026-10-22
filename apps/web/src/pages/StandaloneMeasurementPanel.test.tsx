@@ -173,6 +173,29 @@ function renderPanel(
     </FluentProvider>,
   );
 }
+function renderDiscoveryPanel(client: QueryClient, active = true) {
+  const element = (visible: boolean) => (
+    <StandaloneMeasurementPanel
+      tenantId="tenant-1"
+      projectId="project-1"
+      canWrite
+      active={visible}
+    />
+  );
+  const view = render(element(active), {
+    wrapper: ({ children }) => (
+      <FluentProvider theme={webLightTheme}>
+        <QueryClientProvider client={client}>
+          <MemoryRouter>{children}</MemoryRouter>
+        </QueryClientProvider>
+      </FluentProvider>
+    ),
+  });
+  return {
+    ...view,
+    revisit: (visible = true) => view.rerender(element(visible)),
+  };
+}
 beforeEach(() => {
   vi.clearAllMocks();
   state.accountsError = false;
@@ -215,7 +238,10 @@ beforeEach(() => {
     next_cursor: null,
   });
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 describe("standalone arbitrary-topic measurement", () => {
   it("shows the question, platform, account and timestamp instead of a generic history label", async () => {
     vi.mocked(listMeasurementPlans).mockResolvedValue({
@@ -310,6 +336,124 @@ describe("standalone arbitrary-topic measurement", () => {
     );
     window.dispatchEvent(new Event("focus"));
     expect(state.refetch).toHaveBeenCalledOnce();
+  });
+
+  it("reuses discovery beyond the ordinary query lifetime across tab and page revisits", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 30_000 } },
+    });
+    const initialTime = Date.now();
+    const now = vi.spyOn(Date, "now").mockReturnValue(initialTime);
+    const panel = renderDiscoveryPanel(client);
+    await screen.findByText("模型：网页当前模型");
+    now.mockReturnValue(initialTime + 31_000);
+    panel.revisit(false);
+    panel.revisit();
+    expect(screen.getByText("模型：网页当前模型")).toBeVisible();
+    expect(getMeasurementOptions).toHaveBeenCalledOnce();
+    panel.unmount();
+    renderDiscoveryPanel(client);
+    await screen.findByText("模型：网页当前模型");
+    expect(getMeasurementOptions).toHaveBeenCalledOnce();
+  });
+
+  it("discovers again after five minutes and allows an explicit model refresh", async () => {
+    const user = userEvent.setup();
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const initialTime = Date.now();
+    const now = vi.spyOn(Date, "now").mockReturnValue(initialTime);
+    const panel = renderDiscoveryPanel(client);
+    await screen.findByText("模型：网页当前模型");
+    panel.revisit(false);
+    now.mockReturnValue(initialTime + 5 * 60_000 + 1);
+    panel.revisit();
+    await waitFor(() => expect(getMeasurementOptions).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByText("高级选项"));
+    await user.click(screen.getByRole("button", { name: "刷新可用模型" }));
+    await waitFor(() => expect(getMeasurementOptions).toHaveBeenCalledTimes(3));
+  });
+
+  it("keeps one pending browser discovery across hide, unmount and return", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    let complete!: (
+      value: Awaited<ReturnType<typeof getMeasurementOptions>>,
+    ) => void;
+    vi.mocked(getMeasurementOptions).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          complete = resolve;
+        }),
+    );
+    const panel = renderDiscoveryPanel(client);
+    await waitFor(() => expect(getMeasurementOptions).toHaveBeenCalledOnce());
+    panel.revisit(false);
+    panel.revisit();
+    panel.unmount();
+    renderDiscoveryPanel(client);
+    expect(getMeasurementOptions).toHaveBeenCalledOnce();
+    complete({
+      models: [{ id: "completed-model", label: "已识别模型" }],
+      selected_model: "completed-model",
+    });
+    expect(await screen.findByText("模型：已识别模型")).toBeVisible();
+    expect(getMeasurementOptions).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["account", { account_id: "account-2" }],
+    ["verified login", { updated_at: "2026-10-22T12:00:00Z" }],
+    ["identity", { platform_account_id: "synthetic-identity-2" }],
+    [
+      "network",
+      { proxy_configured: true, proxy_server: "http://proxy.invalid" },
+    ],
+  ])(
+    "hides the previous menu and discovers after an %s change",
+    async (_, change) => {
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      const panel = renderDiscoveryPanel(client);
+      await screen.findByText("模型：网页当前模型");
+      let complete!: (
+        value: Awaited<ReturnType<typeof getMeasurementOptions>>,
+      ) => void;
+      vi.mocked(getMeasurementOptions).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            complete = resolve;
+          }),
+      );
+      state.accounts = [{ ...(state.accounts[0] as object), ...change }];
+      panel.revisit();
+      expect(screen.queryByText("模型：网页当前模型")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "开始测量" })).toBeDisabled();
+      await waitFor(() =>
+        expect(getMeasurementOptions).toHaveBeenCalledTimes(2),
+      );
+      complete({
+        models: [{ id: "updated-model", label: "新可用模型" }],
+        selected_model: "updated-model",
+      });
+      expect(await screen.findByText("模型：新可用模型")).toBeVisible();
+    },
+  );
+
+  it("hides cached models when the selected account expires", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const panel = renderDiscoveryPanel(client);
+    await screen.findByText("模型：网页当前模型");
+    state.accounts = [{ ...(state.accounts[0] as object), status: "expired" }];
+    panel.revisit();
+    expect(screen.queryByText("模型：网页当前模型")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "开始测量" })).toBeDisabled();
+    expect(getMeasurementOptions).toHaveBeenCalledOnce();
   });
 
   it.each([undefined, "older-version", "discover"])(
