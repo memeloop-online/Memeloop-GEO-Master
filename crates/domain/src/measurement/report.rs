@@ -291,6 +291,12 @@ pub trait ReportRepository: Send + Sync {
             "measurement period reports unavailable",
         ))
     }
+    /// List catalog metadata without reading or validating report snapshot bodies.
+    async fn list_measurement_period_summaries(
+        &self,
+        scope: &TenantScope,
+        question_set: Option<crate::MeasurementReportQuestionSet>,
+    ) -> Result<Vec<crate::MeasurementPeriodReportSummary>, AppError>;
     /// Select one window and question-set version before decoding snapshots.
     async fn list_measurement_periods_in_window(
         &self,
@@ -319,6 +325,38 @@ impl MemoryReportRepository {
 
 #[async_trait]
 impl ReportRepository for MemoryReportRepository {
+    async fn list_measurement_period_summaries(
+        &self,
+        scope: &TenantScope,
+        question_set: Option<crate::MeasurementReportQuestionSet>,
+    ) -> Result<Vec<crate::MeasurementPeriodReportSummary>, AppError> {
+        let project = scope
+            .project_id
+            .ok_or_else(|| AppError::forbidden("project scope required"))?;
+        let mut rows = self
+            .measurement_periods
+            .read()
+            .await
+            .get(&(
+                scope.operator_id.as_uuid(),
+                scope.tenant_id.as_uuid(),
+                project.as_uuid(),
+            ))
+            .into_iter()
+            .flatten()
+            .filter(|row| row.question_set == question_set)
+            .map(crate::MeasurementPeriodReportSummary::from)
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| {
+            (
+                std::cmp::Reverse(row.report_window_end_at),
+                std::cmp::Reverse(row.revision),
+                row.report_id,
+            )
+        });
+        Ok(rows)
+    }
+
     async fn create_measurement_period(
         &self,
         scope: &TenantScope,

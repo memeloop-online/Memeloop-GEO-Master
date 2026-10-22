@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use geo_domain::{
-    AppError, ErrorCode, MeasurementPeriodReport, ProjectId, ReportRepository, ReportSnapshot,
-    TenantScope, validate_correction, validate_measurement_period_correction,
+    AppError, ErrorCode, MeasurementPeriodReport, MeasurementPeriodReportSummary,
+    MeasurementReportQuestionSet, ProjectId, ReportRepository, ReportSnapshot, TenantScope,
+    validate_correction, validate_measurement_period_correction,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -94,8 +95,82 @@ fn decode_measurement(value: serde_json::Value) -> Result<MeasurementPeriodRepor
         .map_err(|_| AppError::new(ErrorCode::Internal, "stored measurement report is invalid"))
 }
 
+#[derive(sqlx::FromRow)]
+struct MeasurementReportSummaryRow {
+    report_id: Uuid,
+    project_id: Uuid,
+    revision: i32,
+    correction_of: Option<Uuid>,
+    report_window_start_at: DateTime<Utc>,
+    report_window_end_at: DateTime<Utc>,
+    report_timezone: String,
+    evidence_as_of: DateTime<Utc>,
+    question_set_id: Option<Uuid>,
+    question_set_version_id: Option<Uuid>,
+}
+
+impl TryFrom<MeasurementReportSummaryRow> for MeasurementPeriodReportSummary {
+    type Error = AppError;
+
+    fn try_from(row: MeasurementReportSummaryRow) -> Result<Self, Self::Error> {
+        let invalid = || {
+            AppError::new(
+                ErrorCode::Internal,
+                "stored measurement report metadata is invalid",
+            )
+        };
+        let question_set = match (row.question_set_id, row.question_set_version_id) {
+            (None, None) => None,
+            (Some(question_set_id), Some(question_set_version_id)) => {
+                Some(MeasurementReportQuestionSet {
+                    question_set_id,
+                    question_set_version_id,
+                })
+            }
+            _ => return Err(invalid()),
+        };
+        let revision = u32::try_from(row.revision).map_err(|_| invalid())?;
+        if revision == 0 {
+            return Err(invalid());
+        }
+        Ok(Self {
+            report_id: row.report_id,
+            project_id: row.project_id.into(),
+            question_set,
+            revision,
+            correction_of: row.correction_of,
+            report_window_start_at: row.report_window_start_at,
+            report_window_end_at: row.report_window_end_at,
+            report_timezone: row.report_timezone,
+            evidence_as_of: row.evidence_as_of,
+        })
+    }
+}
+
 #[async_trait]
 impl ReportRepository for PgReportRepository {
+    async fn list_measurement_period_summaries(
+        &self,
+        scope: &TenantScope,
+        question_set: Option<MeasurementReportQuestionSet>,
+    ) -> Result<Vec<MeasurementPeriodReportSummary>, AppError> {
+        let project = scope
+            .project_id
+            .ok_or_else(|| AppError::forbidden("project scope required"))?;
+        let mut tx = self.pool.begin().await.map_err(database_error)?;
+        crate::set_local_scope(&mut tx, scope)
+            .await
+            .map_err(database_error)?;
+        let rows: Vec<MeasurementReportSummaryRow> = sqlx::query_as(
+            "SELECT report_id,project_id,revision,correction_of,report_window_start_at,report_window_end_at,report_timezone,evidence_as_of,question_set_id,question_set_version_id FROM measurement_period_reports WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND question_set_id IS NOT DISTINCT FROM $4 AND question_set_version_id IS NOT DISTINCT FROM $5 ORDER BY report_window_end_at DESC,revision DESC,report_id",
+        ).bind(scope.operator_id.as_uuid()).bind(scope.tenant_id.as_uuid()).bind(project.as_uuid())
+            .bind(question_set.as_ref().map(|selected| selected.question_set_id))
+            .bind(question_set.as_ref().map(|selected| selected.question_set_version_id))
+            .fetch_all(&mut *tx).await.map_err(database_error)?;
+        tx.commit().await.map_err(database_error)?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
     async fn create_measurement_period(
         &self,
         scope: &TenantScope,

@@ -110,7 +110,7 @@ function LocationProbe() {
 }
 function setup(
   input: api.MeasurementPeriodPreview = preview,
-  reports: api.MeasurementPeriodReport[] = [],
+  reports: api.MeasurementPeriodReportSummary[] = [],
 ) {
   const load = vi
     .spyOn(api, "getMeasurementReportPreview")
@@ -143,6 +143,39 @@ afterEach(async () => {
   await i18n.changeLanguage("zh-CN");
 });
 describe("cycle-free measurement report", () => {
+  it("keeps every catalog entry visible when opening one report fails", async () => {
+    const invalid: api.MeasurementPeriodReportSummary = {
+      report_id: "invalid-report",
+      project_id: "project",
+      revision: 1,
+      correction_of: null,
+      report_window_start_at: "2026-09-01T00:00:00Z",
+      report_window_end_at: "2026-09-08T00:00:00Z",
+      report_timezone: "UTC",
+      evidence_as_of: "2026-09-08T00:00:00Z",
+    };
+    const { detail, save } = setup(preview, [saved, invalid]);
+    detail.mockImplementation(async (_tenant, _project, reportId) => {
+      if (reportId === invalid.report_id)
+        throw new Error("Stored report is invalid");
+      return saved;
+    });
+    const selector = await screen.findByRole("combobox", { name: "报告时间" });
+    await userEvent.selectOptions(selector, invalid.report_id);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "报告暂时无法读取",
+    );
+    expect(within(selector).getAllByRole("option")).toHaveLength(3);
+    expect(screen.getAllByRole("button", { name: /查看版本/ })).toHaveLength(2);
+    await userEvent.selectOptions(selector, saved.report_id);
+    expect(
+      await screen.findByRole("heading", { name: "报告版本 2" }),
+    ).toBeVisible();
+    expect(detail).toHaveBeenCalledWith("tenant", "project", invalid.report_id);
+    expect(detail).toHaveBeenCalledWith("tenant", "project", saved.report_id);
+    expect(save).not.toHaveBeenCalled();
+  });
+
   it("saves the exact preview once before opening a report-only AI draft link", async () => {
     const { save } = setup();
     const reportId = "00000000-0000-4000-8000-000000000076";

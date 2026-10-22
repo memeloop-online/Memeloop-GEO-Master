@@ -1480,7 +1480,21 @@ async fn http_cycle_free_preview_save_list_and_detail_share_the_same_snapshot() 
     assert_eq!(response.status(), StatusCode::OK);
     let list: serde_json::Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
-    assert_eq!(list["items"], json!([saved.clone()]));
+    let summary = |value: &serde_json::Value| {
+        let report: geo_domain::MeasurementPeriodReport =
+            serde_json::from_value(value.clone()).unwrap();
+        serde_json::to_value(geo_domain::MeasurementPeriodReportSummary::from(&report)).unwrap()
+    };
+    assert_eq!(list["items"], json!([summary(&saved)]));
+    for field in [
+        "samples",
+        "coverage",
+        "search",
+        "input_hash",
+        "generated_at",
+    ] {
+        assert!(list["items"][0].get(field).is_none());
+    }
     let scoped_query = format!(
         "question_set_id={}&question_set_version_id={}",
         selected.question_set_id, selected.question_set_version_id
@@ -1550,7 +1564,7 @@ async fn http_cycle_free_preview_save_list_and_detail_share_the_same_snapshot() 
         assert_eq!(response.status(), StatusCode::OK);
         let rows: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
-        assert_eq!(rows["items"], json!([expected]));
+        assert_eq!(rows["items"], json!([summary(&expected)]));
     }
     let mut unknown_scope = scoped_body;
     unknown_scope["question_set"]["question_set_version_id"] = json!(Uuid::new_v4());

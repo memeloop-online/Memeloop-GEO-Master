@@ -359,7 +359,7 @@ const TOOL_DESCRIPTIONS = {
   [REPORT_PREVIEW]:
     "Read a temporary, unsaved report preview. For arbitrary-topic or independent measurements use kind measurement_period; no cycle, enterprise setup or new sampling is needed. To report one question-set version, pass question_set with the exact question_set_id and question_set_version_id from scoped discovery; omitted window then includes its saved measurement history. Without question_set, omitted window means the last seven days. To save it, pass the EXACT returned report_window_start_at, report_window_end_at and report_timezone as report_reduce.window and preserve the returned question_set. kind cycle (default) retains current/scoped cycle preview and accepts no question_set. This does not schedule or save anything. Omitted sample details are purpose-restricted, not missing evidence.",
   [REPORT_GET]:
-    "Read an immutable saved report in the current project. Use kind measurement_period for independent measurement reports, report_id for an exact saved version, or list true to list that kind; omit both to read the latest. kind cycle (default) preserves cycle-report reads. Coverage is authoritative; omitted_sample_details counts details withheld from AI by immutable question purpose, not absent samples.",
+    "Read an immutable saved report in the current project. Always specify kind from the report context: measurement_period for independent measurement or question-set reports, cycle for optimization-cycle reports. Preserve the exact report_id supplied by the user or a tool result; an ID alone does not identify its kind. Use list true to list measurement_period reports; omit report_id and list to read the latest of the chosen kind. Coverage is authoritative; omitted_sample_details counts details withheld from AI by immutable question purpose, not absent samples.",
   [REPORT_REDUCE]:
     "Save a report from already persisted evidence, never start sampling or create a cycle. For independent/arbitrary-topic reports choose kind measurement_period and provide the EXACT window returned by report_preview (start_at, end_at, report_timezone) and its question_set when present; replay the identical window and question_set after uncertainty. correction_of creates a new immutable version of that same window and question-set scope. kind cycle (default) reduces the current/scoped cycle after cutoff and accepts no question_set. Do not use withheld evaluation or unclassified sample details for optimization.",
   [KNOWLEDGE_IMPORT_STATUS]:
@@ -864,8 +864,13 @@ const REPORT_QUESTION_SET_SCHEMA = {
 const REPORT_GET_SCHEMA = {
   type: "object",
   additionalProperties: false,
+  required: ["kind"],
   properties: {
-    kind: REPORT_KIND_SCHEMA,
+    kind: {
+      ...REPORT_KIND_SCHEMA,
+      description:
+        "Required. Choose measurement_period for independent measurement or question-set reports and cycle for optimization-cycle reports, using the report context.",
+    },
     report_id: {
       type: "string",
       format: "uuid",

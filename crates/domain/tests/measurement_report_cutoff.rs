@@ -549,6 +549,25 @@ async fn question_set_versions_have_independent_immutable_report_series() {
     assert_ne!(other_report.report_id, scoped_report.report_id);
     assert_eq!(
         repository
+            .list_measurement_period_summaries(&scope, Some(selected.clone()))
+            .await
+            .unwrap(),
+        vec![
+            geo_domain::MeasurementPeriodReportSummary::from(&correction),
+            geo_domain::MeasurementPeriodReportSummary::from(&scoped_report),
+        ]
+    );
+    let mut foreign = scope.clone();
+    foreign.tenant_id = Uuid::new_v4().into();
+    assert!(
+        repository
+            .list_measurement_period_summaries(&foreign, Some(selected.clone()))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        repository
             .list_measurement_periods(&scope, None)
             .await
             .unwrap()
