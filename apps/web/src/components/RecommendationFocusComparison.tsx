@@ -1,0 +1,148 @@
+import { Badge, Card, tokens } from "@fluentui/react-components";
+import { useTranslation } from "react-i18next";
+import { isMeasurementFocus } from "../api/measurementFocus";
+import type { RecommendationItem } from "../api/recommendations";
+import { safeOriginalPublicUrl } from "../pages/PublicationLookupPanel";
+import "../i18n/recommendationFocusComparison";
+
+function RecommendationCard({
+  item,
+  focused = false,
+}: {
+  item: RecommendationItem;
+  focused?: boolean;
+}) {
+  const { t } = useTranslation("recommendationFocusComparison");
+  const urls = [
+    ...new Set(
+      item.citation_urls
+        .map(safeOriginalPublicUrl)
+        .filter((url): url is string => url !== null),
+    ),
+  ];
+  return (
+    <Card
+      role="article"
+      aria-label={item.name}
+      style={{ minWidth: 0, overflowWrap: "anywhere" }}
+    >
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+        <strong>{item.name}</strong>
+        {focused && <Badge appearance="tint">{t("focused")}</Badge>}
+        <span>
+          {item.rank === null
+            ? t("unranked")
+            : t("ranked", { rank: item.rank })}
+        </span>
+      </div>
+      <p style={{ margin: 0 }}>{item.reason || t("reasonMissing")}</p>
+      <details>
+        <summary style={{ cursor: "pointer" }}>{t("evidence")}</summary>
+        <blockquote
+          style={{
+            margin: "8px 0",
+            paddingLeft: 12,
+            borderLeft: `2px solid ${tokens.colorNeutralStroke2}`,
+            whiteSpace: "pre-wrap",
+          }}
+        >
+          {item.evidence_quote}
+        </blockquote>
+        {urls.length > 0 && (
+          <ul style={{ margin: "8px 0", paddingLeft: 20 }}>
+            {urls.map((url) => (
+              <li key={url}>
+                <a href={url} target="_blank" rel="noopener noreferrer">
+                  {url}
+                </a>
+              </li>
+            ))}
+          </ul>
+        )}
+      </details>
+    </Card>
+  );
+}
+
+/** Compare explicit ranks only within this answer's verified recommendations. */
+export function RecommendationFocusComparison({
+  items,
+  focusNames,
+}: {
+  items: RecommendationItem[];
+  focusNames: readonly string[];
+}) {
+  const { t } = useTranslation("recommendationFocusComparison");
+  const focusGroups = new Map<string, RecommendationItem[]>();
+  for (const item of items) {
+    if (!isMeasurementFocus(item.name, focusNames)) continue;
+    const key = JSON.stringify([item.name.trim(), item.kind]);
+    const group = focusGroups.get(key) ?? [];
+    group.push(item);
+    focusGroups.set(key, group);
+  }
+  if (!focusNames.length || !focusGroups.size) return null;
+
+  return (
+    <section
+      aria-label={t("title")}
+      style={{ display: "grid", gap: 12, minWidth: 0 }}
+    >
+      <h5 style={{ margin: 0 }}>{t("title")}</h5>
+      <p style={{ margin: 0 }}>{t("scope")}</p>
+      {[...focusGroups].map(([key, matches]) => {
+        const focus = matches[0];
+        const ambiguous = new Set(matches.map((item) => item.rank)).size > 1;
+        const rank = focus.rank;
+        const ahead =
+          !ambiguous && rank !== null
+            ? items
+                .filter(
+                  (item) =>
+                    item.kind === focus.kind &&
+                    item.rank !== null &&
+                    item.rank < rank &&
+                    item.name.trim() !== focus.name.trim(),
+                )
+                .sort((left, right) => left.rank! - right.rank!)
+            : [];
+        return (
+          <section
+            key={key}
+            aria-label={t("group", {
+              name: focus.name.trim(),
+              kind: t(`kind_${focus.kind}`),
+            })}
+            style={{ display: "grid", gap: 8, minWidth: 0 }}
+          >
+            <h6 style={{ margin: 0, fontSize: "inherit" }}>
+              {t("group", {
+                name: focus.name.trim(),
+                kind: t(`kind_${focus.kind}`),
+              })}
+            </h6>
+            {matches.map((item, index) => (
+              <RecommendationCard key={index} item={item} focused />
+            ))}
+            {ambiguous ? (
+              <p style={{ margin: 0 }}>{t("ambiguous")}</p>
+            ) : rank === null ? (
+              <p style={{ margin: 0 }}>{t("cannotCompare")}</p>
+            ) : ahead.length ? (
+              <>
+                <h6 style={{ margin: "4px 0 0", fontSize: "inherit" }}>
+                  {t("ahead")}
+                </h6>
+                {ahead.map((item, index) => (
+                  <RecommendationCard key={index} item={item} />
+                ))}
+              </>
+            ) : (
+              <p style={{ margin: 0 }}>{t("noneAhead")}</p>
+            )}
+          </section>
+        );
+      })}
+    </section>
+  );
+}

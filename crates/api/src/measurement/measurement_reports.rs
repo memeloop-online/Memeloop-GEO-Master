@@ -187,16 +187,15 @@ pub async fn save_project_measurement_report_at_cutoff(
     ensure_project(state, scope).await?;
     ensure_question_set(state, scope, request.question_set.as_ref()).await?;
     let repository = state.report_repository();
-    let rows = repository
-        .list_measurement_periods(scope, request.question_set.clone())
+    let matching = repository
+        .list_measurement_periods_in_window(scope, request.question_set.clone(), &window)
         .await?;
-    let matching: Vec<_> = rows.iter().filter(|row| row.window() == window).collect();
     let parent = if let Some(parent_id) = request.correction_of {
         if let Some(replay) = matching
             .iter()
             .find(|row| row.correction_of == Some(parent_id))
         {
-            return Ok((*replay).clone());
+            return Ok(replay.clone());
         }
         let parent = matching
             .iter()
@@ -207,10 +206,10 @@ pub async fn save_project_measurement_report_at_cutoff(
                 "measurement report correction parent is not latest",
             ));
         }
-        Some(*parent)
+        Some(parent)
     } else {
         if let Some(replay) = matching.iter().find(|row| row.revision == 1) {
-            return Ok((*replay).clone());
+            return Ok(replay.clone());
         }
         None
     };

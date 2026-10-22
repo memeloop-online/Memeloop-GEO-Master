@@ -25,7 +25,7 @@ import { AgentChatView } from "@memeloop/react-ui/agent";
 import type { WebMemeLoopChatAdapter } from "@memeloop/react-ui/chat";
 import { createTheme, ThemeProvider } from "@mui/material/styles";
 import type { ConversationMessageListProjection } from "memeloop";
-import { useNavigate, useParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import {
   agentEventStreamUrl,
@@ -45,6 +45,10 @@ import {
 } from "../api/agent";
 import { createIdempotencyKey } from "../api/client";
 import { ErrorState, LoadingState } from "../components/AsyncState";
+import {
+  MeasurementReportDraftBridge,
+  measurementReportReference,
+} from "../components/MeasurementReportDraftBridge";
 import { useAppearance } from "../appearance/AppearanceProvider";
 import { formatUiDate } from "../i18n";
 
@@ -219,12 +223,14 @@ function AgentChat({
   projectId,
   onRefresh,
   onFirstMessage,
+  measurementReportId,
 }: {
   conversation: AgentConversationDetail;
   tenantId: string;
   projectId: string;
   onRefresh: () => Promise<void>;
   onFirstMessage?: (conversationId: string) => void;
+  measurementReportId?: string;
 }) {
   const { t } = useTranslation();
   const { appearance } = useAppearance();
@@ -634,6 +640,14 @@ function AgentChat({
         <ThemeProvider theme={agentTheme}>
           <AgentChatView
             adapter={adapter}
+            composerToolbar={
+              measurementReportId ? (
+                <MeasurementReportDraftBridge
+                  key={measurementReportId}
+                  reportId={measurementReportId}
+                />
+              ) : undefined
+            }
             empty={empty}
             selectedFile={selectedFile}
             onFileSelect={(file) => addFiles([file])}
@@ -690,6 +704,8 @@ function AgentChat({
 export function AgentWorkbenchPage() {
   const { t } = useTranslation();
   const { tenantId, projectId, conversationId } = useParams();
+  const { search } = useLocation();
+  const measurementReportId = measurementReportReference(search);
   const navigate = useNavigate();
   const conversations = useAgentConversationsQuery(tenantId, projectId);
   const conversation = useAgentConversationQuery(
@@ -769,6 +785,7 @@ export function AgentWorkbenchPage() {
               tenantId={tenantId}
               projectId={projectId}
               onRefresh={refresh}
+              measurementReportId={measurementReportId}
               onFirstMessage={(id) => {
                 void refetchConversations();
                 navigate(`${base}/${encodeURIComponent(id)}`, {

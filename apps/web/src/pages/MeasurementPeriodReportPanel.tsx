@@ -30,6 +30,8 @@ import {
   measurementFocusNames,
 } from "../api/measurementFocus";
 import { MeasurementFocusPanel } from "../components/MeasurementFocusPanel";
+import { RecommendationFocusComparison } from "../components/RecommendationFocusComparison";
+import { Link, useNavigate } from "react-router-dom";
 
 const knownStatuses = new Set([
   "pending",
@@ -56,6 +58,7 @@ export function MeasurementPeriodReportPanel({
   onSelectReport?: (reportId: string | undefined) => void;
 }) {
   const { session } = useAuth();
+  const navigate = useNavigate();
   const project = useProjectQuery(tenantId, projectId);
   const focusNames = measurementFocusNames(project.data?.settings);
   const { t, i18n } = useTranslation("measurementReports");
@@ -176,7 +179,9 @@ export function MeasurementPeriodReportPanel({
   };
   const status = (value: string) =>
     t(knownStatuses.has(value) ? `status_${value}` : "status_other");
-  async function save() {
+  const reportChatHref = (reportId: string) =>
+    `/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/chat?${new URLSearchParams({ measurementReport: reportId })}`;
+  async function save(analyze = false) {
     if (!preview.data || !matchesScope(preview.data) || saving || !canWrite)
       return;
     saveIntent.current ??= preview.data;
@@ -191,8 +196,11 @@ export function MeasurementPeriodReportPanel({
       if (!matchesScope(saved)) throw new Error("Report scope mismatch");
       saveIntent.current = undefined;
       setSaveState("saved");
-      setSelected(saved.report_id);
-      await history.refetch();
+      if (analyze) navigate(reportChatHref(saved.report_id));
+      else {
+        setSelected(saved.report_id);
+        await history.refetch();
+      }
     } catch {
       setSaveState("saveFailed");
     } finally {
@@ -336,6 +344,11 @@ export function MeasurementPeriodReportPanel({
             {report.kind === "measurement_period" && report.correction_of && (
               <p>{t("correction", { id: report.correction_of })}</p>
             )}
+            {report.kind === "measurement_period" && canWrite && (
+              <Link to={reportChatHref(report.report_id)}>
+                {t("analyzeReport")}
+              </Link>
+            )}
             <p>
               {t("window", {
                 start: at(report.report_window_start_at),
@@ -387,9 +400,14 @@ export function MeasurementPeriodReportPanel({
               </ul>
             </details>
             {!selected && canWrite && (
-              <Button disabled={saving} onClick={() => void save()}>
-                {t(saving ? "saving" : "save")}
-              </Button>
+              <>
+                <Button disabled={saving} onClick={() => void save()}>
+                  {t(saving ? "saving" : "save")}
+                </Button>
+                <Button disabled={saving} onClick={() => void save(true)}>
+                  {t("analyzeReport")}
+                </Button>
+              </>
             )}
             {!report.samples.length && <p>{t("empty")}</p>}
             {recommendations.length > 0 && (
@@ -628,21 +646,14 @@ function SampleRecommendations({
   );
   return (
     <div className="measurement-report-recommendations">
-      {focusNames.length > 0 && (
+      {focusNames.length > 0 && focused.length === 0 && (
         <p className="measurement-report-focus">
           <strong>{t("currentFocus", { name: focusNames.join("、") })}</strong>
           {" · "}
-          {focused.length
-            ? focused
-                .map((item) =>
-                  item.rank === null
-                    ? t("focusRecommended")
-                    : t("rankValue", { rank: item.rank }),
-                )
-                .join(" · ")
-            : t("focusNotFound")}
+          {t("focusNotFound")}
         </p>
       )}
+      <RecommendationFocusComparison items={items} focusNames={focusNames} />
       <table className="report-table">
         <caption>{t("recommendedEntities")}</caption>
         <thead>

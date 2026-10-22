@@ -13,6 +13,7 @@ import { isMeasurementFocus } from "../api/measurementFocus";
 import { safeOriginalPublicUrl } from "../pages/PublicationLookupPanel";
 import "../i18n/observationAnalysis";
 import "../i18n/measurementFocus";
+import { RecommendationFocusComparison } from "./RecommendationFocusComparison";
 
 /** Render model-extracted entities only; never infer names or rank from prose. */
 export function RecommendationResults({
@@ -32,24 +33,20 @@ export function RecommendationResults({
     <section aria-label={t("recommendationsTitle")}>
       <h5>{t("recommendationsTitle")}</h5>
       {decoded !== null &&
-        focusNames.map((name) => {
-          const match = items.find((item) =>
-            isMeasurementFocus(item.name, [name]),
-          );
-          return (
+        focusNames
+          .filter(
+            (name) =>
+              !items.some((item) => isMeasurementFocus(item.name, [name])),
+          )
+          .map((name) => (
             <div key={name} style={{ marginBottom: 12 }}>
               <strong>{focusT("resultTitle", { name })}</strong>
-              <p>
-                {match
-                  ? match.rank !== null
-                    ? focusT("ranked", { rank: match.rank })
-                    : focusT("unranked")
-                  : focusT("notFound", { name })}
-              </p>
-              {match?.reason && <p>{match.reason}</p>}
+              <p>{focusT("notFound", { name })}</p>
             </div>
-          );
-        })}
+          ))}
+      {decoded !== null && (
+        <RecommendationFocusComparison items={items} focusNames={focusNames} />
+      )}
       {value == null ? (
         <p>{t("recommendationsNotAnalyzed")}</p>
       ) : decoded === null ? (

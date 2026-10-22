@@ -1252,6 +1252,130 @@ async fn invalid_report_clocks_are_rejected_before_project_or_evidence_reads() {
 }
 
 #[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in GEO_TEST_DATABASE_URL"]
+async fn saving_report_ignores_corrupt_other_windows_but_rejects_corrupt_current_window() {
+    let config = geo_persistence::DatabaseConfig::from_url(
+        std::env::var("GEO_TEST_DATABASE_URL").expect("disposable database required"),
+    )
+    .unwrap();
+    let database = geo_persistence::Database::connect_and_migrate(&config)
+        .await
+        .unwrap();
+    let operator = Uuid::new_v4();
+    let tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO operators (operator_id,slug,display_name) VALUES ($1,$2,'Synthetic')")
+        .bind(operator)
+        .bind(format!("window-{operator}"))
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO tenants (tenant_id,operator_id,slug,display_name) VALUES ($1,$2,$3,'Synthetic')")
+        .bind(tenant).bind(operator).bind(format!("window-{tenant}")).execute(database.pool()).await.unwrap();
+    let state = AppState::from_database(&database);
+    let tenant_scope = TenantScope::new(operator.into(), tenant.into(), None);
+    let created = state
+        .project_repository()
+        .create(
+            &tenant_scope,
+            ProjectCreate {
+                slug: None,
+                display_name: "Synthetic report windows".into(),
+                settings: ProjectSettings::default(),
+            },
+        )
+        .await
+        .unwrap();
+    let scope = TenantScope::new(
+        tenant_scope.operator_id,
+        tenant_scope.tenant_id,
+        Some(created.id),
+    );
+    let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
+    let version = question_version(&state, &scope, "window-report").await;
+    let selected = report_question_set(&version);
+    let question_binding = binding(&state, &scope, &version).await;
+    plan(
+        &state,
+        &scope,
+        now - Duration::days(2),
+        Some(question_binding),
+    )
+    .await;
+    for question_set in [None, Some(selected)] {
+        let old = MeasurementPeriodRequest {
+            start_at: now - Duration::days(7),
+            end_at: now - Duration::days(1),
+            report_timezone: "UTC".into(),
+            correction_of: None,
+            question_set,
+        };
+        let previous = save_project_measurement_report(&state, &scope, old.clone(), now)
+            .await
+            .unwrap();
+        assert_eq!(previous.samples.len(), 1);
+        sqlx::query("UPDATE measurement_period_reports SET snapshot=snapshot #- '{samples,0,conditions}' WHERE report_id=$1 AND operator_id=$2 AND tenant_id=$3 AND project_id=$4")
+            .bind(previous.report_id).bind(operator).bind(tenant).bind(created.id.as_uuid())
+            .execute(database.pool()).await.unwrap();
+        assert_eq!(
+            state
+                .report_repository()
+                .list_measurement_periods(&scope, old.question_set.clone())
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Internal
+        );
+        let current = MeasurementPeriodRequest {
+            end_at: now,
+            ..old.clone()
+        };
+        let saved = save_project_measurement_report(&state, &scope, current.clone(), now)
+            .await
+            .unwrap();
+        assert_eq!(saved.revision, 1);
+        assert_eq!(saved.samples.len(), 1);
+        assert_eq!(
+            save_project_measurement_report(
+                &state,
+                &scope,
+                current.clone(),
+                now + Duration::minutes(1)
+            )
+            .await
+            .unwrap(),
+            saved
+        );
+        let correction = MeasurementPeriodRequest {
+            correction_of: Some(saved.report_id),
+            ..current
+        };
+        let corrected = save_project_measurement_report(
+            &state,
+            &scope,
+            correction.clone(),
+            now + Duration::minutes(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(corrected.revision, 2);
+        assert_eq!(corrected.correction_of, Some(saved.report_id));
+        assert_eq!(
+            save_project_measurement_report(&state, &scope, correction, now + Duration::minutes(2))
+                .await
+                .unwrap(),
+            corrected
+        );
+        assert_eq!(
+            save_project_measurement_report(&state, &scope, old, now)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Internal
+        );
+    }
+}
+
+#[tokio::test]
 async fn http_cycle_free_preview_save_list_and_detail_share_the_same_snapshot() {
     let state = AppState::development_with_password("report-test");
     let scope = project(&state).await;

@@ -9,7 +9,7 @@ import {
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import * as api from "../api/measurementReports";
 import { MeasurementPeriodReportPanel } from "./MeasurementPeriodReportPanel";
 import i18n from "../i18n";
@@ -99,6 +99,15 @@ const saved: api.MeasurementPeriodReport = {
   revision: 2,
   correction_of: "older-report",
 };
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <output data-testid="report-location">
+      {location.pathname}
+      {location.search}
+    </output>
+  );
+}
 function setup(
   input: api.MeasurementPeriodPreview = preview,
   reports: api.MeasurementPeriodReport[] = [],
@@ -119,6 +128,7 @@ function setup(
       <QueryClientProvider client={client}>
         <MemoryRouter>
           <MeasurementPeriodReportPanel tenantId="tenant" projectId="project" />
+          <LocationProbe />
         </MemoryRouter>
       </QueryClientProvider>
     </FluentProvider>,
@@ -133,6 +143,49 @@ afterEach(async () => {
   await i18n.changeLanguage("zh-CN");
 });
 describe("cycle-free measurement report", () => {
+  it("saves the exact preview once before opening a report-only AI draft link", async () => {
+    const { save } = setup();
+    const reportId = "00000000-0000-4000-8000-000000000076";
+    save.mockResolvedValue({ ...saved, report_id: reportId });
+    await userEvent.click(
+      await screen.findByRole("button", { name: "用 AI 分析这份报告" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("report-location")).toHaveTextContent(
+        `/app/tenant/project/chat?measurementReport=${reportId}`,
+      ),
+    );
+    expect(save).toHaveBeenCalledExactlyOnceWith("tenant", "project", preview);
+    expect(screen.getByTestId("report-location")).not.toHaveTextContent(
+      preview.samples[0].conditions.question,
+    );
+  });
+
+  it("keeps the report open when saving for AI analysis fails", async () => {
+    const { save } = setup();
+    save.mockRejectedValue(new Error("Unavailable"));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "用 AI 分析这份报告" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent("保存尚未确认");
+    expect(screen.getByTestId("report-location")).toHaveTextContent(/^\/$/);
+  });
+
+  it("links a saved report to AI without resaving it", async () => {
+    const { save } = setup(preview, [saved]);
+    await userEvent.selectOptions(
+      await screen.findByRole("combobox", { name: "报告时间" }),
+      saved.report_id,
+    );
+    expect(
+      await screen.findByRole("link", { name: "用 AI 分析这份报告" }),
+    ).toHaveAttribute(
+      "href",
+      `/app/tenant/project/chat?measurementReport=${saved.report_id}`,
+    );
+    expect(save).not.toHaveBeenCalled();
+  });
+
   it("shows newest answers first and filters both cards and comparisons without changing saved report input", async () => {
     const base = preview.samples[0];
     const samples = [
@@ -293,8 +346,10 @@ describe("cycle-free measurement report", () => {
       ],
     });
     const table = await screen.findByRole("table", { name: "AI 推荐了什么" });
-    expect(screen.getByText("当前关注：Trail light")).toBeVisible();
-    expect(screen.getByText(/已获推荐，未明确排名/)).toBeVisible();
+    expect(
+      screen.getByRole("region", { name: "关注对象与同类推荐" }),
+    ).toBeVisible();
+    expect(screen.getByText("已推荐，未明确排名")).toBeVisible();
     expect(within(table).getByText("Trail light").closest("tr")).toHaveClass(
       "measurement-report-focus-row",
     );
