@@ -268,118 +268,125 @@ export function RecommendationTrend({
                     })}
                   </section>
                 )}
-                <div style={{ overflowX: "auto" }}>
-                  <Table
-                    aria-label={input.question}
-                    style={{
-                      minWidth: Math.max(460, 180 * (entries.length + 1)),
-                    }}
-                  >
-                    <TableHeader>
-                      <TableRow>
-                        <TableHeaderCell scope="col">
-                          {t("entity")}
-                        </TableHeaderCell>
-                        {entries.map(({ sample, items }) => {
-                          const label = timeLabel(sample);
-                          return (
-                            <TableHeaderCell key={sample.sampleId} scope="col">
-                              <a
-                                href={sample.recordHref}
-                                aria-label={`${t("viewRecord")} · ${label}`}
-                              >
-                                {label}
-                              </a>
-                              {items === null && (
-                                <p>
-                                  {t(
-                                    sample.recommendations == null
-                                      ? "notAnalyzed"
-                                      : "unverified",
-                                  )}
-                                </p>
-                              )}
-                            </TableHeaderCell>
-                          );
-                        })}
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {[...entities].map(([entityId, entity]) => (
-                        <TableRow
-                          key={entityId}
-                          style={
-                            isMeasurementFocus(entity.name, focusNames)
-                              ? {
-                                  backgroundColor: tokens.colorBrandBackground2,
-                                }
-                              : undefined
-                          }
-                        >
-                          <TableCell style={{ overflowWrap: "anywhere" }}>
-                            <div>{entity.name}</div>
-                            <small>{t(`kind_${entity.kind}`)}</small>
-                            {isMeasurementFocus(entity.name, focusNames) && (
-                              <div>{t("tracked")}</div>
-                            )}
-                          </TableCell>
+                <details open={focusEntities.length === 0}>
+                  <summary>{t("fullHistory")}</summary>
+                  <div style={{ overflowX: "auto" }}>
+                    <Table
+                      aria-label={input.question}
+                      style={{
+                        minWidth: Math.max(460, 180 * (entries.length + 1)),
+                      }}
+                    >
+                      <TableHeader>
+                        <TableRow>
+                          <TableHeaderCell scope="col">
+                            {t("entity")}
+                          </TableHeaderCell>
                           {entries.map(({ sample, items }) => {
-                            const matches = items?.filter(
-                              (item) => entityKey(item) === entityId,
-                            );
+                            const label = timeLabel(sample);
                             return (
-                              <TableCell key={sample.sampleId}>
-                                {items === null
-                                  ? t(
+                              <TableHeaderCell
+                                key={sample.sampleId}
+                                scope="col"
+                              >
+                                <a
+                                  href={sample.recordHref}
+                                  aria-label={`${t("viewRecord")} · ${label}`}
+                                >
+                                  {label}
+                                </a>
+                                {items === null && (
+                                  <p>
+                                    {t(
                                       sample.recommendations == null
                                         ? "notAnalyzed"
                                         : "unverified",
-                                    )
-                                  : !matches?.length
-                                    ? t("absent")
-                                    : matches.map((item, index) => (
-                                        <div key={index}>
-                                          <div>
-                                            {item.rank === null
-                                              ? t("unranked")
-                                              : t("rank", {
-                                                  value: number.format(
-                                                    item.rank,
-                                                  ),
-                                                })}
-                                          </div>
-                                          <div>
-                                            {t("order", {
-                                              value: number.format(
-                                                item.mention_order,
-                                              ),
-                                            })}
-                                          </div>
-                                          <details>
-                                            <summary>{t("evidence")}</summary>
-                                            <blockquote
-                                              style={{
-                                                whiteSpace: "pre-wrap",
-                                                overflowWrap: "anywhere",
-                                              }}
-                                            >
-                                              {item.evidence_quote}
-                                            </blockquote>
-                                          </details>
-                                        </div>
-                                      ))}
-                              </TableCell>
+                                    )}
+                                  </p>
+                                )}
+                              </TableHeaderCell>
                             );
                           })}
                         </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </div>
-                {entities.size === 0 &&
-                  entries.some((entry) => entry.items !== null) && (
-                    <p>{t("noEntities")}</p>
-                  )}
+                      </TableHeader>
+                      <TableBody>
+                        {[...entities].map(([entityId, entity]) => (
+                          <TableRow
+                            key={entityId}
+                            style={
+                              isMeasurementFocus(entity.name, focusNames)
+                                ? {
+                                    backgroundColor:
+                                      tokens.colorBrandBackground2,
+                                  }
+                                : undefined
+                            }
+                          >
+                            <TableCell style={{ overflowWrap: "anywhere" }}>
+                              <div>{entity.name}</div>
+                              <small>{t(`kind_${entity.kind}`)}</small>
+                              {isMeasurementFocus(entity.name, focusNames) && (
+                                <div>{t("tracked")}</div>
+                              )}
+                            </TableCell>
+                            {entries.map(({ sample, items }) => {
+                              const matches = items?.filter(
+                                (item) => entityKey(item) === entityId,
+                              );
+                              return (
+                                <TableCell key={sample.sampleId}>
+                                  {items === null
+                                    ? t(
+                                        sample.recommendations == null
+                                          ? "notAnalyzed"
+                                          : "unverified",
+                                      )
+                                    : !matches?.length
+                                      ? t("absent")
+                                      : matches.map((item, index) => (
+                                          <div key={index}>
+                                            <div>
+                                              {item.rank === null
+                                                ? t("unranked")
+                                                : t("rank", {
+                                                    value: number.format(
+                                                      item.rank,
+                                                    ),
+                                                  })}
+                                            </div>
+                                            <div>
+                                              {t("order", {
+                                                value: number.format(
+                                                  item.mention_order,
+                                                ),
+                                              })}
+                                            </div>
+                                            <details>
+                                              <summary>{t("evidence")}</summary>
+                                              <blockquote
+                                                style={{
+                                                  whiteSpace: "pre-wrap",
+                                                  overflowWrap: "anywhere",
+                                                }}
+                                              >
+                                                {item.evidence_quote}
+                                              </blockquote>
+                                            </details>
+                                          </div>
+                                        ))}
+                                </TableCell>
+                              );
+                            })}
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                  {entities.size === 0 &&
+                    entries.some((entry) => entry.items !== null) && (
+                      <p>{t("noEntities")}</p>
+                    )}
+                </details>
               </section>
             );
           })}

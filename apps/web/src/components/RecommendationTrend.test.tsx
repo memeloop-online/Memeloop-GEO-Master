@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 import {
   RecommendationTrend,
   type RecommendationTrendSample,
@@ -95,6 +101,11 @@ describe("recommendation rank history", () => {
       expect(
         summary.getAllByRole("link").map((link) => link.getAttribute("href")),
       ).toEqual([first.recordHref, last.recordHref]);
+      const disclosure = screen.getByText("完整排名对比");
+      expect(disclosure.closest("details")).not.toHaveAttribute("open");
+      expect(screen.getByRole("table", { hidden: true })).not.toBeVisible();
+      fireEvent.click(disclosure);
+      expect(screen.getByRole("table")).toBeVisible();
       const row = screen.getAllByRole("row")[1];
       expect(within(row).getByText("关注对象")).toBeVisible();
       expect(row).toHaveStyle({
@@ -211,6 +222,7 @@ describe("recommendation rank history", () => {
     );
     expect(summary.getByText("排名上升 2 位")).toBeVisible();
     expect(summary.getAllByRole("region")).toHaveLength(1);
+    fireEvent.click(screen.getByText("完整排名对比"));
     const row = screen.getAllByRole("row")[1];
     expect(within(row).getByText("关注对象")).toBeVisible();
     expect(row).toHaveStyle({
@@ -238,6 +250,7 @@ describe("recommendation rank history", () => {
     expect(
       summary.queryByText(/排名上升|排名下降|排名持平/),
     ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("完整排名对比"));
     expect(screen.getAllByText("关注对象")).toHaveLength(2);
     expect(screen.getAllByRole("row")).toHaveLength(3);
   });
@@ -338,6 +351,7 @@ describe("recommendation rank history", () => {
       screen.getByRole("region", { name: "Latest tracked item changes" }),
     );
     expect(summary.getByText("Rank improved by 2")).toBeVisible();
+    expect(screen.getByText("Full rank history")).toBeVisible();
     expect(summary.getByText("Rank 3")).toBeVisible();
     expect(summary.getByText("Rank 1")).toBeVisible();
     expect(
@@ -355,6 +369,8 @@ describe("recommendation rank history", () => {
     });
     render(<RecommendationTrend samples={[later, first]} />);
     const table = screen.getByRole("table");
+    expect(table).toBeVisible();
+    expect(table.closest("details")).toHaveAttribute("open");
     const headers = within(table).getAllByRole("columnheader");
     expect(within(headers[1]).getByRole("link")).toHaveAttribute(
       "href",
@@ -436,6 +452,9 @@ describe("recommendation rank history", () => {
         focusNames={[item.name]}
       />,
     );
+    screen
+      .getAllByText("完整排名对比")
+      .forEach((summary) => fireEvent.click(summary));
     expect(screen.getAllByRole("table")).toHaveLength(2);
     expect(screen.getAllByText("推荐结果可用 1 / 1 次")).toHaveLength(2);
     expect(

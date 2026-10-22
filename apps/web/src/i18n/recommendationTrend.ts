@@ -10,6 +10,7 @@ const translations = {
     entity: "推荐对象",
     tracked: "关注对象",
     focusChanges: "关注对象最近变化",
+    fullHistory: "完整排名对比",
     focusDescription: "比较同一问题与条件下，最近两次的推荐表现。",
     previousSample: "上一次：",
     latestSample: "最近一次：",
@@ -50,6 +51,7 @@ const translations = {
     entity: "Recommended item",
     tracked: "Tracked item",
     focusChanges: "Latest tracked item changes",
+    fullHistory: "Full rank history",
     focusDescription:
       "Compare recommendations from the two most recent measurements under the same conditions.",
     previousSample: "Previous:",
