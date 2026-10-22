@@ -122,6 +122,7 @@ export function TargetCard({
   executeError,
   automatic = false,
   accountDisplayName,
+  active = true,
 }: {
   target: ChannelTarget;
   tenantId: string;
@@ -136,6 +137,7 @@ export function TargetCard({
   executeError: unknown;
   automatic?: boolean;
   accountDisplayName?: string | null;
+  active?: boolean;
 }) {
   const { t, i18n } = useTranslation("measurement");
   const { session } = useAuth();
@@ -274,6 +276,7 @@ export function TargetCard({
               targetId={target.target_id}
               attemptId={attempt.attempt_id}
               canWrite={canWrite}
+              active={active}
             />
           );
           return (
@@ -498,6 +501,7 @@ export function TargetCard({
               targetId={target.target_id}
               attemptId={attempt.attempt_id}
               canWrite={canWrite}
+              active={active}
             />
           )}
         </div>
@@ -557,6 +561,7 @@ export function PlannedTarget({
   canWrite,
   automatic = false,
   accountDisplayName,
+  active = true,
 }: {
   target: ChannelTarget;
   tenantId: string;
@@ -564,6 +569,7 @@ export function PlannedTarget({
   canWrite: boolean;
   automatic?: boolean;
   accountDisplayName?: string | null;
+  active?: boolean;
 }) {
   const { session } = useAuth();
   const client = useQueryClient();
@@ -578,9 +584,10 @@ export function PlannedTarget({
   const detail = useQuery({
     queryKey: key,
     queryFn: () => getChannelTarget(tenantId, projectId, target.target_id),
+    enabled: active,
     retry: false,
     refetchInterval: (query) =>
-      query.state.data?.attempts.at(-1)?.outcome ? false : 3000,
+      !active || query.state.data?.attempts.at(-1)?.outcome ? false : 3000,
   });
   const execution = useMutation({
     mutationFn: () =>
@@ -605,6 +612,7 @@ export function PlannedTarget({
       executeError={execution.error}
       automatic={automatic}
       accountDisplayName={accountDisplayName}
+      active={active}
     />
   );
 }

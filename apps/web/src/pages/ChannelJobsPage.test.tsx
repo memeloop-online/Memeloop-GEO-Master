@@ -12,7 +12,8 @@ import type {
   ChannelTarget,
   ChannelTargetView,
 } from "../api/channelJobs";
-import { ChannelJobsPage, TargetCard } from "./ChannelJobsPage";
+import { ChannelJobsPage, PlannedTarget, TargetCard } from "./ChannelJobsPage";
+import * as channelApi from "../api/channelJobs";
 import i18n from "../i18n";
 import type { ObservationAnalysisPage } from "../api/observationAnalysis";
 
@@ -137,6 +138,88 @@ async function renderAutomaticResult(
   }
   return { ...result, requests, client };
 }
+
+describe("measurement target visibility", () => {
+  it("pauses target polling while hidden and catches up without resubmitting", async () => {
+    vi.useFakeTimers();
+    const requests = mockApi();
+    const pending: ChannelTargetView = {
+      target: automaticTarget,
+      attempts: [],
+    };
+    const detail = vi
+      .spyOn(channelApi, "getChannelTarget")
+      .mockResolvedValue(pending);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const panel = (active: boolean) => (
+      <QueryClientProvider client={client}>
+        <FluentProvider theme={webLightTheme}>
+          <AuthProvider>
+            <MemoryRouter>
+              <PlannedTarget
+                target={automaticTarget}
+                tenantId="tenant-1"
+                projectId="project-1"
+                canWrite
+                automatic
+                active={active}
+              />
+            </MemoryRouter>
+          </AuthProvider>
+        </FluentProvider>
+      </QueryClientProvider>
+    );
+    const view = render(panel(false));
+    await act(() => vi.advanceTimersByTimeAsync(9000));
+    expect(detail).not.toHaveBeenCalled();
+    view.rerender(panel(true));
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(detail).toHaveBeenCalledOnce();
+    await act(() => vi.advanceTimersByTimeAsync(3000));
+    expect(detail).toHaveBeenCalledTimes(2);
+    view.rerender(panel(false));
+    const reads = detail.mock.calls.length;
+    detail.mockResolvedValue({
+      ...pending,
+      attempts: [
+        {
+          attempt_id: "saved-attempt",
+          target_id: automaticTarget.target_id,
+          claimed_at: "2026-10-01T00:00:00Z",
+          received_at: "2026-10-01T00:01:00Z",
+          outcome: {
+            status: "observed",
+            detail: null,
+            occurred_at: "2026-10-01T00:01:00Z",
+            raw_answer: "Persisted measurement answer",
+            citations: [],
+            public_url: null,
+            screenshot_ref: null,
+            connector_version: "test-v1",
+            runner_evidence: [],
+            fixture: false,
+          },
+        },
+      ],
+    });
+    await act(() => vi.advanceTimersByTimeAsync(9000));
+    expect(detail).toHaveBeenCalledTimes(reads);
+    view.rerender(panel(true));
+    await act(() => vi.advanceTimersByTimeAsync(1));
+    expect(detail).toHaveBeenCalledTimes(reads + 1);
+    expect(screen.getByText("Persisted measurement answer")).toBeVisible();
+    await act(() => vi.advanceTimersByTimeAsync(6000));
+    expect(detail).toHaveBeenCalledTimes(reads + 1);
+    expect(
+      requests.filter((request) => request.method === "POST"),
+    ).toHaveLength(0);
+    view.unmount();
+    client.clear();
+    vi.useRealTimers();
+  });
+});
 
 describe("automatic measurement results", () => {
   it.each([
@@ -846,6 +929,8 @@ function renderPage() {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   setCsrfToken(undefined);
   setUnauthorizedHandler(undefined);

@@ -445,6 +445,7 @@ export function QuestionSetsPage() {
             projectId={projectId}
             canWrite={canWrite}
             recordsOnly
+            active={tab === "records"}
           />
         )}
       </section>
