@@ -90,7 +90,9 @@ describe("native measurement report draft bridge", () => {
     native.getState.mockReturnValue({ text: "" });
     render(<MeasurementReportDraftBridge reportId={reportId} />);
     expect(native.setText).toHaveBeenCalledWith(
-      expect.stringContaining(`independent measurement report (ID: ${reportId})`),
+      expect.stringContaining(
+        `independent measurement report (ID: ${reportId})`,
+      ),
     );
   });
 });
