@@ -562,7 +562,10 @@ export function MeasurementPeriodReportPanel({
                 open={Boolean(questionSet)}
               >
                 <summary>{t("compareMeasurements")}</summary>
-                <RecommendationTrend samples={recommendations} />
+                <RecommendationTrend
+                  samples={recommendations}
+                  focusNames={focusNames}
+                />
               </details>
             )}
             <MeasurementReportSearchSection

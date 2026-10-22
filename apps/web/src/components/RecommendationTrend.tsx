@@ -5,9 +5,11 @@ import {
   TableHeader,
   TableHeaderCell,
   TableRow,
+  tokens,
 } from "@fluentui/react-components";
 import { useTranslation } from "react-i18next";
 import type { ChannelTargetInput } from "../api/channelJobs";
+import { isMeasurementFocus } from "../api/measurementFocus";
 import {
   decodeVerifiedRecommendations,
   type RecommendationItem,
@@ -25,7 +27,7 @@ type MeasurementInput = Omit<
 export interface RecommendationTrendSample {
   sampleId: string;
   recordHref: string;
-  observedAt: string;
+  observedAt: string | null;
   measurement: MeasurementInput;
   analysisRevisionId?: string;
   /** The selected grounded analysis's outcome.audit.recommendations. */
@@ -54,11 +56,35 @@ function comparisonKey(input: MeasurementInput) {
 const entityKey = (item: RecommendationItem) =>
   JSON.stringify([item.kind, item.name]);
 
+const observedTime = (sample: RecommendationTrendSample) =>
+  sample.observedAt === null ? NaN : Date.parse(sample.observedAt);
+
+type TrendEntry = {
+  sample: RecommendationTrendSample;
+  items: RecommendationItem[] | null;
+};
+
+function entityState(entry: TrendEntry, entityId: string | undefined) {
+  if (entry.items === null)
+    return {
+      label:
+        entry.sample.recommendations == null ? "notAnalyzed" : "unverified",
+    };
+  const matches = entry.items.filter((item) => entityKey(item) === entityId);
+  if (!matches.length) return { label: "absent" };
+  if (matches.length > 1) return { label: "ambiguous" };
+  return matches[0].rank === null
+    ? { label: "unranked" }
+    : { label: "rank", rank: matches[0].rank };
+}
+
 /** Compare verified extracted recommendations; never derive entities or ranks from prose. */
 export function RecommendationTrend({
   samples,
+  focusNames = [],
 }: {
   samples: readonly RecommendationTrendSample[];
+  focusNames?: readonly string[];
 }) {
   const { t, i18n } = useTranslation("recommendationTrend");
   const number = new Intl.NumberFormat(i18n.resolvedLanguage || i18n.language);
@@ -85,8 +111,7 @@ export function RecommendationTrend({
           <p>{t("exactNames")}</p>
           {[...groups].map(([key, group]) => {
             const ordered = [...group].sort((left, right) => {
-              const difference =
-                Date.parse(left.observedAt) - Date.parse(right.observedAt);
+              const difference = observedTime(left) - observedTime(right);
               return Number.isFinite(difference) ? difference : 0;
             });
             const entries = ordered.map((sample) => ({
@@ -103,6 +128,42 @@ export function RecommendationTrend({
               }
             }
             const input = ordered[0].measurement;
+            const focusEntities = [
+              ...new Set(focusNames.map((name) => name.trim())),
+            ].flatMap<{
+              id: string | undefined;
+              name: string;
+              kind: RecommendationItem["kind"] | undefined;
+            }>((name) => {
+              const matches = [...entities].filter(([, entity]) =>
+                isMeasurementFocus(entity.name, [name]),
+              );
+              return matches.length
+                ? matches.map(([id, entity]) => ({
+                    id,
+                    name: entity.name,
+                    kind: entity.kind,
+                  }))
+                : [{ id: undefined, name, kind: undefined }];
+            });
+            // Unknown times or ties at the latest-pair boundary cannot establish chronology.
+            const latestPair = entries.slice(-2);
+            const chronologyKnown =
+              entries.every(({ sample }) =>
+                Number.isFinite(observedTime(sample)),
+              ) &&
+              latestPair.length === 2 &&
+              observedTime(latestPair[0].sample) <
+                observedTime(latestPair[1].sample) &&
+              (entries.length < 3 ||
+                observedTime(entries[entries.length - 3].sample) <
+                  observedTime(latestPair[0].sample));
+            const timeLabel = (sample: RecommendationTrendSample) => {
+              const time = observedTime(sample);
+              return Number.isFinite(time)
+                ? date.format(time)
+                : t("timeUnknown");
+            };
             return (
               <section key={key} aria-label={input.question}>
                 <h4 style={{ overflowWrap: "anywhere" }}>{input.question}</h4>
@@ -129,6 +190,84 @@ export function RecommendationTrend({
                   })}
                 </p>
                 {entries.length === 1 && <p>{t("singleSample")}</p>}
+                {focusEntities.length > 0 && (
+                  <section aria-label={t("focusChanges")}>
+                    <h5>{t("focusChanges")}</h5>
+                    <p>{t("focusDescription")}</p>
+                    {focusEntities.map((entity) => {
+                      const states = latestPair.map((entry) =>
+                        entityState(entry, entity.id),
+                      );
+                      const previousRank = states[0]?.rank;
+                      const latestRank = states[1]?.rank;
+                      const change =
+                        previousRank !== undefined && latestRank !== undefined
+                          ? previousRank - latestRank
+                          : null;
+                      return (
+                        <section
+                          key={entity.id ?? entity.name}
+                          aria-label={
+                            entity.kind
+                              ? `${entity.name} · ${t(`kind_${entity.kind}`)}`
+                              : entity.name
+                          }
+                        >
+                          <h5 style={{ overflowWrap: "anywhere" }}>
+                            {entity.name}
+                            {entity.kind && <> · {t(`kind_${entity.kind}`)}</>}
+                          </h5>
+                          {entries.length < 2 ? (
+                            <p>{t("singleSample")}</p>
+                          ) : !chronologyKnown ? (
+                            <p>{t("chronologyUnknown")}</p>
+                          ) : (
+                            <>
+                              {latestPair.map(({ sample }, index) => (
+                                <p key={sample.sampleId}>
+                                  {t(
+                                    index === 0
+                                      ? "previousSample"
+                                      : "latestSample",
+                                  )}{" "}
+                                  <a
+                                    href={sample.recordHref}
+                                    aria-label={`${t("viewRecord")} · ${timeLabel(sample)}`}
+                                  >
+                                    {timeLabel(sample)}
+                                  </a>
+                                  {" · "}
+                                  <span>
+                                    {t(states[index].label, {
+                                      value:
+                                        states[index].rank === undefined
+                                          ? undefined
+                                          : number.format(states[index].rank),
+                                    })}
+                                  </span>
+                                </p>
+                              ))}
+                              <p>
+                                {change === null
+                                  ? t("rankNotComparable")
+                                  : t(
+                                      change > 0
+                                        ? "improved"
+                                        : change < 0
+                                          ? "declined"
+                                          : "unchanged",
+                                      {
+                                        value: number.format(Math.abs(change)),
+                                      },
+                                    )}
+                              </p>
+                            </>
+                          )}
+                        </section>
+                      );
+                    })}
+                  </section>
+                )}
                 <div style={{ overflowX: "auto" }}>
                   <Table
                     aria-label={input.question}
@@ -142,17 +281,14 @@ export function RecommendationTrend({
                           {t("entity")}
                         </TableHeaderCell>
                         {entries.map(({ sample, items }) => {
-                          const time = Date.parse(sample.observedAt);
-                          const timeLabel = Number.isFinite(time)
-                            ? date.format(time)
-                            : t("timeUnknown");
+                          const label = timeLabel(sample);
                           return (
                             <TableHeaderCell key={sample.sampleId} scope="col">
                               <a
                                 href={sample.recordHref}
-                                aria-label={`${t("viewRecord")} · ${timeLabel}`}
+                                aria-label={`${t("viewRecord")} · ${label}`}
                               >
-                                {timeLabel}
+                                {label}
                               </a>
                               {items === null && (
                                 <p>
@@ -170,10 +306,22 @@ export function RecommendationTrend({
                     </TableHeader>
                     <TableBody>
                       {[...entities].map(([entityId, entity]) => (
-                        <TableRow key={entityId}>
+                        <TableRow
+                          key={entityId}
+                          style={
+                            isMeasurementFocus(entity.name, focusNames)
+                              ? {
+                                  backgroundColor: tokens.colorBrandBackground2,
+                                }
+                              : undefined
+                          }
+                        >
                           <TableCell style={{ overflowWrap: "anywhere" }}>
                             <div>{entity.name}</div>
                             <small>{t(`kind_${entity.kind}`)}</small>
+                            {isMeasurementFocus(entity.name, focusNames) && (
+                              <div>{t("tracked")}</div>
+                            )}
                           </TableCell>
                           {entries.map(({ sample, items }) => {
                             const matches = items?.filter(
