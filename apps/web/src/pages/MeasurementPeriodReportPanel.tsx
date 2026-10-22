@@ -392,6 +392,18 @@ export function MeasurementPeriodReportPanel({
               </Button>
             )}
             {!report.samples.length && <p>{t("empty")}</p>}
+            {recommendations.length > 0 && (
+              <details
+                className="measurement-report-evidence"
+                open={Boolean(questionSet) || focusNames.length > 0}
+              >
+                <summary>{t("compareMeasurements")}</summary>
+                <RecommendationTrend
+                  samples={recommendations}
+                  focusNames={focusNames}
+                />
+              </details>
+            )}
             {available.map((sample) => (
               <Card
                 className="report-panel measurement-report-sample"
@@ -554,15 +566,6 @@ export function MeasurementPeriodReportPanel({
                     </li>
                   ))}
                 </ul>
-              </details>
-            )}
-            {recommendations.length > 0 && (
-              <details
-                className="measurement-report-evidence"
-                open={Boolean(questionSet)}
-              >
-                <summary>{t("compareMeasurements")}</summary>
-                <RecommendationTrend samples={recommendations} />
               </details>
             )}
             <MeasurementReportSearchSection

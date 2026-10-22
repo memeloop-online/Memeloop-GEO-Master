@@ -317,9 +317,14 @@ describe("cycle-free measurement report", () => {
     expect(
       within(table).queryByText("javascript:alert(1)"),
     ).not.toBeInTheDocument();
+    expect(screen.getByText("对比历次推荐排名").parentElement).toHaveAttribute(
+      "open",
+    );
+    const comparison = screen.getByText("对比历次推荐排名").parentElement!;
     expect(
-      screen.getByText("对比历次推荐排名").parentElement,
-    ).not.toHaveAttribute("open");
+      comparison.compareDocumentPosition(table) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   it("does not display unverified entities as recommendations", async () => {
@@ -689,8 +694,10 @@ describe("cycle-free measurement report", () => {
     expect(screen.getByText("analysis-model")).toBeInTheDocument();
     expect(screen.getByText("analysis-revision")).toBeInTheDocument();
     expect(
-      screen.getAllByRole("heading", { name: "Which lamp suits camping?" })[0],
-    ).toBeVisible();
+      screen
+        .getAllByRole("heading", { name: "Which lamp suits camping?" })
+        .some((heading) => !heading.closest("details:not([open])")),
+    ).toBe(true);
     expect(
       screen.queryByRole("heading", {
         name: preview.samples[0].comparison_key,
