@@ -41,6 +41,12 @@
   min-width: 90px;
 }
 
+.measurement-report-recommendations th:nth-child(3),
+.measurement-report-recommendations td:nth-child(3) {
+  min-width: 260px;
+  text-align: left;
+}
+
 .measurement-report-recommendations a {
   display: block;
   overflow-wrap: anywhere;
