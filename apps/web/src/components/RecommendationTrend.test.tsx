@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup,
   fireEvent,
@@ -12,8 +12,12 @@ import {
 } from "./RecommendationTrend";
 import i18n from "../i18n";
 import userEvent from "@testing-library/user-event";
+import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 beforeEach(async () => {
   await i18n.changeLanguage("zh-CN");
 });
@@ -422,14 +426,28 @@ describe("recommendation rank history", () => {
   });
 
   it("keeps matching and measurement context collapsed with keyboard reachable records and disclosures", async () => {
+    // Fluent Card activates Tabster, which treats jsdom's zero-size body as hidden.
+    vi.spyOn(document.body, "getBoundingClientRect").mockReturnValue(
+      new DOMRect(0, 0, 390, 844),
+    );
+    vi.spyOn(HTMLElement.prototype, "offsetParent", "get").mockImplementation(
+      function (this: HTMLElement) {
+        const closed = this.closest("details:not([open])");
+        return closed && this !== closed.querySelector("summary")
+          ? null
+          : this.parentElement;
+      },
+    );
     const user = userEvent.setup();
     const first = datedSample("first", 1);
     const latest = datedSample("latest", 2);
     render(
-      <RecommendationTrend
-        samples={[first, latest]}
-        focusNames={[item.name]}
-      />,
+      <FluentProvider theme={webLightTheme}>
+        <RecommendationTrend
+          samples={[first, latest]}
+          focusNames={[item.name]}
+        />
+      </FluentProvider>,
     );
     expect(
       screen.getByText("平台：sample-provider · 模型：sample-model"),

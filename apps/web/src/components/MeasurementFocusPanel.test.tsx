@@ -11,6 +11,9 @@ import { ApiError } from "../api/client";
 import i18n from "../i18n";
 
 const state = vi.hoisted(() => ({
+  hasData: true,
+  isPending: false,
+  isError: false,
   data: {
     revision: 7,
     settings: {
@@ -25,9 +28,9 @@ const state = vi.hoisted(() => ({
 
 vi.mock("../api/projects", () => ({
   useProjectQuery: () => ({
-    data: state.data,
-    isPending: false,
-    isError: false,
+    data: state.hasData ? state.data : undefined,
+    isPending: state.isPending,
+    isError: state.isError,
     refetch: state.refetch,
   }),
   useUpdateProjectMutation: () => ({
@@ -38,6 +41,9 @@ vi.mock("../api/projects", () => ({
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  state.hasData = true;
+  state.isPending = false;
+  state.isError = false;
   state.mutateAsync.mockResolvedValue({});
   state.data = {
     revision: 7,
@@ -62,6 +68,36 @@ function renderPanel(canWrite = true) {
 }
 
 describe("measurement focus panel", () => {
+  it.each(["loading", "failed"])(
+    "does not present an unread target as unset in compact mode: %s",
+    (status) => {
+      state.hasData = false;
+      state.isPending = status === "loading";
+      state.isError = status === "failed";
+      render(
+        <MeasurementFocusPanel
+          tenantId="tenant"
+          projectId="project"
+          canWrite
+          compact
+        />,
+      );
+      expect(
+        screen.getByText(
+          status === "loading" ? "正在读取关注对象…" : "暂时无法读取关注对象",
+        ),
+      ).toBeVisible();
+      expect(screen.queryByText("未设置")).not.toBeInTheDocument();
+      expect(
+        screen.queryByText("也可以不设置，直接测量任何问题。"),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "设置关注对象" }),
+      ).not.toBeInTheDocument();
+      if (status === "failed")
+        expect(screen.getByRole("button", { name: "重试" })).toBeVisible();
+    },
+  );
   it("shows the saved product and competitors without an initial form", () => {
     renderPanel();
     expect(screen.getByText("Example X")).toBeVisible();

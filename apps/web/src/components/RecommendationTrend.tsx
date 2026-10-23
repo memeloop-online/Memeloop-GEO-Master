@@ -1,10 +1,13 @@
 import {
+  Badge,
+  Card,
   Table,
   TableBody,
   TableCell,
   TableHeader,
   TableHeaderCell,
   TableRow,
+  Text,
   tokens,
 } from "@fluentui/react-components";
 import { useTranslation } from "react-i18next";
@@ -15,6 +18,7 @@ import {
   type RecommendationItem,
 } from "../api/recommendations";
 import "../i18n/recommendationTrend";
+import "./RecommendationTrend.css";
 
 type FullMeasurementInput = Extract<ChannelTargetInput, { kind: "measure" }>;
 type MeasurementInput = Omit<
@@ -82,9 +86,11 @@ function entityState(entry: TrendEntry, entityId: string | undefined) {
 export function RecommendationTrend({
   samples,
   focusNames = [],
+  embedded = false,
 }: {
   samples: readonly RecommendationTrendSample[];
   focusNames?: readonly string[];
+  embedded?: boolean;
 }) {
   const { t, i18n } = useTranslation("recommendationTrend");
   const number = new Intl.NumberFormat(i18n.resolvedLanguage || i18n.language);
@@ -101,8 +107,8 @@ export function RecommendationTrend({
   }
 
   return (
-    <section aria-label={t("title")}>
-      <h3>{t("title")}</h3>
+    <section className="recommendation-trend" aria-label={t("title")}>
+      {!embedded && <h3>{t("title")}</h3>}
       {!samples.length ? (
         <p>{t("empty")}</p>
       ) : (
@@ -163,17 +169,23 @@ export function RecommendationTrend({
                 : t("timeUnknown");
             };
             return (
-              <section key={key} aria-label={input.question}>
-                <h4 style={{ overflowWrap: "anywhere" }}>{input.question}</h4>
-                <p>
+              <Card
+                key={key}
+                className="recommendation-trend-group"
+                role="region"
+                aria-label={input.question}
+              >
+                <h4 className="recommendation-trend-question">
+                  {input.question}
+                </h4>
+                <Text size={200} className="recommendation-trend-secondary">
                   {t("providerModel", {
                     provider: input.provider,
                     model: input.model,
                   })}
-                </p>
+                </Text>
                 {focusEntities.length > 0 && (
                   <section aria-label={t("focusChanges")}>
-                    <h5>{t("focusChanges")}</h5>
                     {focusEntities.map((entity) => {
                       const states = latestPair.map((entry) =>
                         entityState(entry, entity.id),
@@ -189,6 +201,7 @@ export function RecommendationTrend({
                           : null;
                       return (
                         <section
+                          className="recommendation-trend-focus"
                           key={entity.id ?? entity.name}
                           aria-label={
                             entity.kind
@@ -196,52 +209,92 @@ export function RecommendationTrend({
                               : entity.name
                           }
                         >
-                          <h5 style={{ overflowWrap: "anywhere" }}>
+                          <Text
+                            weight="semibold"
+                            className="recommendation-trend-entity"
+                          >
                             {entity.name}
-                            {entity.kind && <> · {t(`kind_${entity.kind}`)}</>}
-                          </h5>
+                            {entity.kind && (
+                              <Text
+                                size={200}
+                                className="recommendation-trend-secondary"
+                              >
+                                {" "}
+                                · {t(`kind_${entity.kind}`)}
+                              </Text>
+                            )}
+                          </Text>
                           {entries.length > 1 && !chronologyKnown ? (
                             <p>{t("chronologyUnknown")}</p>
                           ) : (
                             <>
-                              <p>
-                                {t("latestSample")}{" "}
-                                <strong>
+                              <Text
+                                size={200}
+                                className="recommendation-trend-secondary"
+                              >
+                                {t("latestSample")}
+                              </Text>
+                              <div className="recommendation-trend-rank-line">
+                                <Text
+                                  as="strong"
+                                  size={latestRank === undefined ? 500 : 800}
+                                  weight="semibold"
+                                  className="recommendation-trend-rank"
+                                >
                                   {t(latestState.label, {
                                     value:
                                       latestRank === undefined
                                         ? undefined
                                         : number.format(latestRank),
                                   })}
-                                </strong>
-                                {" · "}
+                                </Text>
+                                {entries.length > 1 && change !== null && (
+                                  <Badge
+                                    appearance="tint"
+                                    color={
+                                      change > 0
+                                        ? "success"
+                                        : change < 0
+                                          ? "danger"
+                                          : "informative"
+                                    }
+                                    className="recommendation-trend-delta"
+                                  >
+                                    {t(
+                                      change > 0
+                                        ? "improved"
+                                        : change < 0
+                                          ? "declined"
+                                          : "unchanged",
+                                      {
+                                        value: number.format(Math.abs(change)),
+                                      },
+                                    )}
+                                  </Badge>
+                                )}
+                              </div>
+                              <div className="recommendation-trend-date">
                                 <a
                                   href={latest.sample.recordHref}
                                   aria-label={`${t("viewRecord")} · ${timeLabel(latest.sample)}`}
                                 >
                                   {timeLabel(latest.sample)}
                                 </a>
-                              </p>
-                              <p>
-                                {entries.length === 1
-                                  ? t("noPreviousSample")
-                                  : change === null
-                                    ? t("rankNotComparable")
-                                    : t(
-                                        change > 0
-                                          ? "improved"
-                                          : change < 0
-                                            ? "declined"
-                                            : "unchanged",
-                                        {
-                                          value: number.format(
-                                            Math.abs(change),
-                                          ),
-                                        },
-                                      )}
-                              </p>
+                              </div>
+                              {(entries.length === 1 || change === null) && (
+                                <Text
+                                  size={200}
+                                  className="recommendation-trend-secondary"
+                                >
+                                  {t(
+                                    entries.length === 1
+                                      ? "noPreviousSample"
+                                      : "rankNotComparable",
+                                  )}
+                                </Text>
+                              )}
                               {latestPair.length === 2 && (
-                                <p>
+                                <div className="recommendation-trend-previous">
                                   {t("previousSample")}{" "}
                                   <span>
                                     {t(states[0].label, {
@@ -258,7 +311,7 @@ export function RecommendationTrend({
                                   >
                                     {timeLabel(latestPair[0].sample)}
                                   </a>
-                                </p>
+                                </div>
                               )}
                             </>
                           )}
@@ -267,14 +320,14 @@ export function RecommendationTrend({
                     })}
                   </section>
                 )}
-                <p>
+                <Text size={200} className="recommendation-trend-secondary">
                   {t("samples", {
                     available: number.format(
                       entries.filter((entry) => entry.items !== null).length,
                     ),
                     total: number.format(entries.length),
                   })}
-                </p>
+                </Text>
                 {entries.length === 1 && focusEntities.length === 0 && (
                   <p>{t("singleSample")}</p>
                 )}
@@ -410,7 +463,7 @@ export function RecommendationTrend({
                       <p>{t("noEntities")}</p>
                     )}
                 </details>
-              </section>
+              </Card>
             );
           })}
         </>

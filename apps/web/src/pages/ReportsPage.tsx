@@ -565,10 +565,18 @@ function ReportListPage({
     <div className="workbench-page reports-page">
       <section className="page-hero">
         <div>
-          <p className="eyebrow">效果报告</p>
           <h1>{t("pageTitle")}</h1>
           <p>{t("pageDescription")}</p>
         </div>
+      </section>
+      <MeasurementPeriodReportPanel
+        key={`${tenantId}/${projectId}`}
+        tenantId={tenantId}
+        projectId={projectId}
+        embedded
+      />
+      <details className="measurement-report-evidence">
+        <summary>{t("cycleReports")}</summary>
         <Button
           icon={<ArrowSyncRegular />}
           disabled={query.isFetching}
@@ -576,14 +584,6 @@ function ReportListPage({
         >
           刷新列表
         </Button>
-      </section>
-      <MeasurementPeriodReportPanel
-        key={`${tenantId}/${projectId}`}
-        tenantId={tenantId}
-        projectId={projectId}
-      />
-      <details className="measurement-report-evidence">
-        <summary>{t("cycleReports")}</summary>
         {cycle.isPending ? (
           <LoadingState label="正在读取当前周期" compact />
         ) : cycle.isError ? (

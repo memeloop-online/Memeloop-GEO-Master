@@ -51,12 +51,14 @@ export function MeasurementPeriodReportPanel({
   questionSet,
   selectedReportId,
   onSelectReport,
+  embedded = false,
 }: {
   tenantId: string;
   projectId: string;
   questionSet?: MeasurementReportQuestionSet;
   selectedReportId?: string;
   onSelectReport?: (reportId: string | undefined) => void;
+  embedded?: boolean;
 }) {
   const { session } = useAuth();
   const navigate = useNavigate();
@@ -308,9 +310,30 @@ export function MeasurementPeriodReportPanel({
       )}
     </div>
   );
+  const questionSelector = (
+    <Field label={t("questionFilter")}>
+      <select
+        className="measurement-report-select"
+        aria-label={t("questionFilter")}
+        value={activeQuestion}
+        onChange={(event) => setQuestionFilter(event.target.value)}
+      >
+        <option value="">{t("allQuestions")}</option>
+        {activeQuestion && !questions.includes(activeQuestion) && (
+          <option value={activeQuestion}>{activeQuestion}</option>
+        )}
+        {questions.map((question) => (
+          <option key={question} value={question}>
+            {question}
+          </option>
+        ))}
+      </select>
+    </Field>
+  );
   const reportDetails = (
     <details className="measurement-report-evidence measurement-report-details">
       <summary>{t("reportDetails")}</summary>
+      {questions.length === 1 && questionSelector}
       {scopedReport && (
         <>
           <h3>
@@ -479,15 +502,20 @@ export function MeasurementPeriodReportPanel({
   );
   return (
     <section
-      className="report-section"
+      className="report-section measurement-period-report"
       aria-label={t(questionSet ? "questionSetTitle" : "title")}
     >
-      <h2>{t(questionSet ? "questionSetTitle" : "title")}</h2>
-      <p>{t(questionSet ? "questionSetDescription" : "description")}</p>
+      {!embedded && (
+        <>
+          <h2>{t(questionSet ? "questionSetTitle" : "title")}</h2>
+          <p>{t(questionSet ? "questionSetDescription" : "description")}</p>
+        </>
+      )}
       <MeasurementFocusPanel
         tenantId={tenantId}
         projectId={projectId}
         canWrite={Boolean(canWrite)}
+        compact
       />
       {current.isPending ? (
         <p role="status">{t("loading")}</p>
@@ -500,30 +528,12 @@ export function MeasurementPeriodReportPanel({
       ) : (
         report && (
           <>
-            {questions.length > 0 && (
-              <Field label={t("questionFilter")} hint={t("latestFirst")}>
-                <select
-                  className="measurement-report-select"
-                  aria-label={t("questionFilter")}
-                  value={activeQuestion}
-                  onChange={(event) => setQuestionFilter(event.target.value)}
-                >
-                  <option value="">{t("allQuestions")}</option>
-                  {activeQuestion && !questions.includes(activeQuestion) && (
-                    <option value={activeQuestion}>{activeQuestion}</option>
-                  )}
-                  {questions.map((question) => (
-                    <option key={question} value={question}>
-                      {question}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-            )}
+            {questions.length > 1 && questionSelector}
             {recommendations.length > 0 && (
               <RecommendationTrend
                 samples={recommendations}
                 focusNames={focusNames}
+                embedded
               />
             )}
           </>

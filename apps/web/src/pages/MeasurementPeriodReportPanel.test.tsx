@@ -426,7 +426,7 @@ describe("cycle-free measurement report", () => {
     },
   );
   it.each(["zh-CN", "en"])(
-    "shows focus, question selection and rankings before collapsed report management in %s",
+    "shows focus and rankings before collapsed report management and single-question filtering in %s",
     async (language) => {
       await i18n.changeLanguage(language);
       focus.name = "Trail light";
@@ -434,10 +434,7 @@ describe("cycle-free measurement report", () => {
       const focusPanel = screen.getByLabelText(
         language === "en" ? "Tracked product or brand" : "关注对象",
       );
-      const question = await screen.findByRole("combobox", {
-        name: language === "en" ? "AI measurement question" : "AI 测量问题",
-      });
-      const trend = screen.getByRole("region", {
+      const trend = await screen.findByRole("region", {
         name:
           language === "en" ? "Recommendation rank history" : "推荐排名变化",
       });
@@ -451,8 +448,7 @@ describe("cycle-free measurement report", () => {
         })
         .find((heading) => heading.closest(".measurement-report-sample"))!;
       for (const [before, after] of [
-        [focusPanel, question],
-        [question, trend],
+        [focusPanel, trend],
         [trend, details],
         [details, sample],
       ])
@@ -473,6 +469,11 @@ describe("cycle-free measurement report", () => {
         : ["保存此范围的报告", "用 AI 分析这份报告"])
         expect(screen.getByRole("button", { name })).toBeVisible();
       await openReportDetails(language);
+      expect(
+        screen.getByRole("combobox", {
+          name: language === "en" ? "AI measurement question" : "AI 测量问题",
+        }),
+      ).toBeVisible();
       expect(
         screen.getByRole("combobox", {
           name: language === "en" ? "Report period" : "报告时间",
