@@ -852,7 +852,7 @@ describe("standalone arbitrary-topic measurement", () => {
     expect(getChannelTarget).toHaveBeenCalledTimes(1);
   });
   it.each(["record", "planId"])(
-    "opens a %s deep link with history collapsed and the answer visible",
+    "opens a %s deep link independently and reads history only when expanded",
     async (parameter) => {
       const savedPlan = { ...plan, targets: [target] };
       vi.mocked(listMeasurementPlans).mockResolvedValue({
@@ -897,6 +897,21 @@ describe("standalone arbitrary-topic measurement", () => {
       expect(
         screen.queryByRole("button", { name: /自定义问题测量|如何观察流星雨/ }),
       ).not.toBeInTheDocument();
+      expect(getMeasurementPlan).toHaveBeenCalledWith(
+        "tenant-1",
+        "project-1",
+        "measurement-1",
+      );
+      expect(listMeasurementPlans).not.toHaveBeenCalled();
+      expect(listAllQuestionSets).not.toHaveBeenCalled();
+      expect(listAllQuestionSetVersions).not.toHaveBeenCalled();
+
+      await userEvent.click(screen.getByRole("button", { name: "测量历史" }));
+      await waitFor(() => {
+        expect(listMeasurementPlans).toHaveBeenCalledOnce();
+        expect(listAllQuestionSets).toHaveBeenCalledOnce();
+      });
+      expect(screen.getByText("可在晴朗夜晚观测")).toBeVisible();
     },
   );
 
