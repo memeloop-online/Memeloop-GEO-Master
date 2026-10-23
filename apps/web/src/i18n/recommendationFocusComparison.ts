@@ -2,6 +2,8 @@ import i18n from "./index";
 
 const translations = {
   "zh-CN": {
+    analyzeImprovements: "分析改进方向",
+    selectionUnavailable: "暂无法定位这条推荐的已保存证据，请刷新后重试。",
     title: "关注对象与同类推荐",
     scope: "查看本次回答中的推荐理由与原文依据。",
     recommendedTitle: "本次回答推荐了什么",
@@ -25,6 +27,9 @@ const translations = {
     kind_other: "其他对象",
   },
   en: {
+    analyzeImprovements: "Explore improvements",
+    selectionUnavailable:
+      "This recommendation's saved evidence cannot be located. Refresh and try again.",
     title: "Tracked item and similar recommendations",
     scope:
       "Review recommendation reasons and supporting excerpts from this answer.",

@@ -49,6 +49,8 @@ import {
   MeasurementReportDraftBridge,
   measurementReportReference,
   measurementQuestionTargetReference,
+  measurementRecommendationReference,
+  type MeasurementRecommendationReference,
 } from "../components/MeasurementReportDraftBridge";
 import { useAppearance } from "../appearance/AppearanceProvider";
 import { formatUiDate } from "../i18n";
@@ -226,6 +228,7 @@ function AgentChat({
   onFirstMessage,
   measurementReportId,
   measurementQuestionTargetId,
+  measurementRecommendation,
 }: {
   conversation: AgentConversationDetail;
   tenantId: string;
@@ -234,6 +237,7 @@ function AgentChat({
   onFirstMessage?: (conversationId: string) => void;
   measurementReportId?: string;
   measurementQuestionTargetId?: string;
+  measurementRecommendation?: MeasurementRecommendationReference;
 }) {
   const { t } = useTranslation();
   const { appearance } = useAppearance();
@@ -646,9 +650,10 @@ function AgentChat({
             composerToolbar={
               measurementReportId ? (
                 <MeasurementReportDraftBridge
-                  key={`${measurementReportId}:${measurementQuestionTargetId ?? ""}`}
+                  key={`${measurementReportId}:${measurementQuestionTargetId ?? ""}:${measurementRecommendation?.attemptId ?? ""}:${measurementRecommendation?.kind ?? ""}:${measurementRecommendation?.mentionOrder ?? ""}`}
                   reportId={measurementReportId}
                   questionTargetId={measurementQuestionTargetId}
+                  recommendation={measurementRecommendation}
                 />
               ) : undefined
             }
@@ -712,6 +717,7 @@ export function AgentWorkbenchPage() {
   const measurementReportId = measurementReportReference(search);
   const measurementQuestionTargetId =
     measurementQuestionTargetReference(search);
+  const measurementRecommendation = measurementRecommendationReference(search);
   const navigate = useNavigate();
   const conversations = useAgentConversationsQuery(tenantId, projectId);
   const conversation = useAgentConversationQuery(
@@ -793,6 +799,7 @@ export function AgentWorkbenchPage() {
               onRefresh={refresh}
               measurementReportId={measurementReportId}
               measurementQuestionTargetId={measurementQuestionTargetId}
+              measurementRecommendation={measurementRecommendation}
               onFirstMessage={(id) => {
                 void refetchConversations();
                 navigate(`${base}/${encodeURIComponent(id)}`, {

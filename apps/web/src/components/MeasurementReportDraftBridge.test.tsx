@@ -6,6 +6,7 @@ import {
   MeasurementReportDraftBridge,
   measurementReportReference,
   measurementQuestionTargetReference,
+  measurementRecommendationReference,
 } from "./MeasurementReportDraftBridge";
 
 const native = vi.hoisted(() => ({
@@ -20,6 +21,7 @@ vi.mock("@memeloop/react-ui/chat", () => ({
 
 const reportId = "11111111-2222-4333-8444-555555555555";
 const questionTargetId = "66666666-7777-4888-8999-000000000000";
+const attemptId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 
 afterEach(async () => {
   cleanup();
@@ -28,6 +30,31 @@ afterEach(async () => {
 });
 
 describe("measurement report draft reference", () => {
+  it("keeps the exact sample, attempt and occurrence pointer and rejects incomplete pointers", () => {
+    const base = `?measurementReport=${reportId}&measurementQuestionTarget=${questionTargetId}`;
+    const occurrence = `&measurementAttempt=${attemptId}&measurementRecommendationKind=product&measurementRecommendationOrder=3`;
+    expect(measurementRecommendationReference(base + occurrence)).toEqual({
+      attemptId,
+      kind: "product",
+      mentionOrder: 3,
+    });
+    expect(
+      measurementRecommendationReference(
+        base + occurrence.replace(attemptId, "none"),
+      ),
+    ).toEqual({ attemptId: null, kind: "product", mentionOrder: 3 });
+    for (const search of [
+      `?measurementReport=${reportId}${occurrence}`,
+      `${base}&measurementRecommendationOrder=3`,
+      base + occurrence.replace(attemptId, "invalid"),
+      base + occurrence.replace("Kind=product", "Kind=unknown"),
+      base + occurrence.replace("Order=3", "Order=0"),
+      base + occurrence.replace("Order=3", "Order=1.5"),
+    ]) {
+      expect(measurementReportReference(search)).toBeUndefined();
+      expect(measurementRecommendationReference(search)).toBeUndefined();
+    }
+  });
   it("accepts a question sample UUID only with a valid report and never widens an invalid selected scope", () => {
     const search = `?measurementReport=${reportId}&measurementQuestionTarget=${questionTargetId}`;
     expect(measurementReportReference(search)).toBe(reportId);
@@ -65,6 +92,45 @@ describe("measurement report draft reference", () => {
 
 describe("native measurement report draft bridge", () => {
   it.each(["zh-CN", "en"])(
+    "keeps a concise editable request with the exact saved occurrence in %s",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      native.getState.mockReturnValue({ text: "" });
+      render(
+        <MeasurementReportDraftBridge
+          reportId={reportId}
+          questionTargetId={questionTargetId}
+          recommendation={{ attemptId, kind: "product", mentionOrder: 3 }}
+        />,
+      );
+      const draft = native.setText.mock.calls[0][0] as string;
+      for (const value of [
+        reportId,
+        `target_id=${questionTargetId}`,
+        `attempt_id=${attemptId}`,
+        "kind=product",
+        "mention_order=3",
+      ])
+        expect(draft).toContain(value);
+      expect(draft).toContain(
+        language === "en"
+          ? "Separate evidence from hypotheses"
+          : "区分证据与假设",
+      );
+      expect(draft).toContain(
+        language === "en" ? "unread linked pages" : "未读取的引用页面",
+      );
+      expect(draft).toContain(
+        language === "en" ? "its use is restricted" : "使用受限时说明",
+      );
+      expect(draft).not.toMatch(
+        /report\.get|question_binding|frozen_evaluation|evidence_quote/,
+      );
+      if (language === "zh-CN") expect(draft.length).toBeLessThanOrEqual(500);
+      expect(native.send).not.toHaveBeenCalled();
+    },
+  );
+  it.each(["zh-CN", "en"])(
     "keeps the report and selected question sample separate in an editable %s draft",
     async (language) => {
       await i18n.changeLanguage(language);
@@ -97,7 +163,7 @@ describe("native measurement report draft bridge", () => {
     );
     expect(native.setText).toHaveBeenCalledTimes(1);
     expect(native.setText).toHaveBeenCalledWith(
-      expect.stringContaining(`独立测量报告（编号：${reportId}）`),
+      i18n.t("measurementReportChat:request", { reportId }),
     );
     rerender(
       <StrictMode>
@@ -120,6 +186,7 @@ describe("native measurement report draft bridge", () => {
         <MeasurementReportDraftBridge
           reportId={reportId}
           questionTargetId={questionTargetId}
+          recommendation={{ attemptId, kind: "product", mentionOrder: 3 }}
         />,
       );
       native.getState.mockReturnValue({ text: "" });
@@ -127,6 +194,7 @@ describe("native measurement report draft bridge", () => {
         <MeasurementReportDraftBridge
           reportId={reportId}
           questionTargetId={questionTargetId}
+          recommendation={{ attemptId, kind: "product", mentionOrder: 3 }}
         />,
       );
       expect(native.setText).not.toHaveBeenCalled();

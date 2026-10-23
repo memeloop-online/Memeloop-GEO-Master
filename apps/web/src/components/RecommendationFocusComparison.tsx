@@ -1,4 +1,4 @@
-import { Badge, Card, tokens } from "@fluentui/react-components";
+import { Badge, Button, Card, tokens } from "@fluentui/react-components";
 import { useTranslation } from "react-i18next";
 import { isMeasurementFocus } from "../api/measurementFocus";
 import type { RecommendationItem } from "../api/recommendations";
@@ -9,10 +9,14 @@ function RecommendationCard({
   item,
   focused = false,
   showKind = false,
+  onAnalyze,
+  analysisPending,
 }: {
   item: RecommendationItem;
   focused?: boolean;
   showKind?: boolean;
+  onAnalyze?: (item: RecommendationItem) => void;
+  analysisPending?: boolean;
 }) {
   const { t } = useTranslation("recommendationFocusComparison");
   const urls = [
@@ -65,6 +69,11 @@ function RecommendationCard({
           </ul>
         )}
       </details>
+      {onAnalyze && (
+        <Button disabled={analysisPending} onClick={() => onAnalyze(item)}>
+          {t("analyzeImprovements")}
+        </Button>
+      )}
     </Card>
   );
 }
@@ -73,9 +82,13 @@ function RecommendationCard({
 export function RecommendationFocusComparison({
   items,
   focusNames,
+  onAnalyze,
+  analysisPending,
 }: {
   items: RecommendationItem[];
   focusNames: readonly string[];
+  onAnalyze?: (item: RecommendationItem) => void;
+  analysisPending?: boolean;
 }) {
   const { t } = useTranslation("recommendationFocusComparison");
   const focusGroups = new Map<string, RecommendationItem[]>();
@@ -98,7 +111,13 @@ export function RecommendationFocusComparison({
         {[...items]
           .sort((left, right) => left.mention_order - right.mention_order)
           .map((item, index) => (
-            <RecommendationCard key={index} item={item} showKind />
+            <RecommendationCard
+              key={index}
+              item={item}
+              showKind
+              onAnalyze={onAnalyze}
+              analysisPending={analysisPending}
+            />
           ))}
       </section>
     );
@@ -143,7 +162,13 @@ export function RecommendationFocusComparison({
               })}
             </h6>
             {matches.map((item, index) => (
-              <RecommendationCard key={index} item={item} focused />
+              <RecommendationCard
+                key={index}
+                item={item}
+                focused
+                onAnalyze={onAnalyze}
+                analysisPending={analysisPending}
+              />
             ))}
             {ambiguous ? (
               <p style={{ margin: 0 }}>{t("ambiguous")}</p>
@@ -155,7 +180,12 @@ export function RecommendationFocusComparison({
                   {t("ahead")}
                 </h6>
                 {ahead.map((item, index) => (
-                  <RecommendationCard key={index} item={item} />
+                  <RecommendationCard
+                    key={index}
+                    item={item}
+                    onAnalyze={onAnalyze}
+                    analysisPending={analysisPending}
+                  />
                 ))}
               </>
             ) : (

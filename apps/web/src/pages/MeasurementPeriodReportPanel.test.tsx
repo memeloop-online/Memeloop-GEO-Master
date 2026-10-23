@@ -167,6 +167,248 @@ afterEach(async () => {
   await i18n.changeLanguage("zh-CN");
 });
 describe("cycle-free measurement report", () => {
+  it.each([
+    { alreadySaved: false, failedStart: "none", next: "recommendation" },
+    { alreadySaved: true, failedStart: "none", next: "recommendation" },
+    { alreadySaved: false, failedStart: "card", next: "recommendation" },
+    { alreadySaved: false, failedStart: "report", next: "recommendation" },
+    { alreadySaved: false, failedStart: "card", next: "whole-report" },
+    { alreadySaved: false, failedStart: "card", next: "question" },
+  ])(
+    "opens the selected scope: saved=$alreadySaved, prior failure=$failedStart, next=$next",
+    async ({ alreadySaved, failedStart, next }) => {
+      focus.name = "Example target";
+      const attemptId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      const selectedAttemptId = alreadySaved
+        ? "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+        : attemptId;
+      const sampleTargetId = alreadySaved ? selectedTargetId : otherTargetId;
+      const reportId = "11111111-2222-4333-8444-555555555555";
+      const sample = (targetId: string, reason: string) => ({
+        ...preview.samples[0],
+        target_id: targetId,
+        attempt_id: attemptId,
+        recommendations: {
+          version: "geo.recommendations.v1",
+          status: "verified",
+          items: [
+            {
+              name: focus.name,
+              kind: "product",
+              mention_order: 3,
+              rank: 2,
+              reason,
+              evidence_quote: reason,
+              citation_urls: ["https://example.test/source"],
+            },
+          ],
+        },
+      });
+      const input = {
+        ...preview,
+        samples: [
+          sample(selectedTargetId, "Earlier saved reason."),
+          {
+            ...sample(sampleTargetId, "Selected saved reason."),
+            attempt_id: selectedAttemptId,
+          },
+        ],
+      };
+      const result = {
+        ...saved,
+        ...input,
+        kind: "measurement_period" as const,
+        report_id: reportId,
+      };
+      const { save, detail, load } = setup(input, alreadySaved ? [result] : []);
+      save.mockResolvedValue(result);
+      detail.mockResolvedValue(result);
+      if (failedStart !== "none") {
+        save.mockRejectedValueOnce(new Error("Unconfirmed save"));
+        if (failedStart === "card") {
+          const cards = await screen.findAllByRole("article", {
+            name: focus.name,
+          });
+          const first = cards.find((element) =>
+            element.textContent?.includes("Earlier saved reason."),
+          )!;
+          await userEvent.click(
+            within(first).getByRole("button", { name: "分析改进方向" }),
+          );
+        } else
+          await userEvent.click(
+            await screen.findByRole("button", { name: "用 AI 分析这份报告" }),
+          );
+        await screen.findByRole("alert");
+        load.mockResolvedValue({
+          ...input,
+          report_window_end_at: "2026-10-09T00:00:00Z",
+        });
+        await userEvent.click(
+          screen.getByRole("button", { name: "刷新测量报告" }),
+        );
+        await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
+      }
+      if (alreadySaved) {
+        await openReportDetails();
+        await userEvent.selectOptions(
+          screen.getByRole("combobox", { name: "报告时间" }),
+          reportId,
+        );
+        await screen.findByRole("link", { name: "用 AI 分析这份报告" });
+      }
+      if (next === "recommendation") {
+        const cards = await screen.findAllByRole("article", {
+          name: focus.name,
+        });
+        const card = cards.find((element) =>
+          element.textContent?.includes("Selected saved reason."),
+        )!;
+        await userEvent.click(
+          within(card).getByRole("button", { name: "分析改进方向" }),
+        );
+      } else {
+        if (next === "question") {
+          await openReportDetails();
+          await userEvent.selectOptions(
+            screen.getByRole("combobox", { name: "AI 测量问题" }),
+            input.samples[0].conditions.question,
+          );
+        }
+        await userEvent.click(
+          screen.getByRole("button", { name: "用 AI 分析这份报告" }),
+        );
+      }
+      const expectedQuery =
+        next === "recommendation"
+          ? `&measurementQuestionTarget=${sampleTargetId}&measurementAttempt=${selectedAttemptId}&measurementRecommendationKind=product&measurementRecommendationOrder=3`
+          : next === "question"
+            ? `&measurementQuestionTarget=${selectedTargetId}`
+            : "";
+      await waitFor(() =>
+        expect(screen.getByTestId("report-location").textContent).toBe(
+          `/app/tenant/project/chat?measurementReport=${reportId}${expectedQuery}`,
+        ),
+      );
+      if (alreadySaved) expect(save).not.toHaveBeenCalled();
+      else {
+        expect(save).toHaveBeenCalledTimes(failedStart === "none" ? 1 : 2);
+        for (const call of save.mock.calls)
+          expect(call).toEqual(["tenant", "project", input]);
+      }
+      for (const privateValue of [
+        focus.name,
+        "Selected saved reason.",
+        "https://example.test/source",
+        input.samples[0].conditions.question,
+      ])
+        expect(screen.getByTestId("report-location")).not.toHaveTextContent(
+          privateValue,
+        );
+    },
+  );
+
+  it.each(["missing", "renamed", "ambiguous"])(
+    "does not substitute recommendation evidence when the saved occurrence is %s",
+    async (state) => {
+      focus.name = "Example target";
+      const item = {
+        name: focus.name,
+        kind: "product",
+        mention_order: 1,
+        rank: 2,
+        reason: "Saved recommendation reason.",
+        evidence_quote: "Saved excerpt.",
+        citation_urls: [],
+      };
+      const input = {
+        ...preview,
+        samples: [
+          {
+            ...preview.samples[0],
+            target_id: selectedTargetId,
+            recommendations: {
+              version: "geo.recommendations.v1",
+              status: "verified",
+              items: [item],
+            },
+          },
+        ],
+      };
+      const { save } = setup(input);
+      save.mockResolvedValue({
+        ...saved,
+        samples:
+          state === "missing"
+            ? []
+            : [
+                {
+                  ...input.samples[0],
+                  recommendations: {
+                    version: "geo.recommendations.v1",
+                    status: "verified",
+                    items:
+                      state === "renamed"
+                        ? [{ ...item, name: "Different saved item" }]
+                        : [item, item],
+                  },
+                },
+              ],
+      });
+      const card = await screen.findByRole("article", { name: focus.name });
+      await userEvent.click(
+        within(card).getByRole("button", { name: "分析改进方向" }),
+      );
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "暂无法定位这条推荐的已保存证据",
+      );
+      expect(screen.getByTestId("report-location")).toHaveTextContent(/^\/$/);
+    },
+  );
+
+  it("can analyze a saved recommendation when the tracked item was absent, without claiming a cause", async () => {
+    focus.name = "Absent target";
+    const input = {
+      ...preview,
+      samples: [
+        {
+          ...preview.samples[0],
+          target_id: selectedTargetId,
+          recommendations: {
+            version: "geo.recommendations.v1",
+            status: "verified",
+            items: [
+              {
+                name: "Example alternative",
+                kind: "brand",
+                mention_order: 2,
+                rank: 1,
+                reason: "Saved alternative reason.",
+                evidence_quote: "Saved alternative excerpt.",
+                citation_urls: [],
+              },
+            ],
+          },
+        },
+      ],
+    };
+    const { save } = setup(input);
+    save.mockResolvedValue({ ...saved, samples: input.samples });
+    const card = await screen.findByRole("article", {
+      name: "Example alternative",
+    });
+    expect(screen.getByText(/并不解释关注对象为何未被推荐/)).toBeVisible();
+    await userEvent.click(
+      within(card).getByRole("button", { name: "分析改进方向" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("report-location")).toHaveTextContent(
+        "measurementRecommendationKind=brand&measurementRecommendationOrder=2",
+      ),
+    );
+    expect(save).toHaveBeenCalledExactlyOnceWith("tenant", "project", input);
+  });
+
   it("captures the first Analyze scope independently of a failed plain save, then retains it on analysis retries", async () => {
     const { load, save } = setup(scopedPreview);
     save.mockRejectedValueOnce(new Error("Unconfirmed save"));

@@ -23,7 +23,11 @@ import { safeOriginalPublicUrl } from "./PublicationLookupPanel";
 import "../i18n/measurementReports";
 import { reportMeasurementTitle } from "./reportMeasurementTitle";
 import { MeasurementReportSearchSection } from "./MeasurementReportSearchSection";
-import { decodeVerifiedRecommendations } from "../api/recommendations";
+import {
+  decodeVerifiedRecommendations,
+  type RecommendationItem,
+} from "../api/recommendations";
+import type { MeasurementRecommendationReference } from "../components/MeasurementReportDraftBridge";
 import "./MeasurementPeriodReportPanel.css";
 import { useProjectQuery } from "../api/projects";
 import {
@@ -44,6 +48,34 @@ const knownStatuses = new Set([
   "login_required",
   "unsupported",
 ]);
+
+interface AnalysisScope {
+  questionTargetId?: string;
+  question?: string;
+  recommendation?: MeasurementRecommendationReference & { name: string };
+}
+
+function containsRecommendation(
+  report: MeasurementPeriodProjection,
+  scope: AnalysisScope,
+) {
+  const selection = scope.recommendation;
+  if (!selection) return true;
+  const samples = report.samples.filter(
+    (sample) =>
+      sample.target_id === scope.questionTargetId &&
+      (sample.attempt_id ?? null) === selection.attemptId &&
+      sample.conditions.question === scope.question,
+  );
+  if (samples.length !== 1) return false;
+  const items = decodeVerifiedRecommendations(samples[0].recommendations);
+  const matches = items?.filter(
+    (item) =>
+      item.kind === selection.kind &&
+      item.mention_order === selection.mentionOrder,
+  );
+  return matches?.length === 1 && matches[0].name === selection.name;
+}
 
 export function MeasurementPeriodReportPanel({
   tenantId,
@@ -75,7 +107,7 @@ export function MeasurementPeriodReportPanel({
   };
   const [saving, setSaving] = useState(false);
   const [saveState, setSaveState] = useState<
-    "saved" | "saveFailed" | "analysisScopeError"
+    "saved" | "saveFailed" | "analysisScopeError" | "recommendationScopeError"
   >();
   const [window, setWindow] = useState<MeasurementReportWindow>();
   const [start, setStart] = useState("");
@@ -84,10 +116,7 @@ export function MeasurementPeriodReportPanel({
   const saveIntent = useRef<
     | {
         projection: MeasurementPeriodProjection;
-        analysisScope?: {
-          questionTargetId?: string;
-          question?: string;
-        };
+        analysisScope?: AnalysisScope;
       }
     | undefined
   >(undefined);
@@ -202,9 +231,26 @@ export function MeasurementPeriodReportPanel({
   const reportChatHref = (
     reportId: string,
     selectedQuestionTargetId?: string,
+    recommendation?: MeasurementRecommendationReference,
   ) =>
-    `/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/chat?${new URLSearchParams({ measurementReport: reportId, ...(selectedQuestionTargetId ? { measurementQuestionTarget: selectedQuestionTargetId } : {}) })}`;
-  async function save(analyze = false) {
+    `/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/chat?${new URLSearchParams(
+      {
+        measurementReport: reportId,
+        ...(selectedQuestionTargetId
+          ? { measurementQuestionTarget: selectedQuestionTargetId }
+          : {}),
+        ...(recommendation
+          ? {
+              measurementAttempt: recommendation.attemptId ?? "none",
+              measurementRecommendationKind: recommendation.kind,
+              measurementRecommendationOrder: String(
+                recommendation.mentionOrder,
+              ),
+            }
+          : {}),
+      },
+    )}`;
+  async function save(analyze = false, selectedScope?: AnalysisScope) {
     if (!preview.data || !matchesScope(preview.data) || saving || !canWrite)
       return;
     if (
@@ -220,10 +266,15 @@ export function MeasurementPeriodReportPanel({
       projection: preview.data,
     };
     if (analyze) {
-      saveIntent.current.analysisScope ??= {
-        questionTargetId,
-        question: activeQuestion || undefined,
-      };
+      if (selectedScope) saveIntent.current.analysisScope = selectedScope;
+      else if (
+        !saveIntent.current.analysisScope ||
+        saveIntent.current.analysisScope.recommendation
+      )
+        saveIntent.current.analysisScope = {
+          questionTargetId,
+          question: activeQuestion || undefined,
+        };
     }
     const intent = saveIntent.current;
     const analysisScope = intent.analysisScope;
@@ -236,6 +287,15 @@ export function MeasurementPeriodReportPanel({
         intent.projection,
       );
       if (!matchesScope(saved)) throw new Error("Report scope mismatch");
+      if (
+        analyze &&
+        analysisScope &&
+        !containsRecommendation(saved, analysisScope)
+      ) {
+        saveIntent.current = undefined;
+        setSaveState("recommendationScopeError");
+        return;
+      }
       if (
         analyze &&
         analysisScope?.question &&
@@ -253,7 +313,11 @@ export function MeasurementPeriodReportPanel({
       setSaveState("saved");
       if (analyze)
         navigate(
-          reportChatHref(saved.report_id, analysisScope?.questionTargetId),
+          reportChatHref(
+            saved.report_id,
+            analysisScope?.questionTargetId,
+            analysisScope?.recommendation,
+          ),
         );
       else {
         setSelected(saved.report_id);
@@ -266,6 +330,35 @@ export function MeasurementPeriodReportPanel({
     }
   }
   const scopedReport = report && matchesScope(report) ? report : undefined;
+  function analyzeRecommendation(
+    sample: MeasurementPeriodSample,
+    item: RecommendationItem,
+  ) {
+    if (!scopedReport || saving) return;
+    const scope: AnalysisScope = {
+      questionTargetId: sample.target_id,
+      question: sample.conditions.question,
+      recommendation: {
+        attemptId: sample.attempt_id ?? null,
+        name: item.name,
+        kind: item.kind,
+        mentionOrder: item.mention_order,
+      },
+    };
+    if (!containsRecommendation(scopedReport, scope)) {
+      setSaveState("recommendationScopeError");
+      return;
+    }
+    if (scopedReport.kind === "measurement_period")
+      navigate(
+        reportChatHref(
+          scopedReport.report_id,
+          sample.target_id,
+          scope.recommendation,
+        ),
+      );
+    else void save(true, scope);
+  }
   const reportActions = (
     <div className="measurement-report-actions">
       <Button
@@ -300,7 +393,11 @@ export function MeasurementPeriodReportPanel({
           </Link>
         )}
       {saveState && (
-        <p role={saveState === "saved" ? "status" : "alert"}>{t(saveState)}</p>
+        <p role={saveState === "saved" ? "status" : "alert"}>
+          {saveState === "recommendationScopeError"
+            ? t("selectionUnavailable", { ns: "recommendationFocusComparison" })
+            : t(saveState)}
+        </p>
       )}
       {scopedReport && !hasOptimizationSamples && (
         <p>{t("analysisPurposeLimitation")}</p>
@@ -555,7 +652,16 @@ export function MeasurementPeriodReportPanel({
                 {reportMeasurementTitle(sample.comparison_key)} ·{" "}
                 {at(sample.observation?.observed_at ?? sample.scheduled_at)}
               </p>
-              <SampleRecommendations sample={sample} focusNames={focusNames} />
+              <SampleRecommendations
+                sample={sample}
+                focusNames={focusNames}
+                onAnalyze={
+                  canWrite
+                    ? (item) => analyzeRecommendation(sample, item)
+                    : undefined
+                }
+                analysisPending={saving}
+              />
               <a href={recordHref(sample)}>{t("record")}</a>
               <details className="measurement-report-evidence">
                 <summary>{t("answerEvidence")}</summary>
@@ -720,9 +826,13 @@ export function MeasurementPeriodReportPanel({
 function SampleRecommendations({
   sample,
   focusNames,
+  onAnalyze,
+  analysisPending,
 }: {
   sample: MeasurementPeriodSample;
   focusNames: readonly string[];
+  onAnalyze?: (item: RecommendationItem) => void;
+  analysisPending?: boolean;
 }) {
   const { t } = useTranslation("measurementReports");
   const items = decodeVerifiedRecommendations(sample.recommendations);
@@ -778,6 +888,16 @@ function SampleRecommendations({
                     ) : null;
                   })}
                 </details>
+                {onAnalyze && (
+                  <Button
+                    disabled={analysisPending}
+                    onClick={() => onAnalyze(item)}
+                  >
+                    {t("analyzeImprovements", {
+                      ns: "recommendationFocusComparison",
+                    })}
+                  </Button>
+                )}
               </td>
             </tr>
           ))}
@@ -793,7 +913,12 @@ function SampleRecommendations({
           {t("focusNotFound")}
         </p>
       )}
-      <RecommendationFocusComparison items={items} focusNames={focusNames} />
+      <RecommendationFocusComparison
+        items={items}
+        focusNames={focusNames}
+        onAnalyze={onAnalyze}
+        analysisPending={analysisPending}
+      />
       {focusNames.length > 0 ? (
         <details className="measurement-report-evidence">
           <summary>

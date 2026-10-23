@@ -103,6 +103,7 @@ describe("P00 AI workbench routing", () => {
   it.each([
     "unsent",
     "selected-question",
+    "selected-recommendation",
     "invalid-question",
     "question-only",
     "invalid-reference",
@@ -154,20 +155,35 @@ describe("P00 AI workbench routing", () => {
       }
       const chatPath = "/app/tenant-a/project-a/chat";
       renderApp(
-        `${chatPath}${destination === "saved-conversation" ? `/${conversation.id}` : ""}?${destination === "question-only" ? "" : `measurementReport=${destination === "invalid-reference" ? "invalid" : reportId}&`}${destination === "unsent" ? "" : `measurementQuestionTarget=${destination === "invalid-question" ? "invalid" : questionTargetId}`}`,
+        `${chatPath}${destination === "saved-conversation" ? `/${conversation.id}` : ""}?${destination === "question-only" ? "" : `measurementReport=${destination === "invalid-reference" ? "invalid" : reportId}&`}${destination === "unsent" ? "" : `measurementQuestionTarget=${destination === "invalid-question" ? "invalid" : questionTargetId}`}${destination === "selected-recommendation" ? "&measurementAttempt=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee&measurementRecommendationKind=product&measurementRecommendationOrder=3" : ""}`,
         <LocationProbe />,
       );
       const input = await screen.findByLabelText("输入任务");
       await waitFor(() => {
-        if (["unsent", "selected-question"].includes(destination)) {
+        if (
+          ["unsent", "selected-question", "selected-recommendation"].includes(
+            destination,
+          )
+        ) {
           expect((input as HTMLTextAreaElement).value).toContain(reportId);
           if (destination === "selected-question") {
             expect((input as HTMLTextAreaElement).value).toContain(
               `所选问题（样本编号：${questionTargetId}）`,
             );
-          } else {
+          } else if (destination === "unsent") {
             expect((input as HTMLTextAreaElement).value).not.toContain(
               questionTargetId,
+            );
+          }
+          if (destination === "selected-recommendation") {
+            expect((input as HTMLTextAreaElement).value).toContain(
+              `target_id=${questionTargetId}`,
+            );
+            expect((input as HTMLTextAreaElement).value).toContain(
+              "mention_order=3",
+            );
+            expect((input as HTMLTextAreaElement).value).toContain(
+              "attempt_id=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
             );
           }
         } else {
@@ -180,7 +196,12 @@ describe("P00 AI workbench routing", () => {
       expect(
         requests.some(({ path }) => path.includes("measurement-reports")),
       ).toBe(false);
-      if (!["unsent", "selected-question"].includes(destination)) return;
+      if (
+        !["unsent", "selected-question", "selected-recommendation"].includes(
+          destination,
+        )
+      )
+        return;
 
       const user = userEvent.setup();
       await user.clear(input);

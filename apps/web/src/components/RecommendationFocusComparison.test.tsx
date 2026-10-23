@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup,
   fireEvent,
@@ -29,6 +29,24 @@ const item = (
 });
 
 describe("tracked recommendation comparison", () => {
+  it("hands the selected occurrence to its caller, including repeated names", () => {
+    const first = item({ mention_order: 1, reason: "First occurrence." });
+    const second = item({ mention_order: 3, reason: "Second occurrence." });
+    const onAnalyze = vi.fn();
+    render(
+      <RecommendationFocusComparison
+        focusNames={[first.name]}
+        items={[first, second]}
+        onAnalyze={onAnalyze}
+      />,
+    );
+    fireEvent.click(
+      within(screen.getAllByRole("article")[1]).getByRole("button", {
+        name: "分析改进方向",
+      }),
+    );
+    expect(onAnalyze).toHaveBeenCalledExactlyOnceWith(second);
+  });
   it("shows the target first and only same-kind recommendations with strictly smaller ranks", () => {
     render(
       <RecommendationFocusComparison
