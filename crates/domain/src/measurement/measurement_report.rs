@@ -145,6 +145,37 @@ pub struct MeasurementPeriodReport {
     pub search: Option<MeasurementPeriodSearchSection>,
 }
 
+/// Catalog identity from stored report columns; opening a report validates its snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct MeasurementPeriodReportSummary {
+    pub report_id: Uuid,
+    pub project_id: ProjectId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_set: Option<MeasurementReportQuestionSet>,
+    pub revision: u32,
+    pub correction_of: Option<Uuid>,
+    pub report_window_start_at: DateTime<Utc>,
+    pub report_window_end_at: DateTime<Utc>,
+    pub report_timezone: String,
+    pub evidence_as_of: DateTime<Utc>,
+}
+
+impl From<&MeasurementPeriodReport> for MeasurementPeriodReportSummary {
+    fn from(report: &MeasurementPeriodReport) -> Self {
+        Self {
+            report_id: report.report_id,
+            project_id: report.project_id,
+            question_set: report.question_set.clone(),
+            revision: report.revision,
+            correction_of: report.correction_of,
+            report_window_start_at: report.report_window_start_at,
+            report_window_end_at: report.report_window_end_at,
+            report_timezone: report.report_timezone.clone(),
+            evidence_as_of: report.evidence_as_of,
+        }
+    }
+}
+
 impl MeasurementPeriodReport {
     pub fn window(&self) -> MeasurementPeriodWindow {
         MeasurementPeriodWindow {

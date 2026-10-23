@@ -56,7 +56,7 @@ describe("native measurement report draft bridge", () => {
     );
     expect(native.setText).toHaveBeenCalledTimes(1);
     expect(native.setText).toHaveBeenCalledWith(
-      expect.stringContaining(`编号：${reportId}`),
+      expect.stringContaining(`独立测量报告（编号：${reportId}）`),
     );
     rerender(
       <StrictMode>
@@ -90,7 +90,9 @@ describe("native measurement report draft bridge", () => {
     native.getState.mockReturnValue({ text: "" });
     render(<MeasurementReportDraftBridge reportId={reportId} />);
     expect(native.setText).toHaveBeenCalledWith(
-      expect.stringContaining(`report (ID: ${reportId})`),
+      expect.stringContaining(
+        `independent measurement report (ID: ${reportId})`,
+      ),
     );
   });
 });

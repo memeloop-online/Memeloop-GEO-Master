@@ -3710,7 +3710,6 @@ pub enum ReportPreviewResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReportGetRequest {
-    #[serde(default, skip_serializing_if = "is_cycle_report")]
     pub kind: ReportKind,
     #[serde(default)]
     pub report_id: Option<Uuid>,
@@ -4804,7 +4803,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(ReportGetRequest::default()).unwrap(),
-            serde_json::json!({"report_id":null})
+            serde_json::json!({"kind":"cycle","report_id":null})
         );
         assert_eq!(
             serde_json::to_value(ReportReduceRequest::default()).unwrap(),
@@ -4855,6 +4854,25 @@ mod tests {
             .is_err()
         );
         assert!(serde_json::from_str::<ReportGetRequest>(r#"{"kind":"measurement_period","project_id":"00000000-0000-4000-8000-000000000001"}"#).is_err());
+    }
+
+    #[test]
+    fn saved_report_reads_require_explicit_kind_at_host_boundary() {
+        let report_id = Uuid::new_v4();
+        for request in [
+            serde_json::json!({}),
+            serde_json::json!({"report_id": report_id}),
+            serde_json::json!({"kind": "unknown", "report_id": report_id}),
+        ] {
+            assert!(serde_json::from_value::<ReportGetRequest>(request).is_err());
+        }
+        for kind in ["cycle", "measurement_period"] {
+            let value = serde_json::json!({"kind": kind, "report_id": report_id});
+            let request: ReportGetRequest = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(request.report_id, Some(report_id));
+            assert!(request.validate().is_ok());
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+        }
     }
 
     #[test]

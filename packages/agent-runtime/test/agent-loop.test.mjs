@@ -1523,7 +1523,7 @@ test("report reduction and immutable read are exposed as separate scoped host to
         },
         {
           name: "report_get",
-          arguments: "{}",
+          arguments: JSON.stringify({ kind: "cycle" }),
         },
       ];
       return requests.length <= calls.length
@@ -1560,7 +1560,7 @@ test("report reduction and immutable read are exposed as separate scoped host to
     });
     assert.equal(result.answer, "Report available with a coverage gap.");
     assert.deepEqual(reductions, [{}]);
-    assert.deepEqual(reads, [{}]);
+    assert.deepEqual(reads, [{ kind: "cycle" }]);
     assert.deepEqual(
       requests[0].tools.map((tool) => tool.function.name),
       [
@@ -1607,6 +1607,137 @@ test("report reduction and immutable read are exposed as separate scoped host to
     );
     assert.match(requests[1].messages.at(-1).content, /"status":"partial"/u);
     assert.match(requests[2].messages.at(-1).content, /"evidence_id"/u);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("saved report reads require an explicit kind and preserve the exact report ID", async () => {
+  const reportId = "00000000-0000-4000-8000-000000000043";
+  const steps = [
+    { kind: "measurement_period", report_id: reportId },
+    { kind: "cycle", report_id: reportId },
+  ];
+  const calls = [];
+  let modelCalls = 0;
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async reportGet(request) {
+      calls.push(request);
+      return { kind: request.kind, report_id: request.report_id };
+    },
+    async modelComplete(request) {
+      if (modelCalls === 0) {
+        const tool = request.tools.find(
+          (entry) => entry.function.name === "report_get",
+        ).function;
+        const webRequire = createRequire(
+          new URL("../../../apps/web/package.json", import.meta.url),
+        );
+        const memeloopRequire = createRequire(
+          webRequire.resolve("memeloop/loop-api"),
+        );
+        const Ajv = memeloopRequire("ajv");
+        const validate = new Ajv({
+          strict: true,
+          validateFormats: false,
+        }).compile(tool.parameters);
+        assert.equal(validate({ report_id: reportId }), false);
+        assert.equal(validate({ kind: "unknown", report_id: reportId }), false);
+        for (const step of steps) assert.equal(validate(step), true);
+        assert.equal(
+          validate({ kind: "measurement_period", list: true }),
+          true,
+        );
+        assert.match(tool.description, /Always specify kind/u);
+        assert.match(tool.description, /question-set/u);
+        assert.doesNotMatch(
+          tool.parameters.properties.kind.description,
+          /default|compatibility/u,
+        );
+      }
+      const step = steps[modelCalls++];
+      return step
+        ? {
+            ...finalModelAnswer(""),
+            finish_reason: "tool_calls",
+            tool_calls: [
+              {
+                id: `saved-report-${modelCalls}`,
+                type: "function",
+                function: {
+                  name: "report_get",
+                  arguments: JSON.stringify(step),
+                },
+              },
+            ],
+          }
+        : finalModelAnswer("Read both saved report kinds.");
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?report-kind=${Date.now()}`
+    );
+    const result = await main({
+      ...historyTurn,
+      prompt: `Analyze the independent measurement report ${reportId}, then the optimization-cycle report ${reportId}.`,
+    });
+    assert.equal(result.answer, "Read both saved report kinds.");
+    assert.deepEqual(calls, steps);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("a required report-kind boundary failure aborts the native loop without a success completion", async () => {
+  const reads = [];
+  const events = [];
+  let modelCalls = 0;
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit(topic, payload) {
+      events.push([topic, payload]);
+    },
+    async reportGet(request) {
+      reads.push(request);
+      // The native registry exposes the schema but the Rust host boundary
+      // enforces it. Model its strict deserialization failure here.
+      throw new Error("invalid_request: missing field kind");
+    },
+    async modelComplete() {
+      return modelCalls++ === 0
+        ? {
+            ...finalModelAnswer(""),
+            finish_reason: "tool_calls",
+            tool_calls: [
+              {
+                id: "missing-report-kind",
+                type: "function",
+                function: {
+                  name: "report_get",
+                  arguments: JSON.stringify({
+                    report_id: "00000000-0000-4000-8000-000000000044",
+                  }),
+                },
+              },
+            ],
+          }
+        : finalModelAnswer("The report type is required.");
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?missing-report-kind=${Date.now()}`
+    );
+    await assert.rejects(
+      main({ ...historyTurn, prompt: "Analyze the saved report." }),
+      /invalid_request: missing field kind/u,
+    );
+    assert.deepEqual(reads, [
+      { report_id: "00000000-0000-4000-8000-000000000044" },
+    ]);
+    assert.equal(modelCalls, 1);
+    assert.deepEqual(events, []);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }

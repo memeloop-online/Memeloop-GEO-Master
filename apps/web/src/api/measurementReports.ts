@@ -91,6 +91,18 @@ export interface MeasurementPeriodReport extends MeasurementPeriodProjection {
   revision: number;
   correction_of: string | null;
 }
+export type MeasurementPeriodReportSummary = Pick<
+  MeasurementPeriodReport,
+  | "report_id"
+  | "project_id"
+  | "question_set"
+  | "revision"
+  | "correction_of"
+  | "report_window_start_at"
+  | "report_window_end_at"
+  | "report_timezone"
+  | "evidence_as_of"
+>;
 export interface MeasurementPeriodPreview extends MeasurementPeriodProjection {
   kind: "measurement_period_preview";
 }
@@ -113,7 +125,7 @@ export function listMeasurementReports(
   questionSet?: MeasurementReportQuestionSet,
 ) {
   const query = new URLSearchParams({ ...questionSet });
-  return apiFetch<{ items: MeasurementPeriodReport[] }>(
+  return apiFetch<{ items: MeasurementPeriodReportSummary[] }>(
     `/projects/${encodeURIComponent(projectId)}/measurement-reports${query.size ? `?${query}` : ""}`,
     { tenantId, projectId },
   );

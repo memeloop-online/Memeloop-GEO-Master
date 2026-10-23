@@ -412,6 +412,10 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
     // Invalid snapshots in other report series must not be decoded by this
     // version's history query or by an exact-ID read of a valid snapshot.
     for question_set in [None, Some(next_selected.clone())] {
+        let original_summaries = reopened
+            .list_measurement_period_summaries(&scope, question_set.clone())
+            .await
+            .unwrap();
         let id = Uuid::new_v4();
         let mut malformed = serde_json::to_value(&next_report).unwrap();
         malformed["report_id"] = serde_json::json!(id);
@@ -425,18 +429,45 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
             "INSERT INTO measurement_period_reports (report_id,operator_id,tenant_id,project_id,revision,correction_of,report_window_start_at,report_window_end_at,report_timezone,evidence_as_of,snapshot,question_set_id,question_set_version_id) VALUES ($1,$2,$3,$4,1,NULL,$5,$6,'Etc/UTC',$7,$8,$9,$10)",
         ).bind(id).bind(operator).bind(tenant).bind(project)
             .bind(next_report.report_window_start_at).bind(next_report.report_window_end_at)
-            .bind(next_report.evidence_as_of).bind(malformed)
+            .bind(next_report.evidence_as_of).bind(malformed.clone())
             .bind(question_set.as_ref().map(|selected| selected.question_set_id))
             .bind(question_set.as_ref().map(|selected| selected.question_set_version_id))
             .execute(database.pool()).await.unwrap();
         assert_eq!(
             reopened
-                .list_measurement_periods(&scope, question_set)
+                .list_measurement_periods(&scope, question_set.clone())
                 .await
                 .unwrap_err()
                 .code,
             ErrorCode::Internal
         );
+        // The catalog keeps every identity, even when its immutable body is invalid.
+        let summaries = reopened
+            .list_measurement_period_summaries(&scope, question_set.clone())
+            .await
+            .unwrap();
+        assert_eq!(summaries.len(), original_summaries.len() + 1);
+        assert!(original_summaries.iter().all(|row| summaries.contains(row)));
+        let summary = summaries.iter().find(|row| row.report_id == id).unwrap();
+        assert_eq!(summary.question_set, question_set);
+        assert_eq!(summary.report_timezone, "Etc/UTC");
+        assert_eq!(summary.project_id, scope.project_id.unwrap());
+        assert_eq!(
+            reopened
+                .get_measurement_period(&scope, id)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Internal
+        );
+        let unchanged: serde_json::Value = sqlx::query_scalar(
+            "SELECT snapshot FROM measurement_period_reports WHERE report_id=$1",
+        )
+        .bind(id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(unchanged, malformed);
     }
     let scoped_rows = reopened
         .list_measurement_periods(&scope, Some(selected.clone()))
@@ -547,6 +578,35 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
         exact
             .iter()
             .all(|row| row.question_set.as_ref() == Some(&selected))
+    );
+    let summaries = reopened
+        .list_measurement_period_summaries(&scope, Some(selected.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        summaries,
+        exact
+            .iter()
+            .rev()
+            .map(geo_domain::MeasurementPeriodReportSummary::from)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        reopened
+            .list_measurement_period_summaries(&other, Some(selected.clone()))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut unscoped = scope.clone();
+    unscoped.project_id = None;
+    assert_eq!(
+        reopened
+            .list_measurement_period_summaries(&unscoped, None)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Forbidden
     );
     assert!(
         reopened

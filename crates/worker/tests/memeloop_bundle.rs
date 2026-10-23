@@ -94,7 +94,7 @@ impl HostOps for RecordingHostOps {
                     "type": "function",
                     "function": {
                         "name": if first { "report_reduce" } else { "report_get" },
-                        "arguments": "{}"
+                        "arguments": if first { "{}" } else { r#"{"kind":"cycle"}"# }
                     }
                 }],
                 "model": "probe-model",

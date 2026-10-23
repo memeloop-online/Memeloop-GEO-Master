@@ -9,11 +9,12 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use geo_domain::{
     AppError, ChannelOutcomeStatus, ChannelTargetInput, MeasurementPeriodPreview,
-    MeasurementPeriodReport, MeasurementPeriodSample, MeasurementPeriodSearchIdentity,
-    MeasurementPeriodSearchSample, MeasurementPeriodWindow, MeasurementReportConditions,
-    MeasurementReportQuestionSet, ObservationAnalysisOutcome, ProjectId, TenantScope,
-    build_measurement_period_search_sample, effective_observation, freeze_measurement_period,
-    preview_measurement_period_at_cutoff, preview_measurement_period_with_search,
+    MeasurementPeriodReport, MeasurementPeriodReportSummary, MeasurementPeriodSample,
+    MeasurementPeriodSearchIdentity, MeasurementPeriodSearchSample, MeasurementPeriodWindow,
+    MeasurementReportConditions, MeasurementReportQuestionSet, ObservationAnalysisOutcome,
+    ProjectId, TenantScope, build_measurement_period_search_sample, effective_observation,
+    freeze_measurement_period, preview_measurement_period_at_cutoff,
+    preview_measurement_period_with_search,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -70,7 +71,7 @@ fn utc() -> String {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeasurementPeriodList {
-    pub items: Vec<MeasurementPeriodReport>,
+    pub items: Vec<MeasurementPeriodReportSummary>,
 }
 
 fn microseconds(at: DateTime<Utc>) -> DateTime<Utc> {
@@ -669,7 +670,7 @@ pub(crate) async fn list(
         ensure_question_set(&state, &scope, question_set.as_ref()).await?;
         state
             .report_repository()
-            .list_measurement_periods(&scope, question_set)
+            .list_measurement_period_summaries(&scope, question_set)
             .await
     }
     .await;

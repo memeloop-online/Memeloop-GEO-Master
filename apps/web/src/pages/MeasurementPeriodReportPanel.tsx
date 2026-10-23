@@ -9,6 +9,7 @@ import {
   listMeasurementReports,
   saveMeasurementReport,
   type MeasurementPeriodProjection,
+  type MeasurementPeriodReportSummary,
   type MeasurementPeriodSample,
   type MeasurementReportQuestionSet,
   type MeasurementReportWindow,
@@ -85,7 +86,9 @@ export function MeasurementPeriodReportPanel({
     questionSet?.question_set_id,
     questionSet?.question_set_version_id,
   ];
-  const matchesScope = (value: MeasurementPeriodProjection) =>
+  const matchesScope = (
+    value: Pick<MeasurementPeriodReportSummary, "project_id" | "question_set">,
+  ) =>
     value.project_id === projectId &&
     (value.question_set?.question_set_id ?? null) ===
       (questionSet?.question_set_id ?? null) &&
