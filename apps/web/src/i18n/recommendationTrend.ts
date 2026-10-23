@@ -7,6 +7,8 @@ const translations = {
     description: "按相同问题与测量条件逐次对比。出现顺序不代表推荐排名。",
     samples: "推荐结果可用 {{available}} / {{total}} 次",
     singleSample: "当前只有一次测量，后续同条件测量可用于对比变化。",
+    noPreviousSample: "暂无上次结果，后续同条件测量可用于对比变化。",
+    measurementConditions: "测量条件",
     entity: "推荐对象",
     tracked: "关注对象",
     focusChanges: "关注对象最近变化",
@@ -48,6 +50,9 @@ const translations = {
       "Recommendation results available for {{available}} / {{total}} samples",
     singleSample:
       "Only one measurement is available. Further measurements with the same conditions can show changes.",
+    noPreviousSample:
+      "No previous result yet. Further measurements with the same conditions can show changes.",
+    measurementConditions: "Measurement conditions",
     entity: "Recommended item",
     tracked: "Tracked item",
     focusChanges: "Latest tracked item changes",

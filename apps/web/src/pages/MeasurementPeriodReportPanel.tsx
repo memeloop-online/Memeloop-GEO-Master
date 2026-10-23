@@ -210,18 +210,100 @@ export function MeasurementPeriodReportPanel({
       setSaving(false);
     }
   }
-  return (
-    <section
-      className="report-section"
-      aria-label={t(questionSet ? "questionSetTitle" : "title")}
-    >
-      <h2>{t(questionSet ? "questionSetTitle" : "title")}</h2>
-      <p>{t(questionSet ? "questionSetDescription" : "description")}</p>
-      <MeasurementFocusPanel
-        tenantId={tenantId}
-        projectId={projectId}
-        canWrite={Boolean(canWrite)}
-      />
+  const scopedReport = report && matchesScope(report) ? report : undefined;
+  const reportActions = (
+    <div className="measurement-report-actions">
+      <Button
+        disabled={current.isFetching || saving}
+        onClick={() => {
+          void current.refetch();
+          void history.refetch();
+        }}
+      >
+        {t("refresh")}
+      </Button>
+      {selected && (
+        <Button onClick={() => setSelected(undefined)}>
+          {t(questionSet ? "questionSetBack" : "back")}
+        </Button>
+      )}
+      {scopedReport && !selected && canWrite && (
+        <>
+          <Button disabled={saving} onClick={() => void save()}>
+            {t(saving ? "saving" : "save")}
+          </Button>
+          <Button disabled={saving} onClick={() => void save(true)}>
+            {t("analyzeReport")}
+          </Button>
+        </>
+      )}
+      {scopedReport?.kind === "measurement_period" && canWrite && (
+        <Link to={reportChatHref(scopedReport.report_id)}>
+          {t("analyzeReport")}
+        </Link>
+      )}
+      {saveState && (
+        <p role={saveState === "saveFailed" ? "alert" : "status"}>
+          {t(saveState)}
+        </p>
+      )}
+    </div>
+  );
+  const reportDetails = (
+    <details className="measurement-report-evidence measurement-report-details">
+      <summary>{t("reportDetails")}</summary>
+      {scopedReport && (
+        <>
+          <h3>
+            {scopedReport.kind === "measurement_period"
+              ? t("version", { revision: scopedReport.revision })
+              : t(questionSet ? "questionSetPreview" : "preview")}
+          </h3>
+          <p>
+            {scopedReport.kind === "measurement_period"
+              ? t("immutable")
+              : t("previewNote")}
+          </p>
+          {scopedReport.kind === "measurement_period" &&
+            scopedReport.correction_of && (
+              <p>{t("correction", { id: scopedReport.correction_of })}</p>
+            )}
+          <p>
+            {t("window", {
+              start: at(scopedReport.report_window_start_at),
+              end: at(scopedReport.report_window_end_at),
+            })}{" "}
+            · {scopedReport.report_timezone}
+          </p>
+          <p>{t("asOf", { time: at(scopedReport.evidence_as_of) })}</p>
+          <p>
+            {t(activeQuestion ? "selectedQuestionScope" : "allQuestions")} ·{" "}
+            {t("sampleTotal", { count: visibleSamples.length })} ·{" "}
+            {t("answersAvailable", { count: available.length })} ·{" "}
+            {t("answersUnavailable", { count: unavailable.length })}
+          </p>
+          <details>
+            <summary>{t("originalResults")}</summary>
+            <p>{t("wholeReportScope")}</p>
+            <p>
+              {t("planned", { count: scopedReport.coverage.planned })} ·{" "}
+              {t("live", { count: scopedReport.coverage.observed_live })} ·{" "}
+              {t("analysis", {
+                count: scopedReport.coverage.grounded_saved_analysis,
+              })}
+            </p>
+            <ul>
+              {Object.entries(scopedReport.coverage.counts).map(
+                ([key, count]) => (
+                  <li key={key}>
+                    {status(key)}: {count}
+                  </li>
+                ),
+              )}
+            </ul>
+          </details>
+        </>
+      )}
       {history.data?.items.length ? (
         <Field label={t("historySelection")}>
           <select
@@ -304,300 +386,6 @@ export function MeasurementPeriodReportPanel({
           </form>
         </details>
       )}
-      <Button
-        disabled={current.isFetching || saving}
-        onClick={() => {
-          void current.refetch();
-          void history.refetch();
-        }}
-      >
-        {t("refresh")}
-      </Button>
-      {selected && (
-        <Button onClick={() => setSelected(undefined)}>
-          {t(questionSet ? "questionSetBack" : "back")}
-        </Button>
-      )}
-      {saveState && (
-        <p role={saveState === "saveFailed" ? "alert" : "status"}>
-          {t(saveState)}
-        </p>
-      )}
-      {current.isPending ? (
-        <p role="status">{t("loading")}</p>
-      ) : current.isError ? (
-        <p role="alert">{t("unavailable")}</p>
-      ) : report && !matchesScope(report) ? (
-        <p role="alert">
-          {t(questionSet ? "questionSetScopeError" : "scopeError")}
-        </p>
-      ) : (
-        report && (
-          <>
-            <h3>
-              {report.kind === "measurement_period"
-                ? t("version", { revision: report.revision })
-                : t(questionSet ? "questionSetPreview" : "preview")}
-            </h3>
-            <p>
-              {report.kind === "measurement_period"
-                ? t("immutable")
-                : t("previewNote")}
-            </p>
-            {report.kind === "measurement_period" && report.correction_of && (
-              <p>{t("correction", { id: report.correction_of })}</p>
-            )}
-            {report.kind === "measurement_period" && canWrite && (
-              <Link to={reportChatHref(report.report_id)}>
-                {t("analyzeReport")}
-              </Link>
-            )}
-            <p>
-              {t("window", {
-                start: at(report.report_window_start_at),
-                end: at(report.report_window_end_at),
-              })}{" "}
-              · {report.report_timezone}
-            </p>
-            <p>{t("asOf", { time: at(report.evidence_as_of) })}</p>
-            <h3>{t("aiTitle")}</h3>
-            {questions.length > 0 && (
-              <Field label={t("questionFilter")} hint={t("latestFirst")}>
-                <select
-                  className="measurement-report-select"
-                  aria-label={t("questionFilter")}
-                  value={activeQuestion}
-                  onChange={(event) => setQuestionFilter(event.target.value)}
-                >
-                  <option value="">{t("allQuestions")}</option>
-                  {questions.map((question) => (
-                    <option key={question} value={question}>
-                      {question}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-            )}
-            <p>
-              {t(activeQuestion ? "selectedQuestionScope" : "allQuestions")} ·{" "}
-              {t("sampleTotal", { count: visibleSamples.length })} ·{" "}
-              {t("answersAvailable", { count: available.length })} ·{" "}
-              {t("answersUnavailable", { count: unavailable.length })}
-            </p>
-            <details>
-              <summary>{t("originalResults")}</summary>
-              <p>{t("wholeReportScope")}</p>
-              <p>
-                {t("planned", { count: report.coverage.planned })} ·{" "}
-                {t("live", { count: report.coverage.observed_live })} ·{" "}
-                {t("analysis", {
-                  count: report.coverage.grounded_saved_analysis,
-                })}
-              </p>
-              <ul>
-                {Object.entries(report.coverage.counts).map(([key, count]) => (
-                  <li key={key}>
-                    {status(key)}: {count}
-                  </li>
-                ))}
-              </ul>
-            </details>
-            {!selected && canWrite && (
-              <>
-                <Button disabled={saving} onClick={() => void save()}>
-                  {t(saving ? "saving" : "save")}
-                </Button>
-                <Button disabled={saving} onClick={() => void save(true)}>
-                  {t("analyzeReport")}
-                </Button>
-              </>
-            )}
-            {!report.samples.length && <p>{t("empty")}</p>}
-            {recommendations.length > 0 && (
-              <details
-                className="measurement-report-evidence"
-                open={Boolean(questionSet) || focusNames.length > 0}
-              >
-                <summary>{t("compareMeasurements")}</summary>
-                <RecommendationTrend
-                  samples={recommendations}
-                  focusNames={focusNames}
-                />
-              </details>
-            )}
-            {available.map((sample) => (
-              <Card
-                className="report-panel measurement-report-sample"
-                key={`${sample.target_id}/${sample.attempt_id ?? ""}`}
-              >
-                <h4>{sample.conditions.question}</h4>
-                <p className="report-muted">
-                  {reportMeasurementTitle(sample.comparison_key)} ·{" "}
-                  {at(sample.observation?.observed_at ?? sample.scheduled_at)}
-                </p>
-                <SampleRecommendations
-                  sample={sample}
-                  focusNames={focusNames}
-                />
-                <a href={recordHref(sample)}>{t("record")}</a>
-                <details className="measurement-report-evidence">
-                  <summary>{t("answerEvidence")}</summary>
-                  {sample.observation?.provenance && sample.attempt_id ? (
-                    <ReportSupplementaryMeasurements
-                      embedded
-                      timezone={report.report_timezone}
-                      items={[
-                        {
-                          ...sample,
-                          attempt_id: sample.attempt_id,
-                          observation: sample.observation,
-                        },
-                      ]}
-                    />
-                  ) : sample.observation ? (
-                    <>
-                      <p>
-                        {t("observed", {
-                          time: at(sample.observation.observed_at),
-                        })}
-                      </p>
-                      <h5>{t("answer")}</h5>
-                      <p
-                        style={{
-                          whiteSpace: "pre-wrap",
-                          overflowWrap: "anywhere",
-                        }}
-                      >
-                        {sample.observation.raw_answer}
-                      </p>
-                      <h5>{t("citations")}</h5>
-                      <ul>
-                        {sample.observation.citations.map((url, index) => {
-                          const href = safeOriginalPublicUrl(url);
-                          return (
-                            <li key={index}>
-                              {href ? (
-                                <a
-                                  href={href}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                >
-                                  {url}
-                                </a>
-                              ) : (
-                                url
-                              )}
-                            </li>
-                          );
-                        })}
-                      </ul>
-                    </>
-                  ) : null}
-                  <details>
-                    <summary>{t("originalReceipt")}</summary>
-                    <p>
-                      {t("original", {
-                        status: status(sample.original_status),
-                      })}
-                    </p>
-                    <p>{t("scheduled", { time: at(sample.scheduled_at) })}</p>
-                  </details>
-                  {!sample.observation?.provenance && (
-                    <details>
-                      <summary>
-                        {t("recordDetails", { ns: "reportAnalysis" })}
-                      </summary>
-                      <dl className="report-metadata">
-                        <dt>{t("comparison", { ns: "reportAnalysis" })}</dt>
-                        <dd>{sample.comparison_key}</dd>
-                        <dt>{t("target", { ns: "reportAnalysis" })}</dt>
-                        <dd>{sample.target_id}</dd>
-                        {sample.attempt_id && (
-                          <>
-                            <dt>{t("attempt", { ns: "reportAnalysis" })}</dt>
-                            <dd>{sample.attempt_id}</dd>
-                          </>
-                        )}
-                        <dt>{t("plan", { ns: "reportAnalysis" })}</dt>
-                        <dd>{sample.plan_id}</dd>
-                      </dl>
-                    </details>
-                  )}
-                </details>
-              </Card>
-            ))}
-            {unavailable.length > 0 && (
-              <details className="measurement-report-evidence">
-                <summary>
-                  {t("unavailableDetails", { count: unavailable.length })}
-                </summary>
-                <ul className="measurement-report-unavailable">
-                  {unavailable.map((sample) => (
-                    <li key={`${sample.target_id}/${sample.attempt_id ?? ""}`}>
-                      <strong>{sample.conditions.question}</strong>
-                      <p>
-                        {reportMeasurementTitle(sample.comparison_key)} ·{" "}
-                        {at(sample.scheduled_at)} ·{" "}
-                        {status(sample.original_status)}
-                      </p>
-                      <details>
-                        <summary>{t("originalReceipt")}</summary>
-                        <p>
-                          {t("original", {
-                            status: status(sample.original_status),
-                          })}
-                        </p>
-                        {sample.observation && (
-                          <>
-                            <h5>{t("citations")}</h5>
-                            <ul>
-                              {sample.observation.citations.map(
-                                (url, index) => {
-                                  const href = safeOriginalPublicUrl(url);
-                                  return (
-                                    <li key={index}>
-                                      {href ? (
-                                        <a
-                                          href={href}
-                                          target="_blank"
-                                          rel="noopener noreferrer"
-                                        >
-                                          {url}
-                                        </a>
-                                      ) : (
-                                        url
-                                      )}
-                                    </li>
-                                  );
-                                },
-                              )}
-                            </ul>
-                            <pre
-                              style={{
-                                whiteSpace: "pre-wrap",
-                                overflowWrap: "anywhere",
-                              }}
-                            >
-                              {JSON.stringify(sample.observation, null, 2)}
-                            </pre>
-                          </>
-                        )}
-                      </details>
-                      <a href={recordHref(sample)}>{t("record")}</a>
-                    </li>
-                  ))}
-                </ul>
-              </details>
-            )}
-            <MeasurementReportSearchSection
-              search={report.search}
-              tenantId={tenantId}
-              projectId={projectId}
-              at={at}
-            />
-          </>
-        )
-      )}
       <details className="measurement-report-evidence">
         <summary>{t("history")}</summary>
         {history.isPending ? (
@@ -628,6 +416,230 @@ export function MeasurementPeriodReportPanel({
           <p>{t("noHistory")}</p>
         )}
       </details>
+    </details>
+  );
+  return (
+    <section
+      className="report-section"
+      aria-label={t(questionSet ? "questionSetTitle" : "title")}
+    >
+      <h2>{t(questionSet ? "questionSetTitle" : "title")}</h2>
+      <p>{t(questionSet ? "questionSetDescription" : "description")}</p>
+      <MeasurementFocusPanel
+        tenantId={tenantId}
+        projectId={projectId}
+        canWrite={Boolean(canWrite)}
+      />
+      {current.isPending ? (
+        <p role="status">{t("loading")}</p>
+      ) : current.isError ? (
+        <p role="alert">{t("unavailable")}</p>
+      ) : report && !matchesScope(report) ? (
+        <p role="alert">
+          {t(questionSet ? "questionSetScopeError" : "scopeError")}
+        </p>
+      ) : (
+        report && (
+          <>
+            {questions.length > 0 && (
+              <Field label={t("questionFilter")} hint={t("latestFirst")}>
+                <select
+                  className="measurement-report-select"
+                  aria-label={t("questionFilter")}
+                  value={activeQuestion}
+                  onChange={(event) => setQuestionFilter(event.target.value)}
+                >
+                  <option value="">{t("allQuestions")}</option>
+                  {questions.map((question) => (
+                    <option key={question} value={question}>
+                      {question}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            )}
+            {recommendations.length > 0 && (
+              <RecommendationTrend
+                samples={recommendations}
+                focusNames={focusNames}
+              />
+            )}
+          </>
+        )
+      )}
+      {reportActions}
+      {reportDetails}
+      {!current.isPending && !current.isError && scopedReport && (
+        <>
+          <h3>{t("aiTitle")}</h3>
+          {!scopedReport.samples.length && <p>{t("empty")}</p>}
+          {available.map((sample) => (
+            <Card
+              className="report-panel measurement-report-sample"
+              key={`${sample.target_id}/${sample.attempt_id ?? ""}`}
+            >
+              <h4>{sample.conditions.question}</h4>
+              <p className="report-muted">
+                {reportMeasurementTitle(sample.comparison_key)} ·{" "}
+                {at(sample.observation?.observed_at ?? sample.scheduled_at)}
+              </p>
+              <SampleRecommendations sample={sample} focusNames={focusNames} />
+              <a href={recordHref(sample)}>{t("record")}</a>
+              <details className="measurement-report-evidence">
+                <summary>{t("answerEvidence")}</summary>
+                {sample.observation?.provenance && sample.attempt_id ? (
+                  <ReportSupplementaryMeasurements
+                    embedded
+                    timezone={scopedReport.report_timezone}
+                    items={[
+                      {
+                        ...sample,
+                        attempt_id: sample.attempt_id,
+                        observation: sample.observation,
+                      },
+                    ]}
+                  />
+                ) : sample.observation ? (
+                  <>
+                    <p>
+                      {t("observed", {
+                        time: at(sample.observation.observed_at),
+                      })}
+                    </p>
+                    <h5>{t("answer")}</h5>
+                    <p
+                      style={{
+                        whiteSpace: "pre-wrap",
+                        overflowWrap: "anywhere",
+                      }}
+                    >
+                      {sample.observation.raw_answer}
+                    </p>
+                    <h5>{t("citations")}</h5>
+                    <ul>
+                      {sample.observation.citations.map((url, index) => {
+                        const href = safeOriginalPublicUrl(url);
+                        return (
+                          <li key={index}>
+                            {href ? (
+                              <a
+                                href={href}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                              >
+                                {url}
+                              </a>
+                            ) : (
+                              url
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </>
+                ) : null}
+                <details>
+                  <summary>{t("originalReceipt")}</summary>
+                  <p>
+                    {t("original", {
+                      status: status(sample.original_status),
+                    })}
+                  </p>
+                  <p>{t("scheduled", { time: at(sample.scheduled_at) })}</p>
+                </details>
+                {!sample.observation?.provenance && (
+                  <details>
+                    <summary>
+                      {t("recordDetails", { ns: "reportAnalysis" })}
+                    </summary>
+                    <dl className="report-metadata">
+                      <dt>{t("comparison", { ns: "reportAnalysis" })}</dt>
+                      <dd>{sample.comparison_key}</dd>
+                      <dt>{t("target", { ns: "reportAnalysis" })}</dt>
+                      <dd>{sample.target_id}</dd>
+                      {sample.attempt_id && (
+                        <>
+                          <dt>{t("attempt", { ns: "reportAnalysis" })}</dt>
+                          <dd>{sample.attempt_id}</dd>
+                        </>
+                      )}
+                      <dt>{t("plan", { ns: "reportAnalysis" })}</dt>
+                      <dd>{sample.plan_id}</dd>
+                    </dl>
+                  </details>
+                )}
+              </details>
+            </Card>
+          ))}
+          {unavailable.length > 0 && (
+            <details className="measurement-report-evidence">
+              <summary>
+                {t("unavailableDetails", { count: unavailable.length })}
+              </summary>
+              <ul className="measurement-report-unavailable">
+                {unavailable.map((sample) => (
+                  <li key={`${sample.target_id}/${sample.attempt_id ?? ""}`}>
+                    <strong>{sample.conditions.question}</strong>
+                    <p>
+                      {reportMeasurementTitle(sample.comparison_key)} ·{" "}
+                      {at(sample.scheduled_at)} ·{" "}
+                      {status(sample.original_status)}
+                    </p>
+                    <details>
+                      <summary>{t("originalReceipt")}</summary>
+                      <p>
+                        {t("original", {
+                          status: status(sample.original_status),
+                        })}
+                      </p>
+                      {sample.observation && (
+                        <>
+                          <h5>{t("citations")}</h5>
+                          <ul>
+                            {sample.observation.citations.map((url, index) => {
+                              const href = safeOriginalPublicUrl(url);
+                              return (
+                                <li key={index}>
+                                  {href ? (
+                                    <a
+                                      href={href}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                    >
+                                      {url}
+                                    </a>
+                                  ) : (
+                                    url
+                                  )}
+                                </li>
+                              );
+                            })}
+                          </ul>
+                          <pre
+                            style={{
+                              whiteSpace: "pre-wrap",
+                              overflowWrap: "anywhere",
+                            }}
+                          >
+                            {JSON.stringify(sample.observation, null, 2)}
+                          </pre>
+                        </>
+                      )}
+                    </details>
+                    <a href={recordHref(sample)}>{t("record")}</a>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+          <MeasurementReportSearchSection
+            search={scopedReport.search}
+            tenantId={tenantId}
+            projectId={projectId}
+            at={at}
+          />
+        </>
+      )}
     </section>
   );
 }
@@ -647,6 +659,59 @@ function SampleRecommendations({
   const focused = items.filter((item) =>
     isMeasurementFocus(item.name, focusNames),
   );
+  const table = (
+    <table className="report-table">
+      <caption>{t("recommendedEntities")}</caption>
+      <thead>
+        <tr>
+          <th scope="col">{t("entity")}</th>
+          <th scope="col">{t("rank")}</th>
+          <th scope="col">{t("reason")}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {[...items]
+          .sort((a, b) => a.mention_order - b.mention_order)
+          .map((item, index) => (
+            <tr
+              key={`${item.kind}/${item.name}/${index}`}
+              className={
+                isMeasurementFocus(item.name, focusNames)
+                  ? "measurement-report-focus-row"
+                  : undefined
+              }
+            >
+              <th scope="row">{item.name}</th>
+              <td>
+                {item.rank === null
+                  ? t("unranked")
+                  : t("rankValue", { rank: item.rank })}
+              </td>
+              <td>
+                {item.reason || t("reasonUnavailable")}
+                <details>
+                  <summary>{t("recommendationEvidence")}</summary>
+                  <blockquote>{item.evidence_quote}</blockquote>
+                  {item.citation_urls.map((url, linkIndex) => {
+                    const href = safeOriginalPublicUrl(url);
+                    return href ? (
+                      <a
+                        key={linkIndex}
+                        href={href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        {url}
+                      </a>
+                    ) : null;
+                  })}
+                </details>
+              </td>
+            </tr>
+          ))}
+      </tbody>
+    </table>
+  );
   return (
     <div className="measurement-report-recommendations">
       {focusNames.length > 0 && focused.length === 0 && (
@@ -657,57 +722,16 @@ function SampleRecommendations({
         </p>
       )}
       <RecommendationFocusComparison items={items} focusNames={focusNames} />
-      <table className="report-table">
-        <caption>{t("recommendedEntities")}</caption>
-        <thead>
-          <tr>
-            <th scope="col">{t("entity")}</th>
-            <th scope="col">{t("rank")}</th>
-            <th scope="col">{t("reason")}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {[...items]
-            .sort((a, b) => a.mention_order - b.mention_order)
-            .map((item, index) => (
-              <tr
-                key={`${item.kind}/${item.name}/${index}`}
-                className={
-                  isMeasurementFocus(item.name, focusNames)
-                    ? "measurement-report-focus-row"
-                    : undefined
-                }
-              >
-                <th scope="row">{item.name}</th>
-                <td>
-                  {item.rank === null
-                    ? t("unranked")
-                    : t("rankValue", { rank: item.rank })}
-                </td>
-                <td>
-                  {item.reason || t("reasonUnavailable")}
-                  <details>
-                    <summary>{t("recommendationEvidence")}</summary>
-                    <blockquote>{item.evidence_quote}</blockquote>
-                    {item.citation_urls.map((url, linkIndex) => {
-                      const href = safeOriginalPublicUrl(url);
-                      return href ? (
-                        <a
-                          key={linkIndex}
-                          href={href}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                        >
-                          {url}
-                        </a>
-                      ) : null;
-                    })}
-                  </details>
-                </td>
-              </tr>
-            ))}
-        </tbody>
-      </table>
+      {focusNames.length > 0 ? (
+        <details className="measurement-report-evidence">
+          <summary>
+            {t("allRecommendedEntities", { count: items.length })}
+          </summary>
+          {table}
+        </details>
+      ) : (
+        table
+      )}
     </div>
   );
 }

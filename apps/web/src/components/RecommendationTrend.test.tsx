@@ -11,6 +11,7 @@ import {
   type RecommendationTrendSample,
 } from "./RecommendationTrend";
 import i18n from "../i18n";
+import userEvent from "@testing-library/user-event";
 
 afterEach(cleanup);
 beforeEach(async () => {
@@ -100,7 +101,10 @@ describe("recommendation rank history", () => {
       expect(summary.getAllByText(`第 ${previous} 位`)[0]).toBeVisible();
       expect(
         summary.getAllByRole("link").map((link) => link.getAttribute("href")),
-      ).toEqual([first.recordHref, last.recordHref]);
+      ).toEqual([last.recordHref, first.recordHref]);
+      expect(
+        summary.getByText(`第 ${latest} 位`, { selector: "strong" }),
+      ).toBeVisible();
       const disclosure = screen.getByText("完整排名对比");
       expect(disclosure.closest("details")).not.toHaveAttribute("open");
       expect(screen.getByRole("table", { hidden: true })).not.toBeVisible();
@@ -135,8 +139,8 @@ describe("recommendation rank history", () => {
     expect(
       summary.getAllByRole("link").map((link) => link.getAttribute("href")),
     ).toEqual([
-      datedSample("missing", 2).recordHref,
       datedSample("latest", 3).recordHref,
+      datedSample("missing", 2).recordHref,
     ]);
   });
 
@@ -356,7 +360,103 @@ describe("recommendation rank history", () => {
     expect(summary.getByText("Rank 1")).toBeVisible();
     expect(
       summary.getAllByRole("link").map((link) => link.getAttribute("href")),
-    ).toEqual([previous.recordHref, latest.recordHref]);
+    ).toEqual([latest.recordHref, previous.recordHref]);
+  });
+
+  it.each([
+    [
+      "zh-CN",
+      "关注对象最近变化",
+      "第 2 位",
+      "暂无上次结果，后续同条件测量可用于对比变化。",
+    ],
+    [
+      "en",
+      "Latest tracked item changes",
+      "Rank 2",
+      "No previous result yet. Further measurements with the same conditions can show changes.",
+    ],
+  ])(
+    "shows the single sample's explicit rank and record in %s",
+    async (language, region, rank, noPrevious) => {
+      await i18n.changeLanguage(language);
+      const only = datedSample("only", 1);
+      render(<RecommendationTrend samples={[only]} focusNames={[item.name]} />);
+      const summary = within(screen.getByRole("region", { name: region }));
+      expect(summary.getByText(rank, { selector: "strong" })).toBeVisible();
+      expect(summary.getByText(noPrevious)).toBeVisible();
+      expect(summary.getByRole("link")).toHaveAttribute(
+        "href",
+        only.recordHref,
+      );
+      expect(
+        summary.queryByText(
+          /排名上升|排名下降|排名持平|Rank improved|Rank declined|Rank unchanged/,
+        ),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it("never presents an older rank as the latest when the latest sample is missing", () => {
+    const latest = { ...datedSample("latest", 3), recommendations: undefined };
+    render(
+      <RecommendationTrend
+        samples={[datedSample("old", 1, [{ ...item, rank: 7 }]), latest]}
+        focusNames={[item.name]}
+      />,
+    );
+    const summary = within(
+      screen.getByRole("region", { name: "关注对象最近变化" }),
+    );
+    expect(
+      summary.getByText("推荐结果尚未分析", { selector: "strong" }),
+    ).toBeVisible();
+    expect(
+      summary.queryByText("第 7 位", { selector: "strong" }),
+    ).not.toBeInTheDocument();
+    expect(summary.getAllByRole("link")[0]).toHaveAttribute(
+      "href",
+      latest.recordHref,
+    );
+    expect(summary.getByText("这两次结果无法比较明确排名。")).toBeVisible();
+  });
+
+  it("keeps matching and measurement context collapsed with keyboard reachable records and disclosures", async () => {
+    const user = userEvent.setup();
+    const first = datedSample("first", 1);
+    const latest = datedSample("latest", 2);
+    render(
+      <RecommendationTrend
+        samples={[first, latest]}
+        focusNames={[item.name]}
+      />,
+    );
+    expect(
+      screen.getByText("平台：sample-provider · 模型：sample-model"),
+    ).toBeVisible();
+    const conditions = screen.getByText("测量条件");
+    expect(conditions.tagName).toBe("SUMMARY");
+    expect(conditions.closest("details")).not.toHaveAttribute("open");
+    const context = screen.getByText("consumer_web · CN · zh-CN · enabled");
+    const matching = screen.getByText(
+      "对象按提取出的名称与类型对应，别名尚未合并。",
+    );
+    expect(context).not.toBeVisible();
+    expect(matching).not.toBeVisible();
+    const summary = within(
+      screen.getByRole("region", { name: "关注对象最近变化" }),
+    );
+    await user.tab();
+    expect(summary.getAllByRole("link")[0]).toHaveFocus();
+    await user.tab();
+    expect(summary.getAllByRole("link")[1]).toHaveFocus();
+    await user.tab();
+    expect(conditions).toHaveFocus();
+    await user.tab();
+    expect(screen.getByText("完整排名对比")).toHaveFocus();
+    await user.click(conditions);
+    expect(context).toBeVisible();
+    expect(matching).toBeVisible();
   });
 
   it("compares each explicit rank chronologically while keeping mention order separate", () => {

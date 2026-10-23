@@ -107,8 +107,6 @@ export function RecommendationTrend({
         <p>{t("empty")}</p>
       ) : (
         <>
-          <p>{t("description")}</p>
-          <p>{t("exactNames")}</p>
           {[...groups].map(([key, group]) => {
             const ordered = [...group].sort((left, right) => {
               const difference = observedTime(left) - observedTime(right);
@@ -173,33 +171,18 @@ export function RecommendationTrend({
                     model: input.model,
                   })}
                 </p>
-                <p>
-                  {t("conditions", {
-                    surface: input.surface,
-                    market: input.market,
-                    language: input.language,
-                    searchMode: input.search_mode,
-                  })}
-                </p>
-                <p>
-                  {t("samples", {
-                    available: number.format(
-                      entries.filter((entry) => entry.items !== null).length,
-                    ),
-                    total: number.format(entries.length),
-                  })}
-                </p>
-                {entries.length === 1 && <p>{t("singleSample")}</p>}
                 {focusEntities.length > 0 && (
                   <section aria-label={t("focusChanges")}>
                     <h5>{t("focusChanges")}</h5>
-                    <p>{t("focusDescription")}</p>
                     {focusEntities.map((entity) => {
                       const states = latestPair.map((entry) =>
                         entityState(entry, entity.id),
                       );
-                      const previousRank = states[0]?.rank;
-                      const latestRank = states[1]?.rank;
+                      const latest = latestPair[latestPair.length - 1];
+                      const latestState = states[states.length - 1];
+                      const previousRank =
+                        states.length === 2 ? states[0].rank : undefined;
+                      const latestRank = latestState.rank;
                       const change =
                         previousRank !== undefined && latestRank !== undefined
                           ? previousRank - latestRank
@@ -217,50 +200,66 @@ export function RecommendationTrend({
                             {entity.name}
                             {entity.kind && <> · {t(`kind_${entity.kind}`)}</>}
                           </h5>
-                          {entries.length < 2 ? (
-                            <p>{t("singleSample")}</p>
-                          ) : !chronologyKnown ? (
+                          {entries.length > 1 && !chronologyKnown ? (
                             <p>{t("chronologyUnknown")}</p>
                           ) : (
                             <>
-                              {latestPair.map(({ sample }, index) => (
-                                <p key={sample.sampleId}>
-                                  {t(
-                                    index === 0
-                                      ? "previousSample"
-                                      : "latestSample",
-                                  )}{" "}
-                                  <a
-                                    href={sample.recordHref}
-                                    aria-label={`${t("viewRecord")} · ${timeLabel(sample)}`}
-                                  >
-                                    {timeLabel(sample)}
-                                  </a>
-                                  {" · "}
+                              <p>
+                                {t("latestSample")}{" "}
+                                <strong>
+                                  {t(latestState.label, {
+                                    value:
+                                      latestRank === undefined
+                                        ? undefined
+                                        : number.format(latestRank),
+                                  })}
+                                </strong>
+                                {" · "}
+                                <a
+                                  href={latest.sample.recordHref}
+                                  aria-label={`${t("viewRecord")} · ${timeLabel(latest.sample)}`}
+                                >
+                                  {timeLabel(latest.sample)}
+                                </a>
+                              </p>
+                              <p>
+                                {entries.length === 1
+                                  ? t("noPreviousSample")
+                                  : change === null
+                                    ? t("rankNotComparable")
+                                    : t(
+                                        change > 0
+                                          ? "improved"
+                                          : change < 0
+                                            ? "declined"
+                                            : "unchanged",
+                                        {
+                                          value: number.format(
+                                            Math.abs(change),
+                                          ),
+                                        },
+                                      )}
+                              </p>
+                              {latestPair.length === 2 && (
+                                <p>
+                                  {t("previousSample")}{" "}
                                   <span>
-                                    {t(states[index].label, {
+                                    {t(states[0].label, {
                                       value:
-                                        states[index].rank === undefined
+                                        previousRank === undefined
                                           ? undefined
-                                          : number.format(states[index].rank),
+                                          : number.format(previousRank),
                                     })}
                                   </span>
+                                  {" · "}
+                                  <a
+                                    href={latestPair[0].sample.recordHref}
+                                    aria-label={`${t("viewRecord")} · ${timeLabel(latestPair[0].sample)}`}
+                                  >
+                                    {timeLabel(latestPair[0].sample)}
+                                  </a>
                                 </p>
-                              ))}
-                              <p>
-                                {change === null
-                                  ? t("rankNotComparable")
-                                  : t(
-                                      change > 0
-                                        ? "improved"
-                                        : change < 0
-                                          ? "declined"
-                                          : "unchanged",
-                                      {
-                                        value: number.format(Math.abs(change)),
-                                      },
-                                    )}
-                              </p>
+                              )}
                             </>
                           )}
                         </section>
@@ -268,6 +267,30 @@ export function RecommendationTrend({
                     })}
                   </section>
                 )}
+                <p>
+                  {t("samples", {
+                    available: number.format(
+                      entries.filter((entry) => entry.items !== null).length,
+                    ),
+                    total: number.format(entries.length),
+                  })}
+                </p>
+                {entries.length === 1 && focusEntities.length === 0 && (
+                  <p>{t("singleSample")}</p>
+                )}
+                <details>
+                  <summary>{t("measurementConditions")}</summary>
+                  <p>
+                    {t("conditions", {
+                      surface: input.surface,
+                      market: input.market,
+                      language: input.language,
+                      searchMode: input.search_mode,
+                    })}
+                  </p>
+                  <p>{t("description")}</p>
+                  <p>{t("exactNames")}</p>
+                </details>
                 <details open={focusEntities.length === 0}>
                   <summary>{t("fullHistory")}</summary>
                   <div style={{ overflowX: "auto" }}>

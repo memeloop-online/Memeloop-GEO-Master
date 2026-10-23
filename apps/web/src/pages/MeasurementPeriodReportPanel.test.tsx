@@ -135,6 +135,13 @@ function setup(
   );
   return { load, list, detail, save };
 }
+async function openReportDetails(language = "zh-CN") {
+  const summary = await screen.findByText(
+    language === "en" ? "Report details" : "报告详情",
+  );
+  if (!summary.parentElement!.hasAttribute("open"))
+    await userEvent.click(summary);
+}
 afterEach(async () => {
   auth.role = "member";
   focus.name = "";
@@ -143,6 +150,96 @@ afterEach(async () => {
   await i18n.changeLanguage("zh-CN");
 });
 describe("cycle-free measurement report", () => {
+  it.each(["zh-CN", "en"])(
+    "shows focus, question selection and rankings before collapsed report management in %s",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      focus.name = "Trail light";
+      setup(preview, [saved]);
+      const focusPanel = screen.getByLabelText(
+        language === "en" ? "Tracked product or brand" : "关注对象",
+      );
+      const question = await screen.findByRole("combobox", {
+        name: language === "en" ? "AI measurement question" : "AI 测量问题",
+      });
+      const trend = screen.getByRole("region", {
+        name:
+          language === "en" ? "Recommendation rank history" : "推荐排名变化",
+      });
+      const details = screen
+        .getByText(language === "en" ? "Report details" : "报告详情")
+        .closest("details")!;
+      const sample = screen
+        .getAllByRole("heading", {
+          name: "Which lamp suits camping?",
+          level: 4,
+        })
+        .find((heading) => heading.closest(".measurement-report-sample"))!;
+      for (const [before, after] of [
+        [focusPanel, question],
+        [question, trend],
+        [trend, details],
+        [details, sample],
+      ])
+        expect(
+          before.compareDocumentPosition(after) &
+            Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+      expect(trend).toBeVisible();
+      expect(trend.closest("details")).toBeNull();
+      expect(details).not.toHaveAttribute("open");
+      expect(
+        screen.getByText(
+          language === "en" ? /^Evidence as of:/ : /^数据更新至：/,
+        ),
+      ).not.toBeVisible();
+      for (const name of language === "en"
+        ? ["Save report for this period", "Analyze this report with AI"]
+        : ["保存此范围的报告", "用 AI 分析这份报告"])
+        expect(screen.getByRole("button", { name })).toBeVisible();
+      await openReportDetails(language);
+      expect(
+        screen.getByRole("combobox", {
+          name: language === "en" ? "Report period" : "报告时间",
+        }),
+      ).toBeVisible();
+    },
+  );
+
+  it("keeps the full recommendation table visible without a focus", async () => {
+    setup({
+      ...preview,
+      samples: [
+        {
+          ...preview.samples[0],
+          recommendations: {
+            version: "geo.recommendations.v1",
+            status: "verified",
+            items: [
+              {
+                name: "Trail light",
+                kind: "product",
+                mention_order: 1,
+                rank: 1,
+                reason: "Compact enough for a backpack",
+                evidence_quote: "Trail light is compact.",
+                citation_urls: [],
+              },
+            ],
+          },
+        },
+      ],
+    });
+    const table = await screen.findByRole("table", { name: "AI 推荐了什么" });
+    expect(table).toBeVisible();
+    expect(table.closest("details")).toBeNull();
+    expect(within(table).getByText("Trail light")).toBeVisible();
+    expect(
+      within(table).getByText("Compact enough for a backpack"),
+    ).toBeVisible();
+    expect(screen.queryByText(/全部推荐对象/)).not.toBeInTheDocument();
+  });
+
   it("keeps every catalog entry visible when opening one report fails", async () => {
     const invalid: api.MeasurementPeriodReportSummary = {
       report_id: "invalid-report",
@@ -160,12 +257,14 @@ describe("cycle-free measurement report", () => {
         throw new Error("Stored report is invalid");
       return saved;
     });
+    await openReportDetails();
     const selector = await screen.findByRole("combobox", { name: "报告时间" });
     await userEvent.selectOptions(selector, invalid.report_id);
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "报告暂时无法读取",
     );
     expect(within(selector).getAllByRole("option")).toHaveLength(3);
+    await userEvent.click(screen.getByText("已保存的测量报告"));
     expect(screen.getAllByRole("button", { name: /查看版本/ })).toHaveLength(2);
     await userEvent.selectOptions(selector, saved.report_id);
     expect(
@@ -206,6 +305,7 @@ describe("cycle-free measurement report", () => {
 
   it("links a saved report to AI without resaving it", async () => {
     const { save } = setup(preview, [saved]);
+    await openReportDetails();
     await userEvent.selectOptions(
       await screen.findByRole("combobox", { name: "报告时间" }),
       saved.report_id,
@@ -269,8 +369,8 @@ describe("cycle-free measurement report", () => {
     expect(recordOrder()).toEqual(["newer", "other", "older"]);
     await userEvent.selectOptions(filter, base.conditions.question);
     expect(recordOrder()).toEqual(["newer", "older"]);
+    await openReportDetails();
     expect(screen.getByText(/当前问题 · 测量样本 2 项/)).toBeVisible();
-    await userEvent.click(screen.getByText("对比历次推荐排名"));
     const trend = screen.getByRole("region", { name: "推荐排名变化" });
     expect(
       within(trend).queryByText("Which desk suits a small room?"),
@@ -307,6 +407,7 @@ describe("cycle-free measurement report", () => {
     };
     const { detail } = setup(preview, [frozen]);
     detail.mockResolvedValue(frozen);
+    await openReportDetails();
     await userEvent.selectOptions(
       await screen.findByRole("combobox", { name: "报告时间" }),
       frozen.report_id,
@@ -336,6 +437,7 @@ describe("cycle-free measurement report", () => {
   });
   it("switches between a saved snapshot and the latest preview from the report selector", async () => {
     const { detail, save } = setup(preview, [saved]);
+    await openReportDetails();
     const selector = await screen.findByRole("combobox", { name: "报告时间" });
     await userEvent.selectOptions(selector, saved.report_id);
     await waitFor(() =>
@@ -378,11 +480,34 @@ describe("cycle-free measurement report", () => {
         },
       ],
     });
-    const table = await screen.findByRole("table", { name: "AI 推荐了什么" });
+    const allEntities = await screen.findByText("全部推荐对象（1）");
+    const disclosure = allEntities.closest("details")!;
+    expect(allEntities.tagName).toBe("SUMMARY");
+    expect(disclosure).not.toHaveAttribute("open");
     expect(
-      screen.getByRole("region", { name: "关注对象与同类推荐" }),
+      within(disclosure).getByRole("table", { hidden: true }),
+    ).not.toBeVisible();
+    const focusComparison = screen.getByRole("region", {
+      name: "关注对象与同类推荐",
+    });
+    expect(focusComparison).toBeVisible();
+    expect(
+      within(focusComparison).getByText("Compact enough for a backpack"),
     ).toBeVisible();
+    await userEvent.click(
+      within(focusComparison).getByText("查看原文依据与引用"),
+    );
+    expect(
+      within(focusComparison).getByText("Trail light is compact."),
+    ).toBeVisible();
+    expect(within(focusComparison).getByRole("link")).toHaveAttribute(
+      "href",
+      "https://example.org/review",
+    );
+    expect(disclosure).not.toHaveAttribute("open");
     expect(screen.getByText("已推荐，未明确排名")).toBeVisible();
+    await userEvent.click(allEntities);
+    const table = screen.getByRole("table", { name: "AI 推荐了什么" });
     expect(within(table).getByText("Trail light").closest("tr")).toHaveClass(
       "measurement-report-focus-row",
     );
@@ -405,10 +530,9 @@ describe("cycle-free measurement report", () => {
     expect(
       within(table).queryByText("javascript:alert(1)"),
     ).not.toBeInTheDocument();
-    expect(screen.getByText("对比历次推荐排名").parentElement).toHaveAttribute(
-      "open",
-    );
-    const comparison = screen.getByText("对比历次推荐排名").parentElement!;
+    const comparison = screen.getByRole("region", { name: "推荐排名变化" });
+    expect(comparison).toBeVisible();
+    expect(comparison.closest("details")).toBeNull();
     expect(
       comparison.compareDocumentPosition(table) &
         Node.DOCUMENT_POSITION_FOLLOWING,
@@ -482,6 +606,7 @@ describe("cycle-free measurement report", () => {
         },
         samples,
       });
+      await openReportDetails(language);
       expect(
         await screen.findByText(
           language === "en" ? /Answers available: 2/ : /回答可查看 2 项/,
