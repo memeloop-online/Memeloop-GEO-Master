@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  act,
   cleanup,
   render,
   screen,
@@ -99,6 +100,22 @@ const saved: api.MeasurementPeriodReport = {
   revision: 2,
   correction_of: "older-report",
 };
+const selectedTargetId = "66666666-7777-4888-8999-000000000000";
+const otherTargetId = "99999999-aaaa-4bbb-8ccc-dddddddddddd";
+const scopedPreview: api.MeasurementPeriodPreview = {
+  ...preview,
+  samples: [
+    { ...preview.samples[0], target_id: selectedTargetId },
+    {
+      ...preview.samples[0],
+      target_id: otherTargetId,
+      conditions: {
+        ...preview.samples[0].conditions,
+        question: "Which desk suits a small room?",
+      },
+    },
+  ],
+};
 function LocationProbe() {
   const location = useLocation();
   return (
@@ -150,6 +167,264 @@ afterEach(async () => {
   await i18n.changeLanguage("zh-CN");
 });
 describe("cycle-free measurement report", () => {
+  it("captures the first Analyze scope independently of a failed plain save, then retains it on analysis retries", async () => {
+    const { load, save } = setup(scopedPreview);
+    save.mockRejectedValueOnce(new Error("Unconfirmed save"));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "保存此范围的报告" }),
+    );
+    await screen.findByRole("alert");
+    load.mockResolvedValue({
+      ...scopedPreview,
+      report_window_end_at: "2026-10-09T00:00:00Z",
+    });
+    await userEvent.click(screen.getByRole("button", { name: "刷新测量报告" }));
+    await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
+    const filter = screen.getByRole("combobox", { name: "AI 测量问题" });
+    await userEvent.selectOptions(
+      filter,
+      scopedPreview.samples[0].conditions.question,
+    );
+    save.mockRejectedValueOnce(new Error("Unconfirmed analysis save"));
+    await userEvent.click(
+      screen.getByRole("button", { name: "用 AI 分析这份报告" }),
+    );
+    await screen.findByRole("alert");
+    await userEvent.selectOptions(
+      filter,
+      scopedPreview.samples[1].conditions.question,
+    );
+    save.mockResolvedValue({ ...saved, samples: scopedPreview.samples });
+    await userEvent.click(
+      screen.getByRole("button", { name: "用 AI 分析这份报告" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("report-location")).toHaveTextContent(
+        `/app/tenant/project/chat?measurementReport=${saved.report_id}&measurementQuestionTarget=${selectedTargetId}`,
+      ),
+    );
+    expect(save).toHaveBeenCalledTimes(3);
+    for (const call of save.mock.calls)
+      expect(call).toEqual(["tenant", "project", scopedPreview]);
+  });
+
+  it("rejects a missing selected anchor on first Analyze after an unconfirmed plain save", async () => {
+    const { load, save } = setup(scopedPreview);
+    save.mockRejectedValueOnce(new Error("Unconfirmed save"));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "保存此范围的报告" }),
+    );
+    await screen.findByRole("alert");
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "AI 测量问题" }),
+      scopedPreview.samples[0].conditions.question,
+    );
+    load.mockResolvedValue({
+      ...scopedPreview,
+      samples: [scopedPreview.samples[1]],
+    });
+    await userEvent.click(screen.getByRole("button", { name: "刷新测量报告" }));
+    await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
+    await userEvent.click(
+      screen.getByRole("button", { name: "用 AI 分析这份报告" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "未找到所选问题",
+    );
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("report-location")).toHaveTextContent(/^\/$/);
+  });
+
+  it("validates the newly captured Analyze anchor against the saved result after a failed plain save", async () => {
+    const { save } = setup(scopedPreview);
+    save.mockRejectedValueOnce(new Error("Unconfirmed save"));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "保存此范围的报告" }),
+    );
+    await screen.findByRole("alert");
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "AI 测量问题" }),
+      scopedPreview.samples[0].conditions.question,
+    );
+    save.mockResolvedValue({ ...saved, samples: [scopedPreview.samples[1]] });
+    await userEvent.click(
+      screen.getByRole("button", { name: "用 AI 分析这份报告" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "未找到所选问题",
+    );
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId("report-location")).toHaveTextContent(/^\/$/);
+  });
+  it.each([false, true])(
+    "captures the selected sample before saving and retains it across uncertainty: retry=%s",
+    async (retry) => {
+      const reportId = "11111111-2222-4333-8444-555555555555";
+      const { save } = setup(scopedPreview);
+      let resolveSave!: (value: api.MeasurementPeriodReport) => void;
+      let rejectSave!: (reason: Error) => void;
+      save.mockImplementationOnce(
+        () =>
+          new Promise((resolve, reject) => {
+            resolveSave = resolve;
+            rejectSave = reject;
+          }),
+      );
+      const filter = await screen.findByRole("combobox", {
+        name: "AI 测量问题",
+      });
+      await userEvent.selectOptions(
+        filter,
+        scopedPreview.samples[0].conditions.question,
+      );
+      await userEvent.click(
+        screen.getByRole("button", { name: "用 AI 分析这份报告" }),
+      );
+      await userEvent.selectOptions(
+        filter,
+        scopedPreview.samples[1].conditions.question,
+      );
+      const result = {
+        ...saved,
+        report_id: reportId,
+        samples: scopedPreview.samples,
+      };
+      await act(async () => {
+        if (retry) rejectSave(new Error("Unavailable"));
+        else resolveSave(result);
+      });
+      if (retry) {
+        expect(await screen.findByRole("alert")).toHaveTextContent(
+          "保存尚未确认",
+        );
+        save.mockResolvedValue(result);
+        await userEvent.click(
+          screen.getByRole("button", { name: "用 AI 分析这份报告" }),
+        );
+        expect(save.mock.calls[0]).toEqual(save.mock.calls[1]);
+      }
+      await waitFor(() =>
+        expect(screen.getByTestId("report-location")).toHaveTextContent(
+          `/app/tenant/project/chat?measurementReport=${reportId}&measurementQuestionTarget=${selectedTargetId}`,
+        ),
+      );
+      expect(screen.getByTestId("report-location")).not.toHaveTextContent(
+        "Which",
+      );
+    },
+  );
+
+  it("does not widen the selected scope when the saved report lacks its anchor", async () => {
+    const { save } = setup(scopedPreview);
+    save.mockResolvedValue({ ...saved, samples: [scopedPreview.samples[1]] });
+    await userEvent.selectOptions(
+      await screen.findByRole("combobox", { name: "AI 测量问题" }),
+      scopedPreview.samples[0].conditions.question,
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "用 AI 分析这份报告" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "已保存的报告中未找到所选问题",
+    );
+    expect(screen.getByTestId("report-location")).toHaveTextContent(/^\/$/);
+  });
+
+  it("retains the whole-report handoff when no question was selected at the original click", async () => {
+    const { save } = setup(scopedPreview);
+    let completeSave!: (value: api.MeasurementPeriodReport) => void;
+    save.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          completeSave = resolve;
+        }),
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: "用 AI 分析这份报告" }),
+    );
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "AI 测量问题" }),
+      scopedPreview.samples[0].conditions.question,
+    );
+    await act(async () =>
+      completeSave({ ...saved, samples: scopedPreview.samples }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("report-location")).toHaveTextContent(
+        `/app/tenant/project/chat?measurementReport=${saved.report_id}`,
+      ),
+    );
+    expect(screen.getByTestId("report-location")).not.toHaveTextContent(
+      "measurementQuestionTarget",
+    );
+  });
+
+  it("does not turn a selected question into a whole-report handoff after refresh removes its samples", async () => {
+    const { load, save } = setup(scopedPreview);
+    await userEvent.selectOptions(
+      await screen.findByRole("combobox", { name: "AI 测量问题" }),
+      scopedPreview.samples[0].conditions.question,
+    );
+    load.mockResolvedValue({ ...preview, samples: [scopedPreview.samples[1]] });
+    await userEvent.click(screen.getByRole("button", { name: "刷新测量报告" }));
+    await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
+    await userEvent.click(
+      screen.getByRole("button", { name: "用 AI 分析这份报告" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "未找到所选问题",
+    );
+    expect(save).not.toHaveBeenCalled();
+    expect(screen.getByTestId("report-location")).toHaveTextContent(/^\/$/);
+  });
+
+  it.each(["zh-CN", "en"])(
+    "keeps raw evidence available and explains a scope with no optimization samples in %s",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      const { save, detail } = setup(scopedPreview, [saved]);
+      detail.mockResolvedValue({ ...saved, samples: scopedPreview.samples });
+      await openReportDetails(language);
+      await userEvent.selectOptions(
+        screen.getByRole("combobox", {
+          name: language === "en" ? "Report period" : "报告时间",
+        }),
+        saved.report_id,
+      );
+      const filter = await screen.findByRole("combobox", {
+        name: language === "en" ? "AI measurement question" : "AI 测量问题",
+      });
+      await userEvent.selectOptions(
+        filter,
+        scopedPreview.samples[0].conditions.question,
+      );
+      expect(
+        screen.getByText(
+          language === "en"
+            ? /No samples in this scope are available for optimization advice/
+            : /当前范围暂无可用于优化建议的样本/,
+        ),
+      ).toBeVisible();
+      expect(
+        screen.getByRole("link", {
+          name:
+            language === "en"
+              ? "Analyze this report with AI"
+              : "用 AI 分析这份报告",
+        }),
+      ).toHaveAttribute(
+        "href",
+        `/app/tenant/project/chat?measurementReport=${saved.report_id}&measurementQuestionTarget=${selectedTargetId}`,
+      );
+      await userEvent.click(
+        screen.getByText(
+          language === "en" ? "Full answer and sources" : "完整回答与引用",
+        ),
+      );
+      expect(screen.getByText("Saved response answer")).toBeVisible();
+      expect(save).not.toHaveBeenCalled();
+    },
+  );
   it.each(["zh-CN", "en"])(
     "shows focus, question selection and rankings before collapsed report management in %s",
     async (language) => {

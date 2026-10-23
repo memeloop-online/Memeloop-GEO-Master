@@ -72,12 +72,23 @@ export function MeasurementPeriodReportPanel({
     else setLocalSelected(reportId);
   };
   const [saving, setSaving] = useState(false);
-  const [saveState, setSaveState] = useState<"saved" | "saveFailed">();
+  const [saveState, setSaveState] = useState<
+    "saved" | "saveFailed" | "analysisScopeError"
+  >();
   const [window, setWindow] = useState<MeasurementReportWindow>();
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
   const [invalidWindow, setInvalidWindow] = useState(false);
-  const saveIntent = useRef<MeasurementPeriodProjection | undefined>(undefined);
+  const saveIntent = useRef<
+    | {
+        projection: MeasurementPeriodProjection;
+        analysisScope?: {
+          questionTargetId?: string;
+          question?: string;
+        };
+      }
+    | undefined
+  >(undefined);
   const scope = [
     session?.user.id,
     session?.operator.id,
@@ -124,12 +135,16 @@ export function MeasurementPeriodReportPanel({
   const questions = [
     ...new Set(orderedSamples.map((sample) => sample.conditions.question)),
   ];
-  const activeQuestion = questions.includes(questionFilter)
-    ? questionFilter
-    : "";
+  const activeQuestion = questionFilter;
   const visibleSamples = orderedSamples.filter(
     (sample) =>
       !activeQuestion || sample.conditions.question === activeQuestion,
+  );
+  const questionTargetId = activeQuestion
+    ? visibleSamples[0]?.target_id
+    : undefined;
+  const hasOptimizationSamples = visibleSamples.some(
+    (sample) => sample.question_binding?.purpose === "optimization",
   );
   const recordHref = (sample: MeasurementPeriodSample) => {
     const query = new URLSearchParams({
@@ -182,24 +197,62 @@ export function MeasurementPeriodReportPanel({
   };
   const status = (value: string) =>
     t(knownStatuses.has(value) ? `status_${value}` : "status_other");
-  const reportChatHref = (reportId: string) =>
-    `/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/chat?${new URLSearchParams({ measurementReport: reportId })}`;
+  const reportChatHref = (
+    reportId: string,
+    selectedQuestionTargetId?: string,
+  ) =>
+    `/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/chat?${new URLSearchParams({ measurementReport: reportId, ...(selectedQuestionTargetId ? { measurementQuestionTarget: selectedQuestionTargetId } : {}) })}`;
   async function save(analyze = false) {
     if (!preview.data || !matchesScope(preview.data) || saving || !canWrite)
       return;
-    saveIntent.current ??= preview.data;
+    if (
+      analyze &&
+      !saveIntent.current?.analysisScope &&
+      activeQuestion &&
+      !questionTargetId
+    ) {
+      setSaveState("analysisScopeError");
+      return;
+    }
+    saveIntent.current ??= {
+      projection: preview.data,
+    };
+    if (analyze) {
+      saveIntent.current.analysisScope ??= {
+        questionTargetId,
+        question: activeQuestion || undefined,
+      };
+    }
+    const intent = saveIntent.current;
+    const analysisScope = intent.analysisScope;
     setSaving(true);
     setSaveState(undefined);
     try {
       const saved = await saveMeasurementReport(
         tenantId,
         projectId,
-        saveIntent.current,
+        intent.projection,
       );
       if (!matchesScope(saved)) throw new Error("Report scope mismatch");
+      if (
+        analyze &&
+        analysisScope?.question &&
+        !saved.samples.some(
+          (sample) =>
+            sample.target_id === analysisScope.questionTargetId &&
+            sample.conditions.question === analysisScope.question,
+        )
+      ) {
+        saveIntent.current = undefined;
+        setSaveState("analysisScopeError");
+        return;
+      }
       saveIntent.current = undefined;
       setSaveState("saved");
-      if (analyze) navigate(reportChatHref(saved.report_id));
+      if (analyze)
+        navigate(
+          reportChatHref(saved.report_id, analysisScope?.questionTargetId),
+        );
       else {
         setSelected(saved.report_id);
         await history.refetch();
@@ -237,15 +290,21 @@ export function MeasurementPeriodReportPanel({
           </Button>
         </>
       )}
-      {scopedReport?.kind === "measurement_period" && canWrite && (
-        <Link to={reportChatHref(scopedReport.report_id)}>
-          {t("analyzeReport")}
-        </Link>
-      )}
+      {scopedReport?.kind === "measurement_period" &&
+        canWrite &&
+        (!activeQuestion || questionTargetId) && (
+          <Link to={reportChatHref(scopedReport.report_id, questionTargetId)}>
+            {t("analyzeReport")}
+          </Link>
+        )}
       {saveState && (
-        <p role={saveState === "saveFailed" ? "alert" : "status"}>
-          {t(saveState)}
-        </p>
+        <p role={saveState === "saved" ? "status" : "alert"}>{t(saveState)}</p>
+      )}
+      {scopedReport && !hasOptimizationSamples && (
+        <p>{t("analysisPurposeLimitation")}</p>
+      )}
+      {scopedReport && activeQuestion && !questionTargetId && (
+        <p>{t("analysisScopeError")}</p>
       )}
     </div>
   );
@@ -450,6 +509,9 @@ export function MeasurementPeriodReportPanel({
                   onChange={(event) => setQuestionFilter(event.target.value)}
                 >
                   <option value="">{t("allQuestions")}</option>
+                  {activeQuestion && !questions.includes(activeQuestion) && (
+                    <option value={activeQuestion}>{activeQuestion}</option>
+                  )}
                   {questions.map((question) => (
                     <option key={question} value={question}>
                       {question}

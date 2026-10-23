@@ -359,7 +359,7 @@ const TOOL_DESCRIPTIONS = {
   [REPORT_PREVIEW]:
     "Read a temporary, unsaved report preview. For arbitrary-topic or independent measurements use kind measurement_period; no cycle, enterprise setup or new sampling is needed. To report one question-set version, pass question_set with the exact question_set_id and question_set_version_id from scoped discovery; omitted window then includes its saved measurement history. Without question_set, omitted window means the last seven days. To save it, pass the EXACT returned report_window_start_at, report_window_end_at and report_timezone as report_reduce.window and preserve the returned question_set. kind cycle (default) retains current/scoped cycle preview and accepts no question_set. This does not schedule or save anything. Omitted sample details are purpose-restricted, not missing evidence.",
   [REPORT_GET]:
-    "Read an immutable saved report in the current project. Always specify kind from the report context: measurement_period for independent measurement or question-set reports, cycle for optimization-cycle reports. Preserve the exact report_id supplied by the user or a tool result; an ID alone does not identify its kind. Use list true to list measurement_period reports; omit report_id and list to read the latest of the chosen kind. Coverage is authoritative; omitted_sample_details counts details withheld from AI by immutable question purpose, not absent samples.",
+    "Read an immutable saved report in the current project. Always specify kind from the report context: measurement_period for independent measurement or question-set reports, cycle for optimization-cycle reports. Preserve the exact report_id supplied by the user or a tool result; an ID alone does not identify its kind. When the user supplies a selected question target reference, pass that exact question_target_id with the explicit report_id. Rust resolves the same exact question cohort within that saved report, preserving every measurement condition and repeated sample before purpose filtering. Never omit the selector, substitute another question or widen to the whole report if selected details are withheld or unavailable. question_selection.coverage describes the selected cohort; top-level coverage describes the whole report. An empty selected samples array does not authorize reading another topic. Use list true to list measurement_period reports; omit report_id and list to read the latest of the chosen kind. omitted_sample_details counts selected details withheld from AI by immutable question purpose, not absent samples.",
   [REPORT_REDUCE]:
     "Save a report from already persisted evidence, never start sampling or create a cycle. For independent/arbitrary-topic reports choose kind measurement_period and provide the EXACT window returned by report_preview (start_at, end_at, report_timezone) and its question_set when present; replay the identical window and question_set after uncertainty. correction_of creates a new immutable version of that same window and question-set scope. kind cycle (default) reduces the current/scoped cycle after cutoff and accepts no question_set. Do not use withheld evaluation or unclassified sample details for optimization.",
   [KNOWLEDGE_IMPORT_STATUS]:
@@ -875,6 +875,12 @@ const REPORT_GET_SCHEMA = {
       type: "string",
       format: "uuid",
       description: "Omit to read the latest report in the current project.",
+    },
+    question_target_id: {
+      type: "string",
+      format: "uuid",
+      description:
+        "Optional selected question anchor from this saved report. A selected-question sample ID in the user's draft maps to question_target_id. Requires kind measurement_period and explicit report_id; incompatible with list. Preserve the exact supplied reference. Rust selects all samples with the same exact question before immutable purpose filtering.",
     },
     list: {
       type: "boolean",

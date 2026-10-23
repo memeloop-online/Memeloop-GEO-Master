@@ -742,7 +742,12 @@ impl ReportService for AppState {
                         AppError::not_found("no measurement report exists for this project")
                     })?
             };
-            return Ok(ReportResult::MeasurementPeriod(Box::new(report.into())));
+            let projection = geo_worker::MeasurementPeriodReportProjection::from_selected_report(
+                report,
+                request.question_target_id,
+            )
+            .map_err(AppError::invalid_request)?;
+            return Ok(ReportResult::MeasurementPeriod(Box::new(projection)));
         }
         if let Some(id) = request.report_id {
             self.report_repository()
