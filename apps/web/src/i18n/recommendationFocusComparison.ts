@@ -4,6 +4,10 @@ const translations = {
   "zh-CN": {
     title: "关注对象与同类推荐",
     scope: "查看本次回答中的推荐理由与原文依据。",
+    recommendedTitle: "本次回答推荐了什么",
+    recommendedScope:
+      "以下内容展示本次回答中的推荐理由与原文依据，并不解释关注对象为何未被推荐。",
+    fullList: "查看完整推荐列表",
     group: "{{name}} · {{kind}}",
     focused: "关注对象",
     ranked: "推荐第 {{rank}} 位",
@@ -24,6 +28,10 @@ const translations = {
     title: "Tracked item and similar recommendations",
     scope:
       "Review recommendation reasons and supporting excerpts from this answer.",
+    recommendedTitle: "What this answer recommended",
+    recommendedScope:
+      "These are the recommendation reasons and supporting excerpts from this answer; they do not explain why the tracked item was not recommended.",
+    fullList: "View the full recommendation list",
     group: "{{name}} · {{kind}}",
     focused: "Tracked item",
     ranked: "Recommended at #{{rank}}",

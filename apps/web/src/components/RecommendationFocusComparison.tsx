@@ -8,9 +8,11 @@ import "../i18n/recommendationFocusComparison";
 function RecommendationCard({
   item,
   focused = false,
+  showKind = false,
 }: {
   item: RecommendationItem;
   focused?: boolean;
+  showKind?: boolean;
 }) {
   const { t } = useTranslation("recommendationFocusComparison");
   const urls = [
@@ -29,6 +31,9 @@ function RecommendationCard({
       <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
         <strong>{item.name}</strong>
         {focused && <Badge appearance="tint">{t("focused")}</Badge>}
+        {showKind && (
+          <Badge appearance="outline">{t(`kind_${item.kind}`)}</Badge>
+        )}
         <span>
           {item.rank === null
             ? t("unranked")
@@ -64,7 +69,7 @@ function RecommendationCard({
   );
 }
 
-/** Compare explicit ranks only within this answer's verified recommendations. */
+/** Show verified recommendations; compare explicit ranks only for exact focus matches. */
 export function RecommendationFocusComparison({
   items,
   focusNames,
@@ -81,7 +86,23 @@ export function RecommendationFocusComparison({
     group.push(item);
     focusGroups.set(key, group);
   }
-  if (!focusNames.length || !focusGroups.size) return null;
+  if (!focusNames.length || !items.length) return null;
+  if (!focusGroups.size) {
+    return (
+      <section
+        aria-label={t("recommendedTitle")}
+        style={{ display: "grid", gap: 12, minWidth: 0 }}
+      >
+        <h5 style={{ margin: 0 }}>{t("recommendedTitle")}</h5>
+        <p style={{ margin: 0 }}>{t("recommendedScope")}</p>
+        {[...items]
+          .sort((left, right) => left.mention_order - right.mention_order)
+          .map((item, index) => (
+            <RecommendationCard key={index} item={item} showKind />
+          ))}
+      </section>
+    );
+  }
 
   return (
     <section

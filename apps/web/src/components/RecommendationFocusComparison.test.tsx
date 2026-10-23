@@ -169,60 +169,144 @@ describe("tracked recommendation comparison", () => {
   });
 
   it.each([
-    { focusNames: [] },
-    { focusNames: ["Missing target"] },
-    { focusNames: ["Example target Pro"] },
+    { focusNames: [], items: [item()] },
+    { focusNames: ["Example target"], items: [] },
   ])(
-    "renders no comparison without an exact tracked match ($focusNames)",
-    ({ focusNames }) => {
+    "renders nothing without focus names or recommendations ($focusNames)",
+    ({ focusNames, items }) => {
       const { container } = render(
-        <RecommendationFocusComparison
-          items={[item()]}
-          focusNames={focusNames}
-        />,
+        <RecommendationFocusComparison items={items} focusNames={focusNames} />,
       );
       expect(container).toBeEmptyDOMElement();
     },
   );
 
-  it("keeps evidence collapsed and renders only deduplicated safe citations as links", () => {
-    const { container } = render(
+  it("shows every occurrence and its actual kind in mention order when the exact model is absent", () => {
+    render(
       <RecommendationFocusComparison
-        focusNames={["Example target"]}
+        focusNames={["Example target Pro"]}
         items={[
+          item({ kind: "brand", mention_order: 4, rank: 1 }),
+          item({ name: "Other item", kind: "other", mention_order: 6 }),
+          item({ mention_order: 1, rank: 4 }),
           item({
-            evidence_quote: "<script>literal evidence</script>",
-            citation_urls: [
-              "https://example.test/review",
-              "https://example.test/review",
-              "http://example.test/other",
-              "javascript:alert(1)",
-              "data:text/html,unsafe",
-              "https://user:secret@example.test/private",
-              "/relative",
-            ],
+            name: "Example service",
+            kind: "service",
+            mention_order: 5,
+            rank: null,
+          }),
+          item({
+            mention_order: 3,
+            rank: null,
+            reason: "A separate occurrence without a rank.",
+          }),
+          item({
+            name: "Example restaurant",
+            kind: "restaurant",
+            mention_order: 2,
+            rank: 2,
           }),
         ]}
       />,
     );
-    const details = container.querySelector("details");
-    expect(details).not.toHaveAttribute("open");
+    const section = screen.getByRole("region", { name: "本次回答推荐了什么" });
+    expect(section).toBeVisible();
     expect(
-      screen.getByText("<script>literal evidence</script>"),
-    ).not.toBeVisible();
-    fireEvent.click(screen.getByText("查看原文依据与引用"));
-    expect(details).toHaveAttribute("open");
-    expect(screen.getByText("<script>literal evidence</script>")).toBeVisible();
-    expect(container.querySelector("script")).toBeNull();
-    const links = screen.getAllByRole("link");
-    expect(links.map((link) => link.getAttribute("href"))).toEqual([
-      "https://example.test/review",
-      "http://example.test/other",
+      within(section).getByText(
+        "以下内容展示本次回答中的推荐理由与原文依据，并不解释关注对象为何未被推荐。",
+      ),
+    ).toBeVisible();
+    const cards = within(section).getAllByRole("article");
+    expect(cards.map((card) => card.getAttribute("aria-label"))).toEqual([
+      "Example target",
+      "Example restaurant",
+      "Example target",
+      "Example target",
+      "Example service",
+      "Other item",
     ]);
-    for (const link of links) {
-      expect(link).toHaveAttribute("target", "_blank");
-      expect(link).toHaveAttribute("rel", "noopener noreferrer");
-    }
+    expect(within(cards[0]).getByText("产品")).toBeVisible();
+    expect(within(cards[0]).getByText("推荐第 4 位")).toBeVisible();
+    expect(within(cards[1]).getByText("餐馆")).toBeVisible();
+    expect(within(cards[2]).getByText("已推荐，未明确排名")).toBeVisible();
+    expect(
+      within(cards[2]).getByText("A separate occurrence without a rank."),
+    ).toBeVisible();
+    expect(within(cards[3]).getByText("品牌")).toBeVisible();
+    expect(within(cards[4]).getByText("服务")).toBeVisible();
+    expect(within(cards[5]).getByText("其他对象")).toBeVisible();
+    expect(screen.queryByText("关注对象")).not.toBeInTheDocument();
+    expect(screen.queryByText("排名更靠前的推荐")).not.toBeInTheDocument();
+    expect(screen.queryByText("Example target Pro")).not.toBeInTheDocument();
+    expect(screen.queryByText(/暂无法比较先后/)).not.toBeInTheDocument();
+  });
+
+  it.each(["Example target", "Example target Pro"])(
+    "keeps evidence collapsed and renders only safe citations (%s)",
+    (focusName) => {
+      const { container } = render(
+        <RecommendationFocusComparison
+          focusNames={[focusName]}
+          items={[
+            item({
+              evidence_quote: "<script>literal evidence</script>",
+              citation_urls: [
+                "https://example.test/review",
+                "https://example.test/review",
+                "http://example.test/other",
+                "javascript:alert(1)",
+                "data:text/html,unsafe",
+                "https://user:secret@example.test/private",
+                "/relative",
+              ],
+            }),
+          ]}
+        />,
+      );
+      const details = container.querySelector("details");
+      expect(details).not.toHaveAttribute("open");
+      expect(
+        screen.getByText("<script>literal evidence</script>"),
+      ).not.toBeVisible();
+      fireEvent.click(screen.getByText("查看原文依据与引用"));
+      expect(details).toHaveAttribute("open");
+      expect(
+        screen.getByText("<script>literal evidence</script>"),
+      ).toBeVisible();
+      expect(container.querySelector("script")).toBeNull();
+      const links = screen.getAllByRole("link");
+      expect(links.map((link) => link.getAttribute("href"))).toEqual([
+        "https://example.test/review",
+        "http://example.test/other",
+      ]);
+      for (const link of links) {
+        expect(link).toHaveAttribute("target", "_blank");
+        expect(link).toHaveAttribute("rel", "noopener noreferrer");
+      }
+    },
+  );
+
+  it("uses English labels for the absent-focus recommendations", async () => {
+    await i18n.changeLanguage("en");
+    render(
+      <RecommendationFocusComparison
+        focusNames={["Example target Pro"]}
+        items={[item({ reason: null, rank: null })]}
+      />,
+    );
+    expect(
+      screen.getByRole("region", { name: "What this answer recommended" }),
+    ).toBeVisible();
+    expect(screen.getByText("Product")).toBeVisible();
+    expect(screen.getByText("No recommendation reason given")).toBeVisible();
+    expect(
+      screen.getByText("Recommended without an explicit rank"),
+    ).toBeVisible();
+    expect(
+      screen.getByText(
+        "These are the recommendation reasons and supporting excerpts from this answer; they do not explain why the tracked item was not recommended.",
+      ),
+    ).toBeVisible();
   });
 
   it("uses English translations and preserves missing reasons", async () => {

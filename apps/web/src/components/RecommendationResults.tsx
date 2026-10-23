@@ -8,12 +8,32 @@ import {
   TableRow,
 } from "@fluentui/react-components";
 import { useTranslation } from "react-i18next";
+import type { ReactNode } from "react";
 import { decodeVerifiedRecommendations } from "../api/recommendations";
 import { isMeasurementFocus } from "../api/measurementFocus";
 import { safeOriginalPublicUrl } from "../pages/PublicationLookupPanel";
 import "../i18n/observationAnalysis";
 import "../i18n/measurementFocus";
 import { RecommendationFocusComparison } from "./RecommendationFocusComparison";
+
+function FullRecommendationList({
+  collapsed,
+  children,
+}: {
+  collapsed: boolean;
+  children: ReactNode;
+}) {
+  const { t } = useTranslation("recommendationFocusComparison");
+  const list = <div style={{ overflowX: "auto" }}>{children}</div>;
+  return collapsed ? (
+    <details style={{ marginTop: 12 }}>
+      <summary style={{ cursor: "pointer" }}>{t("fullList")}</summary>
+      {list}
+    </details>
+  ) : (
+    list
+  );
+}
 
 /** Render model-extracted entities only; never infer names or rank from prose. */
 export function RecommendationResults({
@@ -29,6 +49,10 @@ export function RecommendationResults({
   const items = [...(decoded ?? [])].sort(
     (left, right) => left.mention_order - right.mention_order,
   );
+  const noFocusMatch =
+    focusNames.length > 0 &&
+    items.length > 0 &&
+    !items.some((item) => isMeasurementFocus(item.name, focusNames));
   return (
     <section aria-label={t("recommendationsTitle")}>
       <h5>{t("recommendationsTitle")}</h5>
@@ -54,7 +78,7 @@ export function RecommendationResults({
       ) : !items.length ? (
         <p>{t("recommendationsEmpty")}</p>
       ) : (
-        <div style={{ overflowX: "auto" }}>
+        <FullRecommendationList collapsed={noFocusMatch}>
           <Table aria-label={t("recommendationsTitle")}>
             <TableHeader>
               <TableRow>
@@ -117,7 +141,7 @@ export function RecommendationResults({
               })}
             </TableBody>
           </Table>
-        </div>
+        </FullRecommendationList>
       )}
     </section>
   );
