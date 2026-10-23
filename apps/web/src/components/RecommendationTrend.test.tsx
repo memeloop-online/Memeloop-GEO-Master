@@ -80,6 +80,189 @@ describe("recommendation rank history", () => {
     });
 
   it.each([
+    [
+      "zh-CN",
+      "推荐频次",
+      "推荐 3 / 4 次 · 75%",
+      "有效样本 4 次 · 暂不可用 1 次",
+      "第 1 位：1 次",
+      "第 3 位：1 次",
+      "未明确排名：1 次",
+    ],
+    [
+      "en",
+      "Recommendation frequency",
+      "Recommended 3 / 4 times · 75%",
+      "Valid samples: 4 · Unavailable: 1",
+      "Rank 1 · Samples: 1",
+      "Rank 3 · Samples: 1",
+      "Unranked samples: 1",
+    ],
+  ])(
+    "shows recommendation frequency and explicit rank distribution in %s",
+    async (language, region, rate, counts, first, third, unranked) => {
+      await i18n.changeLanguage(language);
+      const latest = {
+        ...datedSample("missing", 5),
+        recommendations: undefined,
+      };
+      const previous = datedSample("empty", 4, []);
+      render(
+        <RecommendationTrend
+          samples={[
+            datedSample("third", 2, [{ ...item, rank: 3 }]),
+            latest,
+            datedSample("first", 1, [{ ...item, rank: 1 }]),
+            previous,
+            datedSample("unranked", 3, [{ ...item, rank: null }]),
+          ]}
+          focusNames={[item.name]}
+        />,
+      );
+      const frequency = within(screen.getByRole("region", { name: region }));
+      expect(frequency.getByText(rate)).toBeVisible();
+      expect(frequency.getByText(counts)).toBeVisible();
+      expect(frequency.getByText(first)).toBeVisible();
+      expect(frequency.getByText(third)).toBeVisible();
+      expect(frequency.getByText(unranked)).toBeVisible();
+      const changes = within(
+        screen.getByRole("region", {
+          name:
+            language === "en"
+              ? "Latest tracked item changes"
+              : "关注对象最近变化",
+        }),
+      );
+      expect(
+        changes.getAllByRole("link").map((link) => link.getAttribute("href")),
+      ).toEqual([latest.recordHref, previous.recordHref]);
+    },
+  );
+
+  it.each([
+    [[2, 2], "第 2 位：1 次", "未明确排名：0 次"],
+    [[null, null], "未明确排名：1 次", "未明确排名：1 次"],
+    [[1, 3], "排名不一致：1 次", "未明确排名：0 次"],
+    [[null, 2], "排名不一致：1 次", "未明确排名：0 次"],
+  ])(
+    "counts repeated occurrences once per sample for ranks %j",
+    (ranks, bucket, unranked) => {
+      render(
+        <RecommendationTrend
+          samples={[
+            datedSample(
+              "repeated",
+              1,
+              ranks.map((rank, index) => ({
+                ...item,
+                rank,
+                mention_order: index + 1,
+              })),
+            ),
+            datedSample("empty", 2, []),
+          ]}
+          focusNames={[item.name]}
+        />,
+      );
+      const frequency = within(
+        screen.getByRole("region", { name: "推荐频次" }),
+      );
+      expect(frequency.getByText("推荐 1 / 2 次 · 50%")).toBeVisible();
+      expect(frequency.getByText(bucket)).toBeVisible();
+      expect(frequency.getByText(unranked)).toBeVisible();
+      if (new Set(ranks).size > 1) {
+        expect(frequency.queryByText(/第 \d+ 位：/)).not.toBeInTheDocument();
+      }
+    },
+  );
+
+  it("keeps recommendation frequency separate for exact names and types", () => {
+    render(
+      <RecommendationTrend
+        samples={[
+          datedSample("product", 1),
+          datedSample("brand", 2, [{ ...item, kind: "brand", rank: 1 }]),
+          datedSample("different-model", 3, [
+            { ...item, name: `${item.name} plus`, rank: 1 },
+          ]),
+        ]}
+        focusNames={[item.name]}
+      />,
+    );
+    const frequency = within(screen.getByRole("region", { name: "推荐频次" }));
+    for (const kind of ["产品", "品牌"]) {
+      const entity = within(
+        frequency.getByRole("group", { name: `${item.name} · ${kind}` }),
+      );
+      expect(entity.getByText("推荐 1 / 3 次 · 33.3%")).toBeVisible();
+    }
+    expect(frequency.queryByText(`${item.name} plus`)).not.toBeInTheDocument();
+  });
+
+  it("preserves exact raw names in frequency despite shared focus selection", () => {
+    render(
+      <RecommendationTrend
+        samples={[
+          datedSample("spaced", 1, [{ ...item, name: ` ${item.name} ` }]),
+          datedSample("plain", 2),
+        ]}
+        focusNames={[item.name]}
+      />,
+    );
+    const frequency = within(screen.getByRole("region", { name: "推荐频次" }));
+    expect(frequency.getAllByText("推荐 1 / 2 次 · 50%")).toHaveLength(2);
+  });
+
+  it.each([
+    [[item], "推荐 1 / 1 次 · 100%"],
+    [[], "推荐 0 / 1 次 · 0%"],
+    [[{ ...item, name: `${item.name} plus` }], "推荐 0 / 1 次 · 0%"],
+  ])("shows a single valid sample's frequency for %j", (items, rate) => {
+    render(
+      <RecommendationTrend
+        samples={[datedSample("only", 1, items)]}
+        focusNames={[item.name]}
+      />,
+    );
+    const frequency = within(screen.getByRole("region", { name: "推荐频次" }));
+    expect(frequency.getByText(rate)).toBeVisible();
+    expect(frequency.getByText("有效样本 1 次 · 暂不可用 0 次")).toBeVisible();
+  });
+
+  it.each([
+    ["zh-CN", "推荐频次", "暂无有效结果", "有效样本 0 次 · 暂不可用 4 次"],
+    [
+      "en",
+      "Recommendation frequency",
+      "No valid results yet",
+      "Valid samples: 0 · Unavailable: 4",
+    ],
+  ])(
+    "does not show zero percent when every result is unavailable in %s",
+    async (language, region, empty, counts) => {
+      await i18n.changeLanguage(language);
+      render(
+        <RecommendationTrend
+          samples={[
+            undefined,
+            recommendations([item], "unverified"),
+            { ...recommendations([item]), version: "unsupported" },
+            recommendations([{ ...item, rank: "first" }]),
+          ].map((result, index) => ({
+            ...datedSample(`unavailable-${index}`, index + 1),
+            recommendations: result,
+          }))}
+          focusNames={[item.name]}
+        />,
+      );
+      const frequency = within(screen.getByRole("region", { name: region }));
+      expect(frequency.getByText(empty)).toBeVisible();
+      expect(frequency.getByText(counts)).toBeVisible();
+      expect(frequency.queryByText(/%/)).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([
     [3, 1, "排名上升 2 位"],
     [1, 4, "排名下降 3 位"],
     [2, 2, "排名持平"],
@@ -575,6 +758,7 @@ describe("recommendation rank history", () => {
       .forEach((summary) => fireEvent.click(summary));
     expect(screen.getAllByRole("table")).toHaveLength(2);
     expect(screen.getAllByText("推荐结果可用 1 / 1 次")).toHaveLength(2);
+    expect(screen.getAllByText("推荐 1 / 1 次 · 100%")).toHaveLength(2);
     expect(
       screen.getAllByRole("region", { name: "关注对象最近变化" }),
     ).toHaveLength(2);
@@ -607,8 +791,14 @@ describe("recommendation rank history", () => {
         },
       },
     });
-    render(<RecommendationTrend samples={[first, second]} />);
-    expect(screen.getAllByRole("table")).toHaveLength(2);
+    render(
+      <RecommendationTrend
+        samples={[first, second]}
+        focusNames={[item.name]}
+      />,
+    );
+    expect(screen.getAllByRole("table", { hidden: true })).toHaveLength(2);
+    expect(screen.getAllByText("推荐 1 / 1 次 · 100%")).toHaveLength(2);
   });
 
   it("does not merge aliases or object types by guessing entity identity", () => {

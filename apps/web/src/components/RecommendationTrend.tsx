@@ -68,6 +68,34 @@ type TrendEntry = {
   items: RecommendationItem[] | null;
 };
 
+function recommendationFrequency(
+  entries: readonly TrendEntry[],
+  entityId: string | undefined,
+) {
+  let valid = 0;
+  let recommended = 0;
+  let unranked = 0;
+  let ambiguous = 0;
+  const ranks = new Map<number, number>();
+  for (const { items } of entries) {
+    if (items === null) continue;
+    valid += 1;
+    const matches = items.filter((item) => entityKey(item) === entityId);
+    if (!matches.length) continue;
+    recommended += 1;
+    // Each answer contributes once. Conflicting ranks have no single rank bucket.
+    const sampleRanks = new Set(matches.map((item) => item.rank));
+    if (sampleRanks.size > 1) {
+      ambiguous += 1;
+    } else {
+      const rank = matches[0].rank;
+      if (rank === null) unranked += 1;
+      else ranks.set(rank, (ranks.get(rank) ?? 0) + 1);
+    }
+  }
+  return { valid, recommended, unranked, ambiguous, ranks };
+}
+
 function entityState(entry: TrendEntry, entityId: string | undefined) {
   if (entry.items === null)
     return {
@@ -94,6 +122,13 @@ export function RecommendationTrend({
 }) {
   const { t, i18n } = useTranslation("recommendationTrend");
   const number = new Intl.NumberFormat(i18n.resolvedLanguage || i18n.language);
+  const percent = new Intl.NumberFormat(
+    i18n.resolvedLanguage || i18n.language,
+    {
+      style: "percent",
+      maximumFractionDigits: 1,
+    },
+  );
   const date = new Intl.DateTimeFormat(i18n.resolvedLanguage || i18n.language, {
     dateStyle: "medium",
     timeStyle: "short",
@@ -184,6 +219,88 @@ export function RecommendationTrend({
                     model: input.model,
                   })}
                 </Text>
+                {focusEntities.length > 0 && (
+                  <section aria-label={t("frequency")}>
+                    <Text weight="semibold">{t("frequency")}</Text>
+                    {focusEntities.map((entity) => {
+                      const frequency = recommendationFrequency(
+                        entries,
+                        entity.id,
+                      );
+                      return (
+                        <div
+                          role="group"
+                          aria-label={
+                            entity.kind
+                              ? `${entity.name} · ${t(`kind_${entity.kind}`)}`
+                              : entity.name
+                          }
+                          className="recommendation-trend-focus"
+                          key={entity.id ?? entity.name}
+                        >
+                          <Text weight="semibold">
+                            {entity.name}
+                            {entity.kind && ` · ${t(`kind_${entity.kind}`)}`}
+                          </Text>
+                          <Text>
+                            {frequency.valid === 0
+                              ? t("noValidSamples")
+                              : t("frequencyRate", {
+                                  recommended: number.format(
+                                    frequency.recommended,
+                                  ),
+                                  valid: number.format(frequency.valid),
+                                  percentage: percent.format(
+                                    frequency.recommended / frequency.valid,
+                                  ),
+                                })}
+                          </Text>
+                          <Text
+                            size={200}
+                            className="recommendation-trend-secondary"
+                          >
+                            {t("frequencySamples", {
+                              valid: number.format(frequency.valid),
+                              unavailable: number.format(
+                                entries.length - frequency.valid,
+                              ),
+                            })}
+                          </Text>
+                          {frequency.valid > 0 && (
+                            <div
+                              role="group"
+                              aria-label={t("rankDistribution")}
+                            >
+                              <Text size={200}>{t("rankDistribution")}</Text>
+                              {[...frequency.ranks]
+                                .sort(([left], [right]) => left - right)
+                                .map(([rank, count]) => (
+                                  <div key={rank}>
+                                    {t("rankCount", {
+                                      rank: number.format(rank),
+                                      value: number.format(count),
+                                    })}
+                                  </div>
+                                ))}
+                              <div>
+                                {t("unrankedCount", {
+                                  value: number.format(frequency.unranked),
+                                })}
+                              </div>
+                              {frequency.ambiguous > 0 && (
+                                <div>
+                                  {t("ambiguousCount", {
+                                    value: number.format(frequency.ambiguous),
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </section>
+                )}
                 {focusEntities.length > 0 && (
                   <section aria-label={t("focusChanges")}>
                     {focusEntities.map((entity) => {
