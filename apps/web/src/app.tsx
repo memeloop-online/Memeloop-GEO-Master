@@ -1,6 +1,15 @@
-import { lazy, Suspense } from "react";
-import { Navigate, Outlet, Route, Routes } from "react-router-dom";
+import { lazy, Suspense, useEffect } from "react";
+import {
+  matchPath,
+  Navigate,
+  Outlet,
+  Route,
+  Routes,
+  useLocation,
+} from "react-router-dom";
+import { useAuth } from "./auth/AuthProvider";
 import { RequireMembership, RequireSession } from "./auth/RequireSession";
+import { membershipForTenant } from "./auth/types";
 import { LoadingState } from "./components/AsyncState";
 import { LoginPage } from "./pages/LoginPage";
 import { NotFoundPage } from "./pages/NotFoundPage";
@@ -73,11 +82,15 @@ const ChannelJobsPage = lazy(() =>
     default: module.ChannelJobsPage,
   })),
 );
-const QuestionSetsPage = lazy(() =>
-  import("./pages/QuestionSetsPage").then((module) => ({
+let questionSetsPageModule:
+  Promise<typeof import("./pages/QuestionSetsPage")> | undefined;
+function loadQuestionSetsPage() {
+  questionSetsPageModule ??= import("./pages/QuestionSetsPage");
+  return questionSetsPageModule.then((module) => ({
     default: module.QuestionSetsPage,
-  })),
-);
+  }));
+}
+const QuestionSetsPage = lazy(loadQuestionSetsPage);
 const ContentAssetPage = lazy(() =>
   import("./pages/ContentPages").then((module) => ({
     default: module.ContentAssetPage,
@@ -103,6 +116,26 @@ function PageOutlet() {
 }
 
 export function AppRoutes() {
+  const { status, session } = useAuth();
+  const { pathname } = useLocation();
+  const measurementRoute = matchPath(
+    "/app/:tenantId/:projectId/measurement",
+    pathname,
+  );
+  const preloadMeasurement = Boolean(
+    status === "authenticated" &&
+    measurementRoute &&
+    membershipForTenant(session, measurementRoute.params.tenantId),
+  );
+  useEffect(() => {
+    if (preloadMeasurement) {
+      // This parent commits its fallback while AppShell is still loading,
+      // so the matched page can download alongside the shell.
+      void loadQuestionSetsPage().catch(() => {
+        // React.lazy surfaces a failed import when the route is rendered.
+      });
+    }
+  }, [preloadMeasurement]);
   return (
     <Suspense fallback={<LoadingState />}>
       <Routes>
