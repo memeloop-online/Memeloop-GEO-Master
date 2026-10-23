@@ -3,6 +3,8 @@ import i18n from "./index";
 const translations = {
   "zh-CN": {
     analyzeReport: "用 AI 分析这份报告",
+    reportDetails: "报告详情",
+    allRecommendedEntities: "全部推荐对象（{{count}}）",
     questionFilter: "AI 测量问题",
     allQuestions: "全部问题",
     selectedQuestionScope: "当前问题",
@@ -108,6 +110,8 @@ const translations = {
   },
   en: {
     analyzeReport: "Analyze this report with AI",
+    reportDetails: "Report details",
+    allRecommendedEntities: "All recommended entities ({{count}})",
     questionFilter: "AI measurement question",
     allQuestions: "All questions",
     selectedQuestionScope: "Selected question",

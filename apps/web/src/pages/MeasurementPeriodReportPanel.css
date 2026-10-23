@@ -8,6 +8,18 @@
   font: inherit;
 }
 
+.measurement-report-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-block: 16px;
+}
+
+.measurement-report-details {
+  border-block: 1px solid var(--colorNeutralStroke2);
+}
+
 .measurement-report-sample {
   margin-block: 16px;
 }

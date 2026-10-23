@@ -338,6 +338,7 @@ describe("P13 versioned question sets", () => {
     renderPage(
       "/app/tenant-1/project-1/measurement?tab=records&set=set-1&version=version-1&rankReport=report-1",
     );
+    await userEvent.click(await screen.findByText("报告详情"));
     expect(await screen.findByText("报告版本 1")).toBeVisible();
     expect(
       calls.filter((call) =>

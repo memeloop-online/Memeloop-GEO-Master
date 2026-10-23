@@ -571,6 +571,10 @@ describe("standalone arbitrary-topic measurement", () => {
       await userEvent.click(
         within(versionFolder).getByRole("button", { name: "排名变化" }),
       );
+      await userEvent.click(await within(versionFolder).findByText("报告详情"));
+      await userEvent.click(
+        within(versionFolder).getByText("已保存的测量报告"),
+      );
       await userEvent.click(
         await within(versionFolder).findByRole("button", {
           name: /查看版本 1/,
@@ -651,6 +655,7 @@ describe("standalone arbitrary-topic measurement", () => {
         false,
         "/?tab=records&record=measurement-1&set=set-1&version=version-1&rankReport=report-1",
       );
+      await userEvent.click(await screen.findByText("报告详情"));
       expect(await screen.findByText("报告版本 1")).toBeVisible();
       expect(screen.getByRole("button", { name: "测量历史" })).toHaveAttribute(
         "aria-expanded",
@@ -701,6 +706,7 @@ describe("standalone arbitrary-topic measurement", () => {
               .parentElement!.closest("details"),
           ).toHaveAttribute("open"),
         );
+        await userEvent.click(await screen.findByText("报告详情"));
         expect(await screen.findByText("报告版本 1")).toBeVisible();
         await userEvent.click(
           screen.getByRole("button", { name: "返回测量结果预览" }),
