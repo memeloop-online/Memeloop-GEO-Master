@@ -4,6 +4,7 @@ const translations = {
   "zh-CN": {
     title: "关注对象",
     empty: "想了解哪个产品或品牌的推荐表现？",
+    emptyCompact: "未设置",
     optional: "也可以不设置，直接测量任何问题。",
     edit: "修改",
     add: "设置关注对象",
@@ -29,6 +30,7 @@ const translations = {
   en: {
     title: "Tracked product or brand",
     empty: "Which product or brand do you want to track?",
+    emptyCompact: "Not set",
     optional: "You can also measure any question without setting a target.",
     edit: "Edit",
     add: "Set a target",

@@ -1,0 +1,39 @@
+.measurement-focus {
+  min-width: 0;
+}
+
+.measurement-focus-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.measurement-focus-name {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 4px;
+  overflow-wrap: anywhere;
+}
+
+.measurement-focus.measurement-focus--compact {
+  padding: 8px 0;
+}
+
+.measurement-focus--compact .measurement-focus-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+}
+
+.measurement-focus-name > :first-child {
+  color: var(--colorNeutralForeground2);
+}
+
+.measurement-focus-form {
+  display: grid;
+  gap: 12px;
+}

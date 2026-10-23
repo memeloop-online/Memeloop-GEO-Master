@@ -8,6 +8,7 @@ import {
   MessageBarBody,
   Text,
 } from "@fluentui/react-components";
+import { EditRegular } from "@fluentui/react-icons";
 import { useTranslation } from "react-i18next";
 import { ApiError } from "../api/client";
 import {
@@ -16,15 +17,18 @@ import {
 } from "../api/measurementFocus";
 import { useProjectQuery, useUpdateProjectMutation } from "../api/projects";
 import "../i18n/measurementFocus";
+import "./MeasurementFocusPanel.css";
 
 export function MeasurementFocusPanel({
   tenantId,
   projectId,
   canWrite,
+  compact = false,
 }: {
   tenantId: string;
   projectId: string;
   canWrite: boolean;
+  compact?: boolean;
 }) {
   const { t } = useTranslation("measurementFocus");
   const project = useProjectQuery(tenantId, projectId);
@@ -65,26 +69,28 @@ export function MeasurementFocusPanel({
   }
 
   return (
-    <Card aria-label={t("title")}>
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: 12,
-          flexWrap: "wrap",
-        }}
-      >
-        <div style={{ minWidth: 0, overflowWrap: "anywhere" }}>
+    <Card
+      aria-label={t("title")}
+      className={`measurement-focus${compact ? " measurement-focus--compact" : ""}`}
+      appearance={compact ? "subtle" : "filled"}
+    >
+      <div className="measurement-focus-heading">
+        <div className="measurement-focus-name">
           <Text size={200}>{t("title")}</Text>
-          <div>
-            <Text weight="semibold" size={500}>
-              {focus || t("empty")}
+          {project.data && (
+            <Text weight="semibold" size={compact ? 300 : 500}>
+              {focus || t(compact ? "emptyCompact" : "empty")}
             </Text>
-          </div>
+          )}
         </div>
         {canWrite && project.data && !draft && (
-          <Button onClick={edit}>{t(focus ? "edit" : "add")}</Button>
+          <Button
+            appearance={compact ? "subtle" : "secondary"}
+            icon={compact ? <EditRegular /> : undefined}
+            onClick={edit}
+          >
+            {t(focus ? "edit" : "add")}
+          </Button>
         )}
       </div>
       {!project.data && project.isPending && <p>{t("loading")}</p>}
@@ -96,7 +102,7 @@ export function MeasurementFocusPanel({
           </MessageBarBody>
         </MessageBar>
       )}
-      {!focus && !draft && <Text>{t("optional")}</Text>}
+      {project.data && !focus && !draft && <Text>{t("optional")}</Text>}
       {!!project.data?.settings.competitors.length && (
         <Text size={200}>
           {t("comparison", {
@@ -110,7 +116,7 @@ export function MeasurementFocusPanel({
             event.preventDefault();
             void save();
           }}
-          style={{ display: "grid", gap: 12 }}
+          className="measurement-focus-form"
         >
           <Field label={t("brand")}>
             <Input
