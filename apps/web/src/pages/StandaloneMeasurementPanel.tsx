@@ -143,7 +143,7 @@ export function StandaloneMeasurementPanel({
   const history = useQuery({
     queryKey: [...key, "list", after],
     queryFn: () => listMeasurementPlans(tenantId, projectId, after),
-    enabled: Boolean(session && recordsOnly && active),
+    enabled: Boolean(session && recordsOnly && active && historyOpen),
     retry: false,
   });
   const detail = useQuery({
@@ -220,7 +220,9 @@ export function StandaloneMeasurementPanel({
       projectId,
     ],
     queryFn: () => listAllQuestionSets(tenantId, projectId),
-    enabled: Boolean(session && (recordsOnly || canWrite)),
+    enabled: Boolean(
+      session && (recordsOnly ? active && historyOpen : canWrite),
+    ),
     retry: false,
   });
   const selectedSet =
