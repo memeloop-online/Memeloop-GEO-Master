@@ -1942,6 +1942,42 @@ test("cycle-free reports use existing tools and the exact preview window", async
         "measurement_period",
       ]);
       assert.match(tool.description, /measurement_period/u);
+      assert.match(
+        tool.description,
+        /original_status and coverage\.counts preserve the initial execution receipt/u,
+      );
+      assert.match(
+        tool.description,
+        /observed_live validates that original live receipt only/u,
+      );
+      assert.match(
+        tool.description,
+        /source-grounded saved answer: use its raw_answer, citations and supplied recommendations/u,
+      );
+      assert.match(
+        tool.description,
+        /even when original_status is unknown and observed_live is false/u,
+      );
+      assert.match(
+        tool.description,
+        /grounded_saved_analysis counts these interpretations, not additional measurements/u,
+      );
+      assert.match(
+        tool.description,
+        /Use only returned sample details for concrete findings; aggregate coverage does not reveal withheld answers or recommendations/u,
+      );
+      assert.match(
+        tool.description,
+        /neither establishes a fresh live observation nor proves current platform performance/u,
+      );
+      assert.match(
+        tool.description,
+        /provenance\.actual_model identifies the analysis model; sample\.conditions identifies the measurement provider, model and protocol/u,
+      );
+      assert.match(
+        tool.description,
+        /Preserve the original receipt, evidence cutoff, sample conditions and purpose restrictions/u,
+      );
     }
     assert.match(
       requests[0].tools.find((entry) => entry.function.name === "report_reduce")
@@ -1956,7 +1992,7 @@ test("cycle-free reports use existing tools and the exact preview window", async
   }
 });
 
-test("question-set report tools preserve the selected version, frozen results and exact save retry", async () => {
+test("question-set report tools preserve grounded saved answers with unknown receipts, the selected version and exact save retry", async () => {
   const questionSet = {
     question_set_id: "00000000-0000-4000-8000-000000000051",
     question_set_version_id: "00000000-0000-4000-8000-000000000052",
@@ -1982,6 +2018,13 @@ test("question-set report tools preserve the selected version, frozen results an
     ["report_get", { kind: "measurement_period", report_id: reportId }],
   ];
   const sample = {
+    plan_id: "00000000-0000-4000-8000-000000000054",
+    target_id: "00000000-0000-4000-8000-000000000055",
+    attempt_id: "00000000-0000-4000-8000-000000000056",
+    comparison_key: "synthetic-protocol",
+    scheduled_at: "2026-10-03T00:00:00Z",
+    original_status: "unknown",
+    observed_live: false,
     conditions: {
       question: "Synthetic buying question",
       provider: "synthetic-provider",
@@ -1994,7 +2037,40 @@ test("question-set report tools preserve the selected version, frozen results an
       language: "en",
       sample_ordinal: 0,
     },
-    recommendations: { items: [{ name: "Synthetic item", rank: 1 }] },
+    observation: {
+      raw_answer:
+        "1. Synthetic item is recommended for its documented features.",
+      citations: ["https://source.example.invalid/item"],
+      observed_at: "2026-10-03T00:00:00Z",
+      received_at: "2026-10-03T00:00:01Z",
+      provenance: {
+        revision_id: "00000000-0000-4000-8000-000000000057",
+        source: { kind: "attempt_evidence", evidence_index: 0 },
+        source_sha256: "a".repeat(64),
+        observed_at: "2026-10-03T00:00:00Z",
+        analyzed_at: "2026-10-03T00:00:10Z",
+        actual_model: "synthetic-analysis-model",
+        config_revision: 1,
+        prompt_version: "geo.observation.extract.v4",
+        parser_version: "geo.observation.extract.v6",
+      },
+    },
+    recommendations: {
+      version: "geo.recommendations.v1",
+      status: "verified",
+      items: [
+        {
+          name: "Synthetic item",
+          kind: "product",
+          mention_order: 1,
+          rank: 1,
+          reason: "Documented features",
+          evidence_quote:
+            "1. Synthetic item is recommended for its documented features.",
+          citation_urls: ["https://source.example.invalid/item"],
+        },
+      ],
+    },
   };
   const report = {
     kind: "measurement_period",
@@ -2003,7 +2079,12 @@ test("question-set report tools preserve the selected version, frozen results an
     report_window_start_at: window.start_at,
     report_window_end_at: window.end_at,
     report_timezone: window.report_timezone,
-    coverage: { planned: 2 },
+    coverage: {
+      planned: 2,
+      counts: { unknown: 2 },
+      observed_live: 0,
+      grounded_saved_analysis: 1,
+    },
     omitted_sample_details: 1,
     samples: [sample],
   };
@@ -2071,7 +2152,7 @@ test("question-set report tools preserve the selected version, frozen results an
       const receipt = JSON.parse(request.messages.at(-1).content);
       assert.deepEqual(receipt.question_set, questionSet);
       assert.deepEqual(receipt.samples, [sample]);
-      assert.equal(receipt.coverage.planned, 2);
+      assert.deepEqual(receipt.coverage, report.coverage);
       assert.equal(receipt.omitted_sample_details, 1);
     }
   } finally {
