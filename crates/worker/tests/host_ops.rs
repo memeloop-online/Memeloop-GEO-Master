@@ -1592,6 +1592,10 @@ async fn report_ops_without_an_adapter_fail_closed_after_scope_validation() {
         r#"
         import { hostOps, attempt } from "./host-ops.js";
         await attempt("read", () => hostOps.reportGet({
+          kind: "cycle",
+          report_id: "00000000-0000-4000-8000-000000000001",
+        }));
+        await attempt("read-kind-missing", () => hostOps.reportGet({
           report_id: "00000000-0000-4000-8000-000000000001",
         }));
         await attempt("preview", () => hostOps.reportPreview({}));
@@ -1617,6 +1621,11 @@ async fn report_ops_without_an_adapter_fail_closed_after_scope_validation() {
     assert_typed_error(
         &outcome(&runtime.host_state(), "read"),
         "capability_missing",
+        "report_get",
+    );
+    assert_typed_error(
+        &outcome(&runtime.host_state(), "read-kind-missing"),
+        "invalid_request",
         "report_get",
     );
     assert_typed_error(
