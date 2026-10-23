@@ -239,6 +239,7 @@ describe("question set rank reports", () => {
       "project",
       preview(),
     );
+    await userEvent.click(screen.getByText("报告详情"));
     expect(
       screen.getByText("这是已保存的固定版本，后续结果不会改写本报告。"),
     ).toBeVisible();
