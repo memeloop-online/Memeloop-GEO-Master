@@ -2,6 +2,10 @@ import i18n from "./index";
 
 const translations = {
   "zh-CN": {
+    analysisScopeError:
+      "已保存的报告中未找到所选问题。请刷新报告后重新选择问题。",
+    analysisPurposeLimitation:
+      "当前范围暂无可用于优化建议的样本；仍可查看完整回答与引用。",
     analyzeReport: "用 AI 分析这份报告",
     reportDetails: "报告详情",
     allRecommendedEntities: "全部推荐对象（{{count}}）",
@@ -109,6 +113,10 @@ const translations = {
     scopeError: "此报告不属于当前项目，请重新打开。",
   },
   en: {
+    analysisScopeError:
+      "The selected question was not found in the saved report. Refresh the report and select the question again.",
+    analysisPurposeLimitation:
+      "No samples in this scope are available for optimization advice. You can still inspect full answers and sources.",
     analyzeReport: "Analyze this report with AI",
     reportDetails: "Report details",
     allRecommendedEntities: "All recommended entities ({{count}})",

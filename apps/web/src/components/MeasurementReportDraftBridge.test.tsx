@@ -5,6 +5,7 @@ import i18n from "../i18n";
 import {
   MeasurementReportDraftBridge,
   measurementReportReference,
+  measurementQuestionTargetReference,
 } from "./MeasurementReportDraftBridge";
 
 const native = vi.hoisted(() => ({
@@ -18,6 +19,7 @@ vi.mock("@memeloop/react-ui/chat", () => ({
 }));
 
 const reportId = "11111111-2222-4333-8444-555555555555";
+const questionTargetId = "66666666-7777-4888-8999-000000000000";
 
 afterEach(async () => {
   cleanup();
@@ -26,6 +28,21 @@ afterEach(async () => {
 });
 
 describe("measurement report draft reference", () => {
+  it("accepts a question sample UUID only with a valid report and never widens an invalid selected scope", () => {
+    const search = `?measurementReport=${reportId}&measurementQuestionTarget=${questionTargetId}`;
+    expect(measurementReportReference(search)).toBe(reportId);
+    expect(measurementQuestionTargetReference(search)).toBe(questionTargetId);
+    expect(
+      measurementQuestionTargetReference(
+        `?measurementQuestionTarget=${questionTargetId}`,
+      ),
+    ).toBeUndefined();
+    for (const value of ["", "invalid", `${questionTargetId}/extra`]) {
+      const invalid = `?measurementReport=${reportId}&measurementQuestionTarget=${encodeURIComponent(value)}`;
+      expect(measurementReportReference(invalid)).toBeUndefined();
+      expect(measurementQuestionTargetReference(invalid)).toBeUndefined();
+    }
+  });
   it("accepts only UUID syntax at the URL boundary", () => {
     expect(measurementReportReference(`?measurementReport=${reportId}`)).toBe(
       reportId,
@@ -47,6 +64,30 @@ describe("measurement report draft reference", () => {
 });
 
 describe("native measurement report draft bridge", () => {
+  it.each(["zh-CN", "en"])(
+    "keeps the report and selected question sample separate in an editable %s draft",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      native.getState.mockReturnValue({ text: "" });
+      render(
+        <MeasurementReportDraftBridge
+          reportId={reportId}
+          questionTargetId={questionTargetId}
+        />,
+      );
+      expect(native.setText).toHaveBeenCalledWith(
+        expect.stringContaining(reportId),
+      );
+      expect(native.setText).toHaveBeenCalledWith(
+        expect.stringContaining(
+          language === "en"
+            ? `selected question (sample ID: ${questionTargetId})`
+            : `所选问题（样本编号：${questionTargetId}）`,
+        ),
+      );
+      expect(native.send).not.toHaveBeenCalled();
+    },
+  );
   it("sets editable native text once, without sending, even after rerenders or language changes", async () => {
     native.getState.mockReturnValue({ text: "" });
     const { rerender, container } = render(
@@ -76,10 +117,18 @@ describe("native measurement report draft bridge", () => {
     (text) => {
       native.getState.mockReturnValue({ text });
       const { rerender } = render(
-        <MeasurementReportDraftBridge reportId={reportId} />,
+        <MeasurementReportDraftBridge
+          reportId={reportId}
+          questionTargetId={questionTargetId}
+        />,
       );
       native.getState.mockReturnValue({ text: "" });
-      rerender(<MeasurementReportDraftBridge reportId={reportId} />);
+      rerender(
+        <MeasurementReportDraftBridge
+          reportId={reportId}
+          questionTargetId={questionTargetId}
+        />,
+      );
       expect(native.setText).not.toHaveBeenCalled();
       expect(native.send).not.toHaveBeenCalled();
     },

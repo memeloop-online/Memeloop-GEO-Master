@@ -271,6 +271,8 @@ async fn model_report_details_exclude_heldout_and_unclassified_without_mutating_
     };
     let samples = [
         (Some(QuestionPurpose::Optimization), "allowed"),
+        (Some(QuestionPurpose::Optimization), "allowed_other_model"),
+        (Some(QuestionPurpose::Optimization), "other_topic"),
         (Some(QuestionPurpose::FrozenEvaluation), "heldout_canary"),
         (None, "unclassified_canary"),
     ]
@@ -283,9 +285,15 @@ async fn model_report_details_exclude_heldout_and_unclassified_without_mutating_
             attempt_id: Some(Uuid::new_v4()),
             comparison_key: format!("{canary}_question"),
             conditions: geo_domain::MeasurementReportConditions {
-                question: "Synthetic question".into(),
+                question: if canary.starts_with("allowed") {
+                    "Synthetic question".into()
+                } else if canary == "other_topic" {
+                    "Synthetic question?".into()
+                } else {
+                    format!("{canary}_question")
+                },
                 provider: "provider".into(),
-                model: "model".into(),
+                model: canary.into(),
                 surface: "consumer_web".into(),
                 search_mode: "web_search".into(),
                 protocol_version: "v1".into(),
@@ -361,6 +369,7 @@ async fn model_report_details_exclude_heldout_and_unclassified_without_mutating_
         let result = tools.report_get(&scope, request).await.unwrap();
         let text = serde_json::to_string(&result).unwrap();
         assert!(text.contains("allowed_answer"));
+        assert!(text.contains("allowed_other_model_answer"));
         assert!(!text.contains("heldout_canary"));
         assert!(!text.contains("unclassified_canary"));
         assert!(!text.contains("search_heldout_canary"));
@@ -370,6 +379,103 @@ async fn model_report_details_exclude_heldout_and_unclassified_without_mutating_
         assert!(text.contains("\"omitted_sample_details\":2"));
         assert!(text.contains("\"planned\":3"));
     }
+    for anchor in &stored.samples {
+        let result = tools
+            .report_get(
+                &scope,
+                ReportGetRequest {
+                    kind: ReportKind::MeasurementPeriod,
+                    report_id: Some(stored.report_id),
+                    question_target_id: Some(anchor.target_id),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let ReportResult::MeasurementPeriod(projection) = result else {
+            panic!("selected measurement report required")
+        };
+        let selection = projection.question_selection.as_ref().unwrap();
+        let allowed = anchor
+            .question_binding
+            .as_ref()
+            .is_some_and(|binding| binding.purpose == QuestionPurpose::Optimization);
+        let selected = stored
+            .samples
+            .iter()
+            .filter(|sample| sample.conditions.question == anchor.conditions.question)
+            .count();
+        assert_eq!(selection.question_target_id, anchor.target_id);
+        assert_eq!(selection.selected_sample_count, selected);
+        assert_eq!(selection.excluded_sample_count, 5 - selected);
+        assert_eq!(selection.coverage.planned, selected as u64);
+        assert_eq!(projection.report.coverage, stored.coverage);
+        assert_eq!(projection.report.input_hash, stored.input_hash);
+        assert_eq!(projection.report.window(), stored.window());
+        assert_eq!(projection.report.question_set, stored.question_set);
+        assert!(projection.report.search.is_none());
+        assert_eq!(projection.omitted_search_sample_details, 0);
+        assert_eq!(
+            projection.report.samples.len(),
+            if allowed { selected } else { 0 }
+        );
+        assert_eq!(
+            projection.omitted_sample_details,
+            if allowed { 0 } else { 1 }
+        );
+        for sample in &projection.report.samples {
+            // Preserve all models, exact attempts and evidence from the frozen cohort.
+            assert_eq!(
+                Some(sample),
+                stored
+                    .samples
+                    .iter()
+                    .find(|row| row.target_id == sample.target_id)
+            );
+            assert_eq!(sample.conditions.question, anchor.conditions.question);
+        }
+        let text = serde_json::to_string(&projection).unwrap();
+        assert!(!text.contains("heldout_canary"));
+        assert!(!text.contains("unclassified_canary"));
+        assert!(!text.contains("search_allowed"));
+        if !allowed {
+            assert!(!text.contains("allowed_answer"));
+            assert!(!text.contains("allowed_other_model_answer"));
+        }
+        if anchor.conditions.question == "Synthetic question" {
+            assert!(!text.contains("other_topic_answer"));
+        }
+    }
+    assert!(
+        tools
+            .report_get(
+                &scope,
+                ReportGetRequest {
+                    kind: ReportKind::MeasurementPeriod,
+                    report_id: Some(stored.report_id),
+                    question_target_id: Some(Uuid::new_v4()),
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err()
+    );
+    let mut foreign = scope.clone();
+    foreign.tenant_id = Uuid::new_v4().into();
+    assert!(
+        tools
+            .report_get(
+                &foreign,
+                ReportGetRequest {
+                    kind: ReportKind::MeasurementPeriod,
+                    report_id: Some(stored.report_id),
+                    question_target_id: Some(stored.samples[0].target_id),
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err()
+    );
     let projection = geo_worker::MeasurementPeriodPreviewProjection::from(preview);
     let text = serde_json::to_string(&projection).unwrap();
     assert!(!text.contains("heldout_canary"));

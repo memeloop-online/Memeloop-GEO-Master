@@ -419,7 +419,7 @@ fn validate_recorded_return(
             }
         }
         HostOp::ReportGet | HostOp::ReportReduce => {
-            let (kind, report_id, list, window, correction, question_set) =
+            let (kind, report_id, list, window, correction, question_set, question_target_id) =
                 if op == HostOp::ReportGet {
                     let request: ReportGetRequest = typed(op, request)?;
                     (
@@ -429,6 +429,7 @@ fn validate_recorded_return(
                         None,
                         None,
                         None,
+                        request.question_target_id,
                     )
                 } else {
                     let request: ReportReduceRequest = typed(op, request)?;
@@ -439,10 +440,41 @@ fn validate_recorded_return(
                         request.window,
                         Some(request.correction_of),
                         Some(request.question_set),
+                        None,
                     )
                 };
             let valid_report = |projection: &MeasurementPeriodReportProjection| {
                 let report = &projection.report;
+                let selected_planned = match (&projection.question_selection, question_target_id) {
+                    (None, None) => Some(report.coverage.planned),
+                    (Some(selection), Some(target_id))
+                        if selection.question_target_id == target_id
+                            && selection.selected_sample_count > 0
+                            && selection.coverage.planned
+                                == selection.selected_sample_count as u64
+                            && selection
+                                .coverage
+                                .counts
+                                .values()
+                                .try_fold(0_u64, |total, count| total.checked_add(*count))
+                                == Some(selection.coverage.planned)
+                            && selection.coverage.observed_live <= selection.coverage.planned
+                            && selection.coverage.grounded_saved_analysis
+                                <= selection.coverage.planned
+                            && (selection.selected_sample_count as u64)
+                                .checked_add(selection.excluded_sample_count as u64)
+                                == Some(report.coverage.planned)
+                            && report.search.is_none()
+                            && report.samples.first().is_none_or(|first| {
+                                report.samples.iter().all(|sample| {
+                                    sample.conditions.question == first.conditions.question
+                                })
+                            }) =>
+                    {
+                        Some(selection.coverage.planned)
+                    }
+                    _ => None,
+                };
                 scope.project_id == Some(report.project_id)
                     && !report.report_id.is_nil()
                     && report_id.is_none_or(|id| id == report.report_id)
@@ -450,11 +482,13 @@ fn validate_recorded_return(
                     && question_set
                         .as_ref()
                         .is_none_or(|selected| selected == &report.question_set)
-                    && report_projection_safe(
-                        &report.samples,
-                        projection.omitted_sample_details,
-                        report.coverage.planned,
-                    )
+                    && selected_planned.is_some_and(|planned| {
+                        report_projection_safe(
+                            &report.samples,
+                            projection.omitted_sample_details,
+                            planned,
+                        )
+                    })
                     && search_report_projection_safe(
                         report.search.as_ref(),
                         projection.omitted_search_sample_details,
@@ -3579,6 +3613,17 @@ pub struct MeasurementPeriodReportProjection {
     pub omitted_sample_details: usize,
     #[serde(default)]
     pub omitted_search_sample_details: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_selection: Option<MeasurementPeriodQuestionSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementPeriodQuestionSelection {
+    pub question_target_id: Uuid,
+    pub selected_sample_count: usize,
+    pub excluded_sample_count: usize,
+    pub coverage: geo_domain::MeasurementPeriodCoverage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3649,15 +3694,64 @@ fn report_window_matches(
         })
 }
 
-impl From<geo_domain::MeasurementPeriodReport> for MeasurementPeriodReportProjection {
-    fn from(mut report: geo_domain::MeasurementPeriodReport) -> Self {
+impl MeasurementPeriodReportProjection {
+    pub fn from_selected_report(
+        mut report: geo_domain::MeasurementPeriodReport,
+        question_target_id: Option<Uuid>,
+    ) -> Result<Self, String> {
+        let question_selection = if let Some(question_target_id) = question_target_id {
+            let question = report
+                .samples
+                .iter()
+                .find(|sample| sample.target_id == question_target_id)
+                .ok_or("selected question is not in this saved report")?
+                .conditions
+                .question
+                .clone();
+            let original_count = report.samples.len();
+            report
+                .samples
+                .retain(|sample| sample.conditions.question == question);
+            let mut coverage = geo_domain::MeasurementPeriodCoverage::default();
+            for sample in &report.samples {
+                coverage.planned += 1;
+                *coverage
+                    .counts
+                    .entry(sample.original_status.clone())
+                    .or_default() += 1;
+                coverage.observed_live += u64::from(sample.observed_live);
+                coverage.grounded_saved_analysis += u64::from(
+                    sample
+                        .observation
+                        .as_ref()
+                        .is_some_and(|observation| observation.provenance.is_some()),
+                );
+            }
+            // Selecting an AI question does not select unrelated search evidence.
+            report.search = None;
+            Some(MeasurementPeriodQuestionSelection {
+                question_target_id,
+                selected_sample_count: report.samples.len(),
+                excluded_sample_count: original_count - report.samples.len(),
+                coverage,
+            })
+        } else {
+            None
+        };
         let count = report.samples.len();
         report.samples.retain(report_sample_allowed);
-        Self {
+        Ok(Self {
             omitted_sample_details: count - report.samples.len(),
             omitted_search_sample_details: project_search_samples(&mut report.search),
+            question_selection,
             report,
-        }
+        })
+    }
+}
+
+impl From<geo_domain::MeasurementPeriodReport> for MeasurementPeriodReportProjection {
+    fn from(report: geo_domain::MeasurementPeriodReport) -> Self {
+        Self::from_selected_report(report, None).expect("an unselected report needs no anchor")
     }
 }
 
@@ -3715,6 +3809,8 @@ pub struct ReportGetRequest {
     pub report_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub list: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_target_id: Option<Uuid>,
 }
 
 /// A read-only projection for the current project cycle by default.
@@ -3749,6 +3845,11 @@ pub struct ReportReduceRequest {
 impl ReportGetRequest {
     pub fn validate(&self) -> Result<(), String> {
         if self.report_id.is_some_and(|id| id.is_nil())
+            || self.question_target_id.is_some_and(|id| id.is_nil())
+            || (self.question_target_id.is_some()
+                && (self.kind != ReportKind::MeasurementPeriod
+                    || self.report_id.is_none()
+                    || self.list))
             || (self.list
                 && (self.kind != ReportKind::MeasurementPeriod || self.report_id.is_some()))
         {
@@ -4848,7 +4949,8 @@ mod tests {
             ReportGetRequest {
                 kind: ReportKind::MeasurementPeriod,
                 list: true,
-                report_id: Some(Uuid::new_v4())
+                report_id: Some(Uuid::new_v4()),
+                ..Default::default()
             }
             .validate()
             .is_err()
@@ -4872,6 +4974,37 @@ mod tests {
             assert_eq!(request.report_id, Some(report_id));
             assert!(request.validate().is_ok());
             assert_eq!(serde_json::to_value(request).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn selected_question_requires_an_exact_saved_measurement_report() {
+        let request = ReportGetRequest {
+            kind: ReportKind::MeasurementPeriod,
+            report_id: Some(Uuid::new_v4()),
+            question_target_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(request.validate().is_ok());
+        for invalid in [
+            ReportGetRequest {
+                kind: ReportKind::Cycle,
+                ..request.clone()
+            },
+            ReportGetRequest {
+                report_id: None,
+                ..request.clone()
+            },
+            ReportGetRequest {
+                list: true,
+                ..request.clone()
+            },
+            ReportGetRequest {
+                question_target_id: Some(Uuid::nil()),
+                ..request
+            },
+        ] {
+            assert!(invalid.validate().is_err());
         }
     }
 
@@ -5040,6 +5173,53 @@ mod tests {
         .unwrap();
         let report =
             geo_domain::freeze_measurement_period(&scope, preview.clone(), 1, None).unwrap();
+        for anchor in &report.samples {
+            let projection = MeasurementPeriodReportProjection::from_selected_report(
+                report.clone(),
+                Some(anchor.target_id),
+            )
+            .unwrap();
+            let result =
+                serde_json::to_value(ReportResult::MeasurementPeriod(Box::new(projection)))
+                    .unwrap();
+            let request = serde_json::json!({"kind": "measurement_period", "report_id": report.report_id, "question_target_id": anchor.target_id});
+            validate_recorded_return(HostOp::ReportGet, &scope, &request, &result).unwrap();
+            for (field, value) in [
+                ("question_target_id", serde_json::json!(Uuid::new_v4())),
+                ("selected_sample_count", serde_json::json!(0)),
+                ("excluded_sample_count", serde_json::json!(7)),
+                (
+                    "coverage",
+                    serde_json::json!({"planned": 0, "counts": {}, "grounded_saved_analysis": 0, "observed_live": 0}),
+                ),
+            ] {
+                let mut forged = result.clone();
+                forged["question_selection"][field] = value;
+                assert!(
+                    validate_recorded_return(HostOp::ReportGet, &scope, &request, &forged).is_err()
+                );
+            }
+            let mut absent = result.clone();
+            absent.as_object_mut().unwrap().remove("question_selection");
+            assert!(
+                validate_recorded_return(HostOp::ReportGet, &scope, &request, &absent).is_err()
+            );
+            let mut unselected = request.clone();
+            unselected
+                .as_object_mut()
+                .unwrap()
+                .remove("question_target_id");
+            assert!(
+                validate_recorded_return(HostOp::ReportGet, &scope, &unselected, &result).is_err()
+            );
+        }
+        assert!(
+            MeasurementPeriodReportProjection::from_selected_report(
+                report.clone(),
+                Some(Uuid::new_v4())
+            )
+            .is_err()
+        );
         let preview_result = serde_json::to_value(ReportPreviewResult::MeasurementPeriod(
             Box::new(preview.into()),
         ))

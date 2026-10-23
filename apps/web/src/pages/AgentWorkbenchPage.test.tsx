@@ -100,10 +100,18 @@ afterEach(async () => {
 });
 
 describe("P00 AI workbench routing", () => {
-  it.each(["unsent", "invalid-reference", "saved-conversation"])(
+  it.each([
+    "unsent",
+    "selected-question",
+    "invalid-question",
+    "question-only",
+    "invalid-reference",
+    "saved-conversation",
+  ])(
     "handles a report handoff in the native composer: %s",
     async (destination) => {
       const reportId = "11111111-2222-4333-8444-555555555555";
+      const questionTargetId = "66666666-7777-4888-8999-000000000000";
       const conversation = {
         id: "synthetic-conversation",
         title: "Synthetic saved conversation",
@@ -146,13 +154,22 @@ describe("P00 AI workbench routing", () => {
       }
       const chatPath = "/app/tenant-a/project-a/chat";
       renderApp(
-        `${chatPath}${destination === "saved-conversation" ? `/${conversation.id}` : ""}?measurementReport=${destination === "invalid-reference" ? "invalid" : reportId}`,
+        `${chatPath}${destination === "saved-conversation" ? `/${conversation.id}` : ""}?${destination === "question-only" ? "" : `measurementReport=${destination === "invalid-reference" ? "invalid" : reportId}&`}${destination === "unsent" ? "" : `measurementQuestionTarget=${destination === "invalid-question" ? "invalid" : questionTargetId}`}`,
         <LocationProbe />,
       );
       const input = await screen.findByLabelText("输入任务");
       await waitFor(() => {
-        if (destination === "unsent") {
+        if (["unsent", "selected-question"].includes(destination)) {
           expect((input as HTMLTextAreaElement).value).toContain(reportId);
+          if (destination === "selected-question") {
+            expect((input as HTMLTextAreaElement).value).toContain(
+              `所选问题（样本编号：${questionTargetId}）`,
+            );
+          } else {
+            expect((input as HTMLTextAreaElement).value).not.toContain(
+              questionTargetId,
+            );
+          }
         } else {
           expect(input).toHaveValue("");
         }
@@ -163,7 +180,7 @@ describe("P00 AI workbench routing", () => {
       expect(
         requests.some(({ path }) => path.includes("measurement-reports")),
       ).toBe(false);
-      if (destination !== "unsent") return;
+      if (!["unsent", "selected-question"].includes(destination)) return;
 
       const user = userEvent.setup();
       await user.clear(input);

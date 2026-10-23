@@ -48,6 +48,7 @@ import { ErrorState, LoadingState } from "../components/AsyncState";
 import {
   MeasurementReportDraftBridge,
   measurementReportReference,
+  measurementQuestionTargetReference,
 } from "../components/MeasurementReportDraftBridge";
 import { useAppearance } from "../appearance/AppearanceProvider";
 import { formatUiDate } from "../i18n";
@@ -224,6 +225,7 @@ function AgentChat({
   onRefresh,
   onFirstMessage,
   measurementReportId,
+  measurementQuestionTargetId,
 }: {
   conversation: AgentConversationDetail;
   tenantId: string;
@@ -231,6 +233,7 @@ function AgentChat({
   onRefresh: () => Promise<void>;
   onFirstMessage?: (conversationId: string) => void;
   measurementReportId?: string;
+  measurementQuestionTargetId?: string;
 }) {
   const { t } = useTranslation();
   const { appearance } = useAppearance();
@@ -643,8 +646,9 @@ function AgentChat({
             composerToolbar={
               measurementReportId ? (
                 <MeasurementReportDraftBridge
-                  key={measurementReportId}
+                  key={`${measurementReportId}:${measurementQuestionTargetId ?? ""}`}
                   reportId={measurementReportId}
+                  questionTargetId={measurementQuestionTargetId}
                 />
               ) : undefined
             }
@@ -706,6 +710,8 @@ export function AgentWorkbenchPage() {
   const { tenantId, projectId, conversationId } = useParams();
   const { search } = useLocation();
   const measurementReportId = measurementReportReference(search);
+  const measurementQuestionTargetId =
+    measurementQuestionTargetReference(search);
   const navigate = useNavigate();
   const conversations = useAgentConversationsQuery(tenantId, projectId);
   const conversation = useAgentConversationQuery(
@@ -786,6 +792,7 @@ export function AgentWorkbenchPage() {
               projectId={projectId}
               onRefresh={refresh}
               measurementReportId={measurementReportId}
+              measurementQuestionTargetId={measurementQuestionTargetId}
               onFirstMessage={(id) => {
                 void refetchConversations();
                 navigate(`${base}/${encodeURIComponent(id)}`, {

@@ -1651,6 +1651,12 @@ test("saved report reads require an explicit kind and preserve the exact report 
         );
         assert.match(tool.description, /Always specify kind/u);
         assert.match(tool.description, /question-set/u);
+        assert.match(tool.description, /question_target_id/u);
+        assert.match(tool.description, /Never omit the selector/u);
+        assert.equal(
+          tool.parameters.properties.question_target_id.format,
+          "uuid",
+        );
         assert.doesNotMatch(
           tool.parameters.properties.kind.description,
           /default|compatibility/u,
@@ -1820,6 +1826,7 @@ test("report preview is independent of official read and reduce", async () => {
 
 test("cycle-free reports use existing tools and the exact preview window", async () => {
   const reportId = "00000000-0000-4000-8000-000000000042";
+  const questionTargetId = "00000000-0000-4000-8000-000000000044";
   const window = {
     start_at: "2026-10-01T00:00:00Z",
     end_at: "2026-10-08T00:00:00Z",
@@ -1829,6 +1836,14 @@ test("cycle-free reports use existing tools and the exact preview window", async
     ["report_preview", { kind: "measurement_period" }],
     ["report_reduce", { kind: "measurement_period", window }],
     ["report_get", { kind: "measurement_period", report_id: reportId }],
+    [
+      "report_get",
+      {
+        kind: "measurement_period",
+        report_id: reportId,
+        question_target_id: questionTargetId,
+      },
+    ],
     ["report_get", { kind: "measurement_period", list: true }],
   ];
   const calls = [];
@@ -1855,6 +1870,19 @@ test("cycle-free reports use existing tools and the exact preview window", async
     },
     async reportGet(request) {
       calls.push(["report_get", request]);
+      if (request.question_target_id)
+        return {
+          kind: "measurement_period",
+          report_id: reportId,
+          samples: [],
+          omitted_sample_details: 1,
+          question_selection: {
+            question_target_id: request.question_target_id,
+            selected_sample_count: 1,
+            excluded_sample_count: 2,
+            coverage: { planned: 1 },
+          },
+        };
       return request.list
         ? { kind: "measurement_period_list", items: [{ report_id: reportId }] }
         : { kind: "measurement_period", report_id: reportId };
@@ -1898,6 +1926,13 @@ test("cycle-free reports use existing tools and the exact preview window", async
     });
     assert.equal(result.answer, "Saved the measurement report.");
     assert.deepEqual(calls, steps);
+    const selectedResult = JSON.parse(requests[4].messages.at(-1).content);
+    assert.equal(
+      selectedResult.question_selection.question_target_id,
+      questionTargetId,
+    );
+    assert.deepEqual(selectedResult.samples, []);
+    assert.equal(selectedResult.omitted_sample_details, 1);
     for (const name of ["report_get", "report_preview", "report_reduce"]) {
       const tool = requests[0].tools.find(
         (entry) => entry.function.name === name,
