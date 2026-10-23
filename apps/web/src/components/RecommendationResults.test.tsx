@@ -86,7 +86,7 @@ describe("recommendation results", () => {
     const summary = screen.getByText("查看完整推荐列表");
     const details = summary.closest("details");
     expect(details).not.toHaveAttribute("open");
-    expect(screen.queryByRole("table")).not.toBeInTheDocument();
+    expect(screen.getByRole("table", { hidden: true })).not.toBeVisible();
     fireEvent.click(summary);
     expect(details).toHaveAttribute("open");
     const table = screen.getByRole("table");
@@ -250,7 +250,14 @@ describe("recommendation results", () => {
     expect(
       screen.getByRole("region", { name: "What this answer recommended" }),
     ).toBeVisible();
-    expect(screen.getByText("View the full recommendation list")).toBeVisible();
-    expect(screen.queryByRole("table")).not.toBeInTheDocument();
+    const summary = screen.getByText("View the full recommendation list");
+    expect(summary).toBeVisible();
+    const details = summary.closest("details");
+    expect(details).not.toHaveAttribute("open");
+    const table = screen.getByRole("table", { hidden: true });
+    expect(table).not.toBeVisible();
+    fireEvent.click(summary);
+    expect(details).toHaveAttribute("open");
+    expect(table).toBeVisible();
   });
 });
