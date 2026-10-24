@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { Button, Card, Field, Input } from "@fluentui/react-components";
 import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
@@ -41,6 +41,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { captureMeasurementReportExport } from "./measurementReportExport";
 import { downloadMeasurementReportCsv } from "./measurementReportsCsv";
 import "../i18n/measurementReportExport";
+import "../i18n/measurementReportPdf";
 
 const knownStatuses = new Set([
   "pending",
@@ -102,6 +103,7 @@ export function MeasurementPeriodReportPanel({
   const focusTargets = measurementFocusTargets(project.data?.settings);
   const { t, i18n } = useTranslation("measurementReports");
   const { t: exportText } = useTranslation("measurementReportExport");
+  const { t: pdfText } = useTranslation("measurementReportPdf");
   const [selectedTargetKey, setSelectedTargetKey] = useState<string>();
   const targetKey = (target: MeasurementTarget) =>
     JSON.stringify([target.kind, target.name.trim()]);
@@ -110,6 +112,9 @@ export function MeasurementPeriodReportPanel({
     focusTargets[0] ??
     null;
   const [exportFailed, setExportFailed] = useState(false);
+  const [pdfExporting, setPdfExporting] = useState(false);
+  const [pdfFailed, setPdfFailed] = useState(false);
+  const pdfController = useRef<AbortController | null>(null);
   const [localSelected, setLocalSelected] = useState<string>();
   const [questionFilter, setQuestionFilter] = useState("");
   const selected = onSelectReport ? selectedReportId : localSelected;
@@ -348,6 +353,52 @@ export function MeasurementPeriodReportPanel({
     }
   }
   const scopedReport = report && matchesScope(report) ? report : undefined;
+  const pdfScope = JSON.stringify([...scope, selected, window]);
+  useLayoutEffect(() => {
+    setPdfExporting(false);
+    setPdfFailed(false);
+    return () => {
+      pdfController.current?.abort();
+      pdfController.current = null;
+    };
+  }, [pdfScope, scopedReport, current.isError]);
+
+  async function exportPdf() {
+    if (
+      !scopedReport ||
+      current.isPending ||
+      current.isError ||
+      pdfController.current
+    )
+      return;
+    const controller = new AbortController();
+    pdfController.current = controller;
+    setPdfFailed(false);
+    setPdfExporting(true);
+    try {
+      const input = captureMeasurementReportExport({
+        report: scopedReport,
+        view: {
+          question: activeQuestion || null,
+          target: selectedTarget,
+        },
+        locale:
+          (i18n.resolvedLanguage || i18n.language) === "en" ? "en" : "zh-CN",
+      });
+      const { downloadMeasurementReportPdf } =
+        await import("./measurementReportsPdf");
+      if (controller.signal.aborted) return;
+      await downloadMeasurementReportPdf(input, { signal: controller.signal });
+    } catch {
+      if (!controller.signal.aborted) setPdfFailed(true);
+    } finally {
+      if (pdfController.current === controller) {
+        pdfController.current = null;
+        if (!controller.signal.aborted) setPdfExporting(false);
+      }
+    }
+  }
+
   function analyzeRecommendation(
     sample: MeasurementPeriodSample,
     item: RecommendationItem,
@@ -414,6 +465,12 @@ export function MeasurementPeriodReportPanel({
         </Button>
       )}
       {exportFailed && <p role="alert">{exportText("downloadFailed")}</p>}
+      {scopedReport && !current.isPending && !current.isError && (
+        <Button disabled={pdfExporting} onClick={() => void exportPdf()}>
+          {pdfText(pdfExporting ? "generatingPdf" : "downloadPdf")}
+        </Button>
+      )}
+      {pdfFailed && <p role="alert">{pdfText("downloadFailed")}</p>}
       {selected && (
         <Button onClick={() => setSelected(undefined)}>
           {t(questionSet ? "questionSetBack" : "back")}

@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   act,
   cleanup,
+  fireEvent,
   render,
   screen,
   waitFor,
@@ -14,8 +15,26 @@ import { MemoryRouter, useLocation } from "react-router-dom";
 import * as api from "../api/measurementReports";
 import type { MeasurementTarget } from "../api/projects";
 import * as csv from "./measurementReportsCsv";
+import type { MeasurementReportExportInput } from "./measurementReportExport";
 import { MeasurementPeriodReportPanel } from "./MeasurementPeriodReportPanel";
 import i18n from "../i18n";
+
+const pdf = vi.hoisted(() => ({
+  download:
+    vi.fn<
+      (
+        input: MeasurementReportExportInput,
+        options?: { signal?: AbortSignal },
+      ) => Promise<void>
+    >(),
+  importGate: null as Promise<void> | null,
+  importStarted: false,
+}));
+vi.mock("./measurementReportsPdf", async () => {
+  pdf.importStarted = true;
+  await pdf.importGate;
+  return { downloadMeasurementReportPdf: pdf.download };
+});
 
 const auth = vi.hoisted(() => ({ role: "member" }));
 const focus = vi.hoisted(() => ({
@@ -141,6 +160,7 @@ function LocationProbe() {
 function setup(
   input: api.MeasurementPeriodPreview = preview,
   reports: api.MeasurementPeriodReportSummary[] = [],
+  questionSet?: api.MeasurementReportQuestionSet,
 ) {
   const load = vi
     .spyOn(api, "getMeasurementReportPreview")
@@ -153,17 +173,21 @@ function setup(
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  render(
+  const rendered = render(
     <FluentProvider theme={webLightTheme}>
       <QueryClientProvider client={client}>
         <MemoryRouter>
-          <MeasurementPeriodReportPanel tenantId="tenant" projectId="project" />
+          <MeasurementPeriodReportPanel
+            tenantId="tenant"
+            projectId="project"
+            questionSet={questionSet}
+          />
           <LocationProbe />
         </MemoryRouter>
       </QueryClientProvider>
     </FluentProvider>,
   );
-  return { load, list, detail, save };
+  return { load, list, detail, save, unmount: rendered.unmount };
 }
 async function openReportDetails(language = "zh-CN") {
   const summary = await screen.findByText(
@@ -172,15 +196,247 @@ async function openReportDetails(language = "zh-CN") {
   if (!summary.parentElement!.hasAttribute("open"))
     await userEvent.click(summary);
 }
+beforeEach(() => {
+  pdf.download.mockResolvedValue(undefined);
+});
 afterEach(async () => {
   auth.role = "member";
   focus.name = "";
   focus.targets = null;
   cleanup();
   vi.restoreAllMocks();
+  pdf.download.mockReset();
   await i18n.changeLanguage("zh-CN");
 });
 describe("cycle-free measurement report", () => {
+  it("captures PDF evidence, question, target aliases and language before loading the renderer", async () => {
+    await i18n.changeLanguage("en");
+    let releaseImport!: () => void;
+    pdf.importGate = new Promise<void>((resolve) => {
+      releaseImport = resolve;
+    });
+    const input = structuredClone(scopedPreview);
+    focus.targets = [
+      { name: "Example lamp", kind: "product", aliases: [] },
+      { name: "Example tent", kind: "product", aliases: ["Tent alias"] },
+    ];
+    const { load, list, detail, save } = setup(input);
+    await userEvent.selectOptions(
+      await screen.findByRole("combobox", { name: "View tracked item" }),
+      JSON.stringify(["product", "Example tent"]),
+    );
+    const question = input.samples[1].conditions.question;
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "AI measurement question" }),
+      question,
+    );
+    const expected = structuredClone({
+      report: input,
+      view: { question, target: focus.targets[1] },
+      locale: "en",
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Download PDF" }));
+    await waitFor(() => expect(pdf.importStarted).toBe(true));
+    expect(pdf.download).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: "Generating PDF…" }),
+    ).toBeDisabled();
+    input.samples[0].conditions.question = "Later question";
+    focus.targets[1].aliases.push("Later alias");
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "AI measurement question" }),
+      "",
+    );
+    await act(async () => {
+      await i18n.changeLanguage("zh-CN");
+    });
+    await act(async () => releaseImport());
+    await waitFor(() => expect(pdf.download).toHaveBeenCalledTimes(1));
+    expect(pdf.download.mock.calls[0][0]).toEqual(expected);
+    expect(pdf.download.mock.calls[0][0].report).not.toBe(input);
+    expect(pdf.download.mock.calls[0][0].view.target).not.toBe(
+      focus.targets[1],
+    );
+    expect(pdf.download.mock.calls[0][1]?.signal?.aborted).toBe(false);
+    expect(save).not.toHaveBeenCalled();
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(detail).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { alreadySaved: false, language: "en" },
+    { alreadySaved: true, language: "en" },
+    { alreadySaved: false, language: "zh-CN" },
+    { alreadySaved: true, language: "zh-CN" },
+  ] as const)(
+    "downloads the displayed PDF for read-only viewers without targets or writes: saved=$alreadySaved, locale=$language",
+    async ({ alreadySaved, language }) => {
+      auth.role = "viewer";
+      await i18n.changeLanguage(language);
+      const { load, list, detail, save } = setup(
+        preview,
+        alreadySaved ? [saved] : [],
+      );
+      if (alreadySaved) {
+        await openReportDetails(language);
+        await userEvent.selectOptions(
+          screen.getByRole("combobox", {
+            name: language === "en" ? "Report period" : "报告时间",
+          }),
+          saved.report_id,
+        );
+        await screen.findByText(
+          language === "en" ? "Report revision 2" : "报告版本 2",
+        );
+      }
+      await userEvent.click(
+        await screen.findByRole("button", {
+          name: language === "en" ? "Download PDF" : "下载 PDF",
+        }),
+      );
+      await waitFor(() => expect(pdf.download).toHaveBeenCalledTimes(1));
+      expect(pdf.download.mock.calls[0][0]).toEqual({
+        report: alreadySaved ? saved : preview,
+        view: { question: null, target: null },
+        locale: language,
+      });
+      expect(save).not.toHaveBeenCalled();
+      expect(load).toHaveBeenCalledTimes(1);
+      expect(list).toHaveBeenCalledTimes(1);
+      expect(detail).toHaveBeenCalledTimes(alreadySaved ? 1 : 0);
+    },
+  );
+
+  it.each(["en", "zh-CN"])(
+    "prevents duplicate PDF downloads, localizes failures and allows retry in %s",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      let fail!: (error: Error) => void;
+      pdf.download.mockImplementationOnce(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            fail = reject;
+          }),
+      );
+      const { save } = setup();
+      const button = await screen.findByRole("button", {
+        name: language === "en" ? "Download PDF" : "下载 PDF",
+      });
+      await userEvent.click(button);
+      await waitFor(() => expect(pdf.download).toHaveBeenCalledTimes(1));
+      expect(button).toBeDisabled();
+      await userEvent.click(button);
+      expect(pdf.download).toHaveBeenCalledTimes(1);
+      await act(async () => fail(new Error("Internal PDF failure")));
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        i18n.t("downloadFailed", { ns: "measurementReportPdf" }),
+      );
+      expect(
+        screen.queryByText(/Internal PDF failure/),
+      ).not.toBeInTheDocument();
+      expect(button).toBeEnabled();
+      await userEvent.click(button);
+      await waitFor(() => expect(pdf.download).toHaveBeenCalledTimes(2));
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(save).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["report", "window", "unmount"])(
+    "cancels a pending PDF on %s changes without stale errors",
+    async (change) => {
+      let fail!: (error: Error) => void;
+      pdf.download.mockImplementationOnce(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            fail = reject;
+          }),
+      );
+      const questionSet =
+        change === "window"
+          ? {
+              question_set_id: "question-set",
+              question_set_version_id: "version",
+            }
+          : undefined;
+      const { unmount, save } = setup(
+        { ...preview, question_set: questionSet },
+        change === "window" ? [] : [saved],
+        questionSet,
+      );
+      await userEvent.click(
+        await screen.findByRole("button", { name: "下载 PDF" }),
+      );
+      await waitFor(() => expect(pdf.download).toHaveBeenCalledTimes(1));
+      const signal = pdf.download.mock.calls[0][1]?.signal;
+      expect(signal?.aborted).toBe(false);
+      if (change === "unmount") unmount();
+      else {
+        await openReportDetails();
+        if (change === "report") {
+          await userEvent.selectOptions(
+            screen.getByRole("combobox", { name: "报告时间" }),
+            saved.report_id,
+          );
+          await screen.findByText("报告版本 2");
+        } else {
+          await userEvent.click(screen.getByText("选择报告时间范围"));
+          fireEvent.change(screen.getByLabelText("开始时间（本地时间）"), {
+            target: { value: "2026-10-01T00:00" },
+          });
+          fireEvent.change(screen.getByLabelText("结束时间（本地时间）"), {
+            target: { value: "2026-10-05T00:00" },
+          });
+          await userEvent.click(
+            screen.getByRole("button", { name: "应用时间范围" }),
+          );
+        }
+      }
+      expect(signal?.aborted).toBe(true);
+      await act(async () => fail(new Error("Cancelled PDF failure")));
+      expect(
+        screen.queryByText(/Cancelled PDF failure/),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      if (change !== "unmount") {
+        const button = await screen.findByRole("button", { name: "下载 PDF" });
+        expect(button).toBeEnabled();
+        await userEvent.click(button);
+        await waitFor(() => expect(pdf.download).toHaveBeenCalledTimes(2));
+      }
+      expect(save).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not begin rendering when the panel unmounts during the lazy import", async () => {
+    const { unmount } = setup();
+    const button = await screen.findByRole("button", { name: "下载 PDF" });
+    act(() => {
+      fireEvent.click(button);
+      unmount();
+    });
+    await vi.dynamicImportSettled();
+    expect(pdf.download).not.toHaveBeenCalled();
+  });
+
+  it("clears a failed PDF state when another report is selected", async () => {
+    pdf.download.mockRejectedValueOnce(new Error("Download unavailable"));
+    setup(preview, [saved]);
+    await userEvent.click(
+      await screen.findByRole("button", { name: "下载 PDF" }),
+    );
+    await screen.findByRole("alert");
+    await openReportDetails();
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "报告时间" }),
+      saved.report_id,
+    );
+    await screen.findByText("报告版本 2");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "下载 PDF" })).toBeEnabled();
+  });
+
   it.each([
     { alreadySaved: false, language: "en" },
     { alreadySaved: true, language: "en" },
@@ -303,6 +559,10 @@ describe("cycle-free measurement report", () => {
       screen.queryByRole("button", { name: "下载测量 CSV" }),
     ).not.toBeInTheDocument();
     expect(download).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("button", { name: "下载 PDF" }),
+    ).not.toBeInTheDocument();
+    expect(pdf.download).not.toHaveBeenCalled();
   });
 
   it("keeps export selection aligned with current target aliases and removal fallback", async () => {
@@ -353,6 +613,10 @@ describe("cycle-free measurement report", () => {
       screen.queryByRole("button", { name: "下载测量 CSV" }),
     ).not.toBeInTheDocument();
     expect(download).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("button", { name: "下载 PDF" }),
+    ).not.toBeInTheDocument();
+    expect(pdf.download).not.toHaveBeenCalled();
   });
 
   it.each(["en", "zh-CN"])(
