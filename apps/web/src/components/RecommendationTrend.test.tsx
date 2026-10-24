@@ -655,7 +655,7 @@ describe("recommendation rank history", () => {
     expect(conditions.closest("details")).not.toHaveAttribute("open");
     const context = screen.getByText("consumer_web · CN · zh-CN · enabled");
     const matching = screen.getByText(
-      "对象按提取出的名称与类型对应，别名尚未合并。",
+      "关注对象按当前设置的名称或别名及类型匹配。完整历史保留回答中的原始名称。",
     );
     expect(context).not.toBeVisible();
     expect(matching).not.toBeVisible();

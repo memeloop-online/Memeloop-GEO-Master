@@ -680,7 +680,7 @@ describe("cycle-free measurement report", () => {
       focus.name = "Trail light";
       setup(preview, [saved]);
       const focusPanel = screen.getByLabelText(
-        language === "en" ? "Tracked product or brand" : "关注对象",
+        language === "en" ? "Tracked targets" : "关注对象",
       );
       const trend = await screen.findByRole("region", {
         name:
