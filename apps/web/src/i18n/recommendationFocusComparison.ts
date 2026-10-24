@@ -17,7 +17,7 @@ const translations = {
     ahead: "排名更靠前的推荐",
     noneAhead: "本次同类推荐中，没有明确排名更靠前的对象。",
     cannotCompare: "本次回答未给出该对象的明确排名，暂无法比较先后。",
-    ambiguous: "同名同类型出现不同排名，暂无法比较先后。",
+    ambiguous: "同一关注对象出现不同排名，暂无法比较先后。",
     reasonMissing: "未说明推荐理由",
     evidence: "查看原文依据与引用",
     kind_product: "产品",
@@ -46,7 +46,7 @@ const translations = {
     cannotCompare:
       "This answer gives no explicit rank for this item, so ranks cannot be compared.",
     ambiguous:
-      "Results with this name and type have conflicting ranks, so ranks cannot be compared.",
+      "This target has conflicting ranks, so ranks cannot be compared.",
     reasonMissing: "No recommendation reason given",
     evidence: "View supporting excerpt and citations",
     kind_product: "Product",
