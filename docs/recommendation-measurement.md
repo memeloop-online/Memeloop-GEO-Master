@@ -34,4 +34,12 @@
 
 - Rust 仅接受当前提取 prompt `geo.observation.extract.v4`、parser `geo.observation.extract.v6`，不保留旧格式重放。
 - 执行器输出 `outcome.audit.recommendations`，结构为 `version: geo.recommendations.v1`、`status: verified|unverified` 与 `items`；条目包含 `name`、`kind`、`mention_order`、可空 `rank`／`reason`、`evidence_quote`、`citation_urls`。推荐字段不可用不能丢掉有效答案与引用。
-- 执行器待修：推荐证据加入后超过审计总大小时，目前会整体拒绝有效答案。应单独处理推荐字段，不让辅助展示挤掉正文。
+- 当前执行器在推荐证据使审计超限时先降级推荐字段，保留答案、引用和有界来源；仅基础审计仍超限时拒绝。已有对应边界回归，不再列为未修复问题。
+
+## 独立关注对象配置
+
+- `ProjectSettings.measurement_targets` 保存 `{name, kind, aliases}[]`；默认空列表，项目 PATCH 整体替换，空列表清空。企业名称和产品资料不是隐式测量目标。
+- 类型沿用产品、餐馆、品牌、服务及其他对象；名称与用户明确配置的别名去除首尾空白后精确匹配，不推断大小写、型号或品牌归属。同类型目标之间的名称交叉应明确报错，不能静默合并。
+- 同目标同样本最多计一次推荐；别名命中排名不一致时单列，不取最好名次。原始名称、排名、分析版本和证据保留，不修改已存报告。
+- 报告关注视图使用当前项目配置，不冒充生成报告时冻结的配置；完整历史仍保留原始名称。目标不自动加入消费者问题。
+- 对话通过既有 `project_current`／`project_revise` 读写同一字段，无新 host op；API、Agent bundle 与 Web 须配套部署。
