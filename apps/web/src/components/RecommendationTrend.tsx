@@ -13,6 +13,7 @@ import {
 import { useTranslation } from "react-i18next";
 import type { ChannelTargetInput } from "../api/channelJobs";
 import { isMeasurementFocus } from "../api/measurementFocus";
+import type { MeasurementTarget } from "../api/projects";
 import {
   decodeVerifiedRecommendations,
   type RecommendationItem,
@@ -70,7 +71,7 @@ type TrendEntry = {
 
 function recommendationFrequency(
   entries: readonly TrendEntry[],
-  entityId: string | undefined,
+  target: MeasurementTarget,
 ) {
   let valid = 0;
   let recommended = 0;
@@ -80,7 +81,7 @@ function recommendationFrequency(
   for (const { items } of entries) {
     if (items === null) continue;
     valid += 1;
-    const matches = items.filter((item) => entityKey(item) === entityId);
+    const matches = items.filter((item) => isMeasurementFocus(item, [target]));
     if (!matches.length) continue;
     recommended += 1;
     // Each answer contributes once. Conflicting ranks have no single rank bucket.
@@ -96,15 +97,15 @@ function recommendationFrequency(
   return { valid, recommended, unranked, ambiguous, ranks };
 }
 
-function entityState(entry: TrendEntry, entityId: string | undefined) {
+function entityState(entry: TrendEntry, target: MeasurementTarget) {
   if (entry.items === null)
     return {
       label:
         entry.sample.recommendations == null ? "notAnalyzed" : "unverified",
     };
-  const matches = entry.items.filter((item) => entityKey(item) === entityId);
+  const matches = entry.items.filter((item) => isMeasurementFocus(item, [target]));
   if (!matches.length) return { label: "absent" };
-  if (matches.length > 1) return { label: "ambiguous" };
+  if (new Set(matches.map((item) => item.rank)).size > 1) return { label: "ambiguous" };
   return matches[0].rank === null
     ? { label: "unranked" }
     : { label: "rank", rank: matches[0].rank };
@@ -117,7 +118,7 @@ export function RecommendationTrend({
   embedded = false,
 }: {
   samples: readonly RecommendationTrendSample[];
-  focusTargets?: readonly string[];
+  focusTargets?: readonly MeasurementTarget[];
   embedded?: boolean;
 }) {
   const { t, i18n } = useTranslation("recommendationTrend");
