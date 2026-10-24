@@ -906,20 +906,24 @@ function SampleRecommendations({
   );
   return (
     <div className="measurement-report-recommendations">
-      {focusNames.length > 0 && focused.length === 0 && (
+      {focusTargets.length > 0 && focused.length === 0 && (
         <p className="measurement-report-focus">
-          <strong>{t("currentFocus", { name: focusNames.join("、") })}</strong>
+          <strong>
+            {t("currentFocus", {
+              name: focusTargets.map((target) => target.name).join(" / "),
+            })}
+          </strong>
           {" · "}
           {t("focusNotFound")}
         </p>
       )}
       <RecommendationFocusComparison
         items={items}
-        focusNames={focusNames}
+        focusTargets={focusTargets}
         onAnalyze={onAnalyze}
         analysisPending={analysisPending}
       />
-      {focusNames.length > 0 ? (
+      {focusTargets.length > 0 ? (
         <details className="measurement-report-evidence">
           <summary>
             {t("allRecommendedEntities", { count: items.length })}
