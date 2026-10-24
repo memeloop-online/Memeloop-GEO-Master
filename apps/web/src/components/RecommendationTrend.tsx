@@ -113,11 +113,11 @@ function entityState(entry: TrendEntry, entityId: string | undefined) {
 /** Compare verified extracted recommendations; never derive entities or ranks from prose. */
 export function RecommendationTrend({
   samples,
-  focusNames = [],
+  focusTargets = [],
   embedded = false,
 }: {
   samples: readonly RecommendationTrendSample[];
-  focusNames?: readonly string[];
+  focusTargets?: readonly string[];
   embedded?: boolean;
 }) {
   const { t, i18n } = useTranslation("recommendationTrend");
@@ -168,14 +168,14 @@ export function RecommendationTrend({
             }
             const input = ordered[0].measurement;
             const focusEntities = [
-              ...new Set(focusNames.map((name) => name.trim())),
+              ...new Set(focusTargets.map((name) => name.trim())),
             ].flatMap<{
               id: string | undefined;
               name: string;
               kind: RecommendationItem["kind"] | undefined;
             }>((name) => {
               const matches = [...entities].filter(([, entity]) =>
-                isMeasurementFocus(entity.name, [name]),
+                isMeasurementFocus(entity, [name]),
               );
               return matches.length
                 ? matches.map(([id, entity]) => ({
@@ -507,7 +507,7 @@ export function RecommendationTrend({
                           <TableRow
                             key={entityId}
                             style={
-                              isMeasurementFocus(entity.name, focusNames)
+                              isMeasurementFocus(entity, focusTargets)
                                 ? {
                                     backgroundColor:
                                       tokens.colorBrandBackground2,
@@ -518,7 +518,7 @@ export function RecommendationTrend({
                             <TableCell style={{ overflowWrap: "anywhere" }}>
                               <div>{entity.name}</div>
                               <small>{t(`kind_${entity.kind}`)}</small>
-                              {isMeasurementFocus(entity.name, focusNames) && (
+                              {isMeasurementFocus(entity, focusTargets) && (
                                 <div>{t("tracked")}</div>
                               )}
                             </TableCell>

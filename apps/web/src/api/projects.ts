@@ -44,9 +44,16 @@ export interface DistributionScope {
   replication_policy: "one_account_per_platform";
 }
 
+export interface MeasurementTarget {
+  name: string;
+  kind: "product" | "restaurant" | "brand" | "service" | "other";
+  aliases: string[];
+}
+
 export interface ProjectSettings {
   brand_name: string;
   product_name?: string | null;
+  measurement_targets: MeasurementTarget[];
   market: string;
   language: string;
   target_audience?: string | null;

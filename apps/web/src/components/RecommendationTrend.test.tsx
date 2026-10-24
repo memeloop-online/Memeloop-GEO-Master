@@ -116,7 +116,7 @@ describe("recommendation rank history", () => {
             previous,
             datedSample("unranked", 3, [{ ...item, rank: null }]),
           ]}
-          focusNames={[item.name]}
+          focusTargets={[item.name]}
         />,
       );
       const frequency = within(screen.getByRole("region", { name: region }));
@@ -161,7 +161,7 @@ describe("recommendation rank history", () => {
             ),
             datedSample("empty", 2, []),
           ]}
-          focusNames={[item.name]}
+          focusTargets={[item.name]}
         />,
       );
       const frequency = within(
@@ -186,7 +186,7 @@ describe("recommendation rank history", () => {
             { ...item, name: `${item.name} plus`, rank: 1 },
           ]),
         ]}
-        focusNames={[item.name]}
+        focusTargets={[item.name]}
       />,
     );
     const frequency = within(screen.getByRole("region", { name: "推荐频次" }));
@@ -206,7 +206,7 @@ describe("recommendation rank history", () => {
           datedSample("spaced", 1, [{ ...item, name: ` ${item.name} ` }]),
           datedSample("plain", 2),
         ]}
-        focusNames={[item.name]}
+        focusTargets={[item.name]}
       />,
     );
     const frequency = within(screen.getByRole("region", { name: "推荐频次" }));
@@ -221,7 +221,7 @@ describe("recommendation rank history", () => {
     render(
       <RecommendationTrend
         samples={[datedSample("only", 1, items)]}
-        focusNames={[item.name]}
+        focusTargets={[item.name]}
       />,
     );
     const frequency = within(screen.getByRole("region", { name: "推荐频次" }));
@@ -252,7 +252,7 @@ describe("recommendation rank history", () => {
             ...datedSample(`unavailable-${index}`, index + 1),
             recommendations: result,
           }))}
-          focusNames={[item.name]}
+          focusTargets={[item.name]}
         />,
       );
       const frequency = within(screen.getByRole("region", { name: region }));
@@ -278,7 +278,7 @@ describe("recommendation rank history", () => {
       render(
         <RecommendationTrend
           samples={[last, first]}
-          focusNames={[item.name]}
+          focusTargets={[item.name]}
         />,
       );
       const summary = within(
@@ -313,7 +313,7 @@ describe("recommendation rank history", () => {
           { ...datedSample("missing", 2), recommendations: undefined },
           datedSample("latest", 3, [{ ...item, rank: 1 }]),
         ]}
-        focusNames={[item.name]}
+        focusTargets={[item.name]}
       />,
     );
     const summary = within(
@@ -352,7 +352,7 @@ describe("recommendation rank history", () => {
             datedSample("first", 1),
             { ...datedSample("last", 2), recommendations: result },
           ]}
-          focusNames={[item.name]}
+          focusTargets={[item.name]}
         />,
       );
       const summary = within(
@@ -376,7 +376,7 @@ describe("recommendation rank history", () => {
             { ...item, name: `${item.name} plus`, rank: 1, mention_order: 2 },
           ]),
         ]}
-        focusNames={[item.name]}
+        focusTargets={[item.name]}
       />,
     );
     const summary = within(
@@ -405,7 +405,7 @@ describe("recommendation rank history", () => {
             { ...item, name: ` ${item.name} `, rank: 1 },
           ]),
         ]}
-        focusNames={[item.name, ` ${item.name} `]}
+        focusTargets={[item.name, ` ${item.name} `]}
       />,
     );
     const summary = within(
@@ -430,7 +430,7 @@ describe("recommendation rank history", () => {
           ]),
           datedSample("last", 2, [{ ...item, rank: 1 }]),
         ]}
-        focusNames={[item.name]}
+        focusTargets={[item.name]}
       />,
     );
     const summary = within(
@@ -453,7 +453,7 @@ describe("recommendation rank history", () => {
           datedSample("first", 1, []),
           { ...datedSample("last", 2, []), recommendations: undefined },
         ]}
-        focusNames={["Tracked sample"]}
+        focusTargets={["Tracked sample"]}
       />,
     );
     const summary = within(
@@ -473,7 +473,7 @@ describe("recommendation rank history", () => {
             { ...datedSample("first", 1, [{ ...item, rank: 3 }]), observedAt },
             datedSample("last", 2, [{ ...item, rank: 1 }]),
           ]}
-          focusNames={[item.name]}
+          focusTargets={[item.name]}
         />,
       );
       const summary = within(
@@ -496,7 +496,7 @@ describe("recommendation rank history", () => {
           datedSample("tied", 1),
           datedSample("last", 2),
         ]}
-        focusNames={[item.name]}
+        focusTargets={[item.name]}
       />,
     );
     expect(
@@ -511,10 +511,10 @@ describe("recommendation rank history", () => {
       datedSample("last", 2, [{ ...item, mention_order: 3 }]),
       datedSample("first", 1),
     ];
-    const focusNames = [item.name, item.name];
-    const original = JSON.stringify({ samples, focusNames });
-    render(<RecommendationTrend samples={samples} focusNames={focusNames} />);
-    expect(JSON.stringify({ samples, focusNames })).toBe(original);
+    const focusTargets = [item.name, item.name];
+    const original = JSON.stringify({ samples, focusTargets });
+    render(<RecommendationTrend samples={samples} focusTargets={focusTargets} />);
+    expect(JSON.stringify({ samples, focusTargets })).toBe(original);
     expect(
       screen.getAllByRole("region", { name: `${item.name} · 产品` }),
     ).toHaveLength(1);
@@ -535,7 +535,7 @@ describe("recommendation rank history", () => {
           datedSample("old", 1, [{ ...item, rank: 7 }]),
           previous,
         ]}
-        focusNames={[item.name]}
+        focusTargets={[item.name]}
       />,
     );
     const summary = within(
@@ -568,7 +568,7 @@ describe("recommendation rank history", () => {
     async (language, region, rank, noPrevious) => {
       await i18n.changeLanguage(language);
       const only = datedSample("only", 1);
-      render(<RecommendationTrend samples={[only]} focusNames={[item.name]} />);
+      render(<RecommendationTrend samples={[only]} focusTargets={[item.name]} />);
       const summary = within(screen.getByRole("region", { name: region }));
       expect(summary.getByText(rank, { selector: "strong" })).toBeVisible();
       expect(summary.getByText(noPrevious)).toBeVisible();
@@ -589,7 +589,7 @@ describe("recommendation rank history", () => {
     render(
       <RecommendationTrend
         samples={[datedSample("old", 1, [{ ...item, rank: 7 }]), latest]}
-        focusNames={[item.name]}
+        focusTargets={[item.name]}
       />,
     );
     const summary = within(
@@ -628,7 +628,7 @@ describe("recommendation rank history", () => {
       <FluentProvider theme={webLightTheme}>
         <RecommendationTrend
           samples={[first, latest]}
-          focusNames={[item.name]}
+          focusTargets={[item.name]}
         />
       </FluentProvider>,
     );
@@ -750,7 +750,7 @@ describe("recommendation rank history", () => {
     render(
       <RecommendationTrend
         samples={[first, second]}
-        focusNames={[item.name]}
+        focusTargets={[item.name]}
       />,
     );
     screen
@@ -794,7 +794,7 @@ describe("recommendation rank history", () => {
     render(
       <RecommendationTrend
         samples={[first, second]}
-        focusNames={[item.name]}
+        focusTargets={[item.name]}
       />,
     );
     expect(screen.getAllByRole("table", { hidden: true })).toHaveLength(2);

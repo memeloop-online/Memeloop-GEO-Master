@@ -42,7 +42,7 @@ describe("recommendation results", () => {
             rank: null,
           },
         ])}
-        focusNames={["Sample purifier"]}
+        focusTargets={["Sample purifier"]}
       />,
     );
     expect(screen.getByText("推荐第 2 位")).toBeVisible();
@@ -51,11 +51,11 @@ describe("recommendation results", () => {
 
   it("does not call missing analysis an absent recommendation", () => {
     const { rerender } = render(
-      <RecommendationResults value={null} focusNames={["Example"]} />,
+      <RecommendationResults value={null} focusTargets={["Example"]} />,
     );
     expect(screen.queryByText(/本次推荐名单/)).not.toBeInTheDocument();
     rerender(
-      <RecommendationResults value={result([item])} focusNames={["Example"]} />,
+      <RecommendationResults value={result([item])} focusTargets={["Example"]} />,
     );
     expect(screen.getByText("本次推荐名单中没有“Example”")).toBeVisible();
   });
@@ -67,7 +67,7 @@ describe("recommendation results", () => {
           { ...item, mention_order: 2, rank: null, reason: null },
           { ...item, name: "Sample restaurant", kind: "restaurant", rank: 1 },
         ])}
-        focusNames={["Sample purifier Pro", "Another focus"]}
+        focusTargets={["Sample purifier Pro", "Another focus"]}
       />,
     );
     expect(
@@ -99,7 +99,7 @@ describe("recommendation results", () => {
     render(
       <RecommendationResults
         value={result([item])}
-        focusNames={["Sample purifier", "Sample purifier Pro"]}
+        focusTargets={["Sample purifier", "Sample purifier Pro"]}
       />,
     );
     expect(
@@ -124,7 +124,7 @@ describe("recommendation results", () => {
   ])(
     "does not show fallback cards for unavailable or empty extraction (%s)",
     (value) => {
-      render(<RecommendationResults value={value} focusNames={["Example"]} />);
+      render(<RecommendationResults value={value} focusTargets={["Example"]} />);
       expect(screen.queryByRole("article")).not.toBeInTheDocument();
       expect(screen.queryByText("查看完整推荐列表")).not.toBeInTheDocument();
       expect(
@@ -244,7 +244,7 @@ describe("recommendation results", () => {
     render(
       <RecommendationResults
         value={result([item])}
-        focusNames={["Sample purifier Pro"]}
+        focusTargets={["Sample purifier Pro"]}
       />,
     );
     expect(

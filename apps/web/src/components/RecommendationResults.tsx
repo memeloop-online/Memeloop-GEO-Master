@@ -38,10 +38,10 @@ function FullRecommendationList({
 /** Render model-extracted entities only; never infer names or rank from prose. */
 export function RecommendationResults({
   value,
-  focusNames = [],
+  focusTargets = [],
 }: {
   value: unknown;
-  focusNames?: readonly string[];
+  focusTargets?: readonly string[];
 }) {
   const { t } = useTranslation("observationAnalysis");
   const { t: focusT } = useTranslation("measurementFocus");
@@ -50,17 +50,17 @@ export function RecommendationResults({
     (left, right) => left.mention_order - right.mention_order,
   );
   const noFocusMatch =
-    focusNames.length > 0 &&
+    focusTargets.length > 0 &&
     items.length > 0 &&
-    !items.some((item) => isMeasurementFocus(item.name, focusNames));
+    !items.some((item) => isMeasurementFocus(item, focusTargets));
   return (
     <section aria-label={t("recommendationsTitle")}>
       <h5>{t("recommendationsTitle")}</h5>
       {decoded !== null &&
-        focusNames
+        focusTargets
           .filter(
             (name) =>
-              !items.some((item) => isMeasurementFocus(item.name, [name])),
+              !items.some((item) => isMeasurementFocus(item, [name])),
           )
           .map((name) => (
             <div key={name} style={{ marginBottom: 12 }}>
@@ -69,7 +69,7 @@ export function RecommendationResults({
             </div>
           ))}
       {decoded !== null && (
-        <RecommendationFocusComparison items={items} focusNames={focusNames} />
+        <RecommendationFocusComparison items={items} focusTargets={focusTargets} />
       )}
       {value == null ? (
         <p>{t("recommendationsNotAnalyzed")}</p>
@@ -101,7 +101,7 @@ export function RecommendationResults({
                   <TableRow key={`${item.mention_order}-${index}`}>
                     <TableCell>
                       {item.name}{" "}
-                      {isMeasurementFocus(item.name, focusNames) && (
+                      {isMeasurementFocus(item, focusTargets) && (
                         <Badge appearance="tint">{focusT("focused")}</Badge>
                       )}
                     </TableCell>

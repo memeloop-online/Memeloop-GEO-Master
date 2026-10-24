@@ -108,7 +108,7 @@ use axum::{
 use futures_util::StreamExt;
 use geo_domain::{
     AgentRepository, AgentRuntime, AppError, ConnectorCapabilityRepository, DistributionScope,
-    DocumentScope, EventEnvelope, InitialSource, KnowledgeRepository, Membership,
+    DocumentScope, EventEnvelope, InitialSource, KnowledgeRepository, MeasurementTarget, Membership,
     MemoryAgentRepository, MemoryAuthRepository, MemoryConnectorCapabilityRepository,
     MemoryKnowledgeRepository, MissingAgentRuntime, Operation, Operator, Project, ProjectCreate,
     ProjectId, ProjectOverview, ProjectPage, ProjectPatch, ProjectRepository, ProjectSettings,
@@ -1134,6 +1134,7 @@ struct ProjectListQuery {
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct ProjectSettingsPatchRequest {
+    pub measurement_targets: Option<Vec<MeasurementTarget>>,
     pub brand_name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     pub product_name: Option<Option<String>>,
@@ -1158,6 +1159,7 @@ struct ProjectSettingsPatchRequest {
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct ProjectPatchRequest {
+    pub measurement_targets: Option<Vec<MeasurementTarget>>,
     /// The revision echoed by clients. If present it must match If-Match.
     pub revision: Option<i64>,
     pub slug: Option<String>,
@@ -1191,6 +1193,7 @@ impl ProjectPatchRequest {
         let target_audience = self.target_audience.or(settings.target_audience);
         let objective = self.objective.or(settings.objective);
         let patch = ProjectPatch {
+            measurement_targets: self.measurement_targets.or(settings.measurement_targets),
             slug: self.slug,
             display_name: self.display_name,
             brand_name: self.brand_name.or(settings.brand_name),

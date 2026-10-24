@@ -6,16 +6,19 @@ import {
   Input,
   MessageBar,
   MessageBarBody,
+  Select,
+  Textarea,
   Text,
 } from "@fluentui/react-components";
 import { EditRegular } from "@fluentui/react-icons";
 import { useTranslation } from "react-i18next";
 import { ApiError } from "../api/client";
 import {
-  measurementFocusNames,
+  measurementFocusTargets,
   measurementFocusPatch,
 } from "../api/measurementFocus";
 import { useProjectQuery, useUpdateProjectMutation } from "../api/projects";
+import type { MeasurementTarget } from "../api/projects";
 import "../i18n/measurementFocus";
 import "./MeasurementFocusPanel.css";
 
@@ -35,19 +38,24 @@ export function MeasurementFocusPanel({
   const update = useUpdateProjectMutation(tenantId, projectId);
   const [draft, setDraft] = useState<{
     revision: number;
-    brand: string;
-    product: string;
+    targets: MeasurementTarget[];
   } | null>(null);
   const [error, setError] = useState<"saveFailed" | "conflict" | null>(null);
-  const focus = measurementFocusNames(project.data?.settings)[0];
+  const targets = measurementFocusTargets(project.data?.settings);
+
+  function changeTarget(index: number, patch: Partial<MeasurementTarget>) {
+    if (!draft) return;
+    setDraft({ ...draft, targets: draft.targets.map((target, position) =>
+      position === index ? { ...target, ...patch } : target,
+    ) });
+  }
 
   function edit() {
     if (!project.data) return;
     setError(null);
     setDraft({
       revision: project.data.revision,
-      brand: project.data.settings.brand_name,
-      product: project.data.settings.product_name ?? "",
+      targets: targets.map((target) => ({ ...target, aliases: [...target.aliases] })),
     });
   }
 
@@ -56,7 +64,7 @@ export function MeasurementFocusPanel({
     setError(null);
     try {
       await update.mutateAsync(
-        measurementFocusPatch(draft.revision, draft.brand, draft.product),
+        measurementFocusPatch(draft.revision, draft.targets),
       );
       setDraft(null);
     } catch (failure) {
@@ -79,7 +87,7 @@ export function MeasurementFocusPanel({
           <Text size={200}>{t("title")}</Text>
           {project.data && (
             <Text weight="semibold" size={compact ? 300 : 500}>
-              {focus || t(compact ? "emptyCompact" : "empty")}
+              {targets.length ? targets.map((target) => `${target.name} · ${t(`kind_${target.kind}`)}`).join(" / ") : t(compact ? "emptyCompact" : "empty")}
             </Text>
           )}
         </div>
@@ -89,7 +97,7 @@ export function MeasurementFocusPanel({
             icon={compact ? <EditRegular /> : undefined}
             onClick={edit}
           >
-            {t(focus ? "edit" : "add")}
+            {t(targets.length ? "edit" : "add")}
           </Button>
         )}
       </div>
@@ -102,7 +110,8 @@ export function MeasurementFocusPanel({
           </MessageBarBody>
         </MessageBar>
       )}
-      {project.data && !focus && !draft && <Text>{t("optional")}</Text>}
+      {project.data && !targets.length && !draft && <Text>{t("optional")}</Text>}
+      {project.data && <Text size={200}>{t("viewingScope")}</Text>}
       {!!project.data?.settings.competitors.length && (
         <Text size={200}>
           {t("comparison", {
@@ -118,24 +127,32 @@ export function MeasurementFocusPanel({
           }}
           className="measurement-focus-form"
         >
-          <Field label={t("brand")}>
-            <Input
-              value={draft.brand}
-              maxLength={200}
-              disabled={update.isPending}
-              onChange={(_, data) => setDraft({ ...draft, brand: data.value })}
-            />
-          </Field>
-          <Field label={t("product")} hint={t("productHint")}>
-            <Input
-              value={draft.product}
-              maxLength={200}
-              disabled={update.isPending}
-              onChange={(_, data) =>
-                setDraft({ ...draft, product: data.value })
-              }
-            />
-          </Field>
+          {draft.targets.map((target, index) => (
+            <fieldset key={index} className="measurement-focus-target">
+              <legend>{t("targetNumber", { number: index + 1 })}</legend>
+              <Field label={t("name")} required>
+                <Input value={target.name} required disabled={update.isPending}
+                  onChange={(_, data) => changeTarget(index, { name: data.value })} />
+              </Field>
+              <Field label={t("kind")}>
+                <Select value={target.kind} disabled={update.isPending}
+                  onChange={(_, data) => changeTarget(index, { kind: data.value as MeasurementTarget["kind"] })}>
+                  {(["product", "restaurant", "brand", "service", "other"] as const).map((kind) =>
+                    <option key={kind} value={kind}>{t(`kind_${kind}`)}</option>)}
+                </Select>
+              </Field>
+              <Field label={t("aliases")} hint={t("aliasesHint")}>
+                <Textarea value={target.aliases.join("\n")} disabled={update.isPending}
+                  onChange={(_, data) => changeTarget(index, { aliases: data.value.split("\n") })} />
+              </Field>
+              <Button disabled={update.isPending} onClick={() => setDraft({
+                ...draft, targets: draft.targets.filter((_, position) => position !== index),
+              })}>{t("removeTarget", { number: index + 1 })}</Button>
+            </fieldset>
+          ))}
+          <Button disabled={update.isPending} onClick={() => setDraft({
+            ...draft, targets: [...draft.targets, { name: "", kind: "product", aliases: [] }],
+          })}>{t("addTarget")}</Button>
           {error && (
             <MessageBar intent="error">
               <MessageBarBody>{t(error)}</MessageBarBody>
@@ -145,7 +162,7 @@ export function MeasurementFocusPanel({
             <Button
               appearance="primary"
               type="submit"
-              disabled={update.isPending || error === "conflict"}
+              disabled={update.isPending || error === "conflict" || draft.targets.some((target) => !target.name.trim())}
             >
               {t(update.isPending ? "saving" : "save")}
             </Button>

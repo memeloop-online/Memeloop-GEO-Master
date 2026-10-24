@@ -81,25 +81,25 @@ function RecommendationCard({
 /** Show verified recommendations; compare explicit ranks only for exact focus matches. */
 export function RecommendationFocusComparison({
   items,
-  focusNames,
+  focusTargets,
   onAnalyze,
   analysisPending,
 }: {
   items: RecommendationItem[];
-  focusNames: readonly string[];
+  focusTargets: readonly string[];
   onAnalyze?: (item: RecommendationItem) => void;
   analysisPending?: boolean;
 }) {
   const { t } = useTranslation("recommendationFocusComparison");
   const focusGroups = new Map<string, RecommendationItem[]>();
   for (const item of items) {
-    if (!isMeasurementFocus(item.name, focusNames)) continue;
+    if (!isMeasurementFocus(item, focusTargets)) continue;
     const key = JSON.stringify([item.name.trim(), item.kind]);
     const group = focusGroups.get(key) ?? [];
     group.push(item);
     focusGroups.set(key, group);
   }
-  if (!focusNames.length || !items.length) return null;
+  if (!focusTargets.length || !items.length) return null;
   if (!focusGroups.size) {
     return (
       <section
