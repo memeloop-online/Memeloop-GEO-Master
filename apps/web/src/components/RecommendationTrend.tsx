@@ -103,9 +103,12 @@ function entityState(entry: TrendEntry, target: MeasurementTarget) {
       label:
         entry.sample.recommendations == null ? "notAnalyzed" : "unverified",
     };
-  const matches = entry.items.filter((item) => isMeasurementFocus(item, [target]));
+  const matches = entry.items.filter((item) =>
+    isMeasurementFocus(item, [target]),
+  );
   if (!matches.length) return { label: "absent" };
-  if (new Set(matches.map((item) => item.rank)).size > 1) return { label: "ambiguous" };
+  if (new Set(matches.map((item) => item.rank)).size > 1)
+    return { label: "ambiguous" };
   return matches[0].rank === null
     ? { label: "unranked" }
     : { label: "rank", rank: matches[0].rank };
@@ -169,23 +172,17 @@ export function RecommendationTrend({
             }
             const input = ordered[0].measurement;
             const focusEntities = [
-              ...new Set(focusTargets.map((name) => name.trim())),
-            ].flatMap<{
-              id: string | undefined;
-              name: string;
-              kind: RecommendationItem["kind"] | undefined;
-            }>((name) => {
-              const matches = [...entities].filter(([, entity]) =>
-                isMeasurementFocus(entity, [name]),
-              );
-              return matches.length
-                ? matches.map(([id, entity]) => ({
-                    id,
-                    name: entity.name,
-                    kind: entity.kind,
-                  }))
-                : [{ id: undefined, name, kind: undefined }];
-            });
+              ...new Map(
+                focusTargets.map((target) => [
+                  JSON.stringify([target.kind, target.name.trim()]),
+                  target,
+                ]),
+              ).values(),
+            ].map((target) => ({
+              ...target,
+              name: target.name.trim(),
+              id: JSON.stringify([target.kind, target.name.trim()]),
+            }));
             // Unknown times or ties at the latest-pair boundary cannot establish chronology.
             const latestPair = entries.slice(-2);
             const chronologyKnown =
@@ -226,7 +223,7 @@ export function RecommendationTrend({
                     {focusEntities.map((entity) => {
                       const frequency = recommendationFrequency(
                         entries,
-                        entity.id,
+                        entity,
                       );
                       return (
                         <div
@@ -306,7 +303,7 @@ export function RecommendationTrend({
                   <section aria-label={t("focusChanges")}>
                     {focusEntities.map((entity) => {
                       const states = latestPair.map((entry) =>
-                        entityState(entry, entity.id),
+                        entityState(entry, entity),
                       );
                       const latest = latestPair[latestPair.length - 1];
                       const latestState = states[states.length - 1];
