@@ -1,17 +1,8 @@
 import type { ReportCoverage, ReportSnapshot } from "../api/reports";
 
-type CsvCell = string | number | null;
-type CsvRow = [string, string, string, CsvCell, string];
+import { serializeCsv, type CsvCell } from "./csv";
 
-function safeCell(value: CsvCell): string {
-  const text = value === null ? "" : String(value);
-  // Quoting CSV is not enough: spreadsheets evaluate formula-looking strings.
-  const literal =
-    /^[\s\u0000-\u001f]*[=+\-@]/u.test(text) || /^[\t\r\n]/u.test(text)
-      ? `'${text}`
-      : text;
-  return `"${literal.replaceAll('"', '""')}"`;
-}
+type CsvRow = [string, string, string, CsvCell, string];
 
 function coverageRows(
   area: string,
@@ -151,13 +142,10 @@ export function reportSnapshotCsv(snapshot: ReportSnapshot): string {
       ["evidence", item.evidence_id, "summary", item.summary, ""],
     );
   }
-  return (
-    "\uFEFF" +
-    [["section", "group_or_id", "field", "value", "note"], ...rows]
-      .map((row) => row.map(safeCell).join(","))
-      .join("\r\n") +
-    "\r\n"
-  );
+  return serializeCsv([
+    ["section", "group_or_id", "field", "value", "note"],
+    ...rows,
+  ]);
 }
 
 export function downloadReportCsv(snapshot: ReportSnapshot): void {
