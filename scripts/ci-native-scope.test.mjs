@@ -14,8 +14,12 @@ import { determineNativeScope, nativeRequired } from "./ci-native-scope.mjs";
 
 const pr = { eventName: "pull_request", baseRef: "main" };
 
-test("only explicit browser JavaScript and Markdown paths may skip native checks", () => {
+test("only explicit web/browser source and Markdown paths may skip native checks", () => {
   const paths = [
+    "apps/web/src/main.tsx",
+    "apps/web/src/i18n/messages.ts",
+    "apps/web/src/components/example.test.tsx",
+    "apps/web/src/nested/helper.test.ts",
     "packages/browser-runner/src/index.mjs",
     "packages/browser-runner/src/nested/helper.mjs",
     "packages/browser-runner/test/capture.test.mjs",
@@ -36,7 +40,20 @@ test("only explicit browser JavaScript and Markdown paths may skip native checks
     "Cargo.lock",
     "rust-toolchain.toml",
     "pnpm-lock.yaml",
-    "apps/web/src/main.tsx",
+    "apps/web/package.json",
+    "apps/web/vite.config.ts",
+    "apps/web/tsconfig.app.json",
+    "apps/web/src/main.tsx.bak",
+    "apps/web/src/main.ts.txt",
+    "apps/web/src/main.TSX",
+    "apps/web/src/main.js",
+    "apps/web/src/styles.css",
+    "apps/web/src/prompt.txt",
+    "apps/web/src2/main.tsx",
+    "apps/web/src/.tsx",
+    "apps/web/src/main.tsx\nCargo.lock",
+    "apps/web/src/main.tsx/other",
+    "scripts/bundle-agent.mjs",
     ".github/workflows/ci.yml",
     "scripts/ci-native-scope.mjs",
     "scripts/ci-native-scope.test.mjs",
@@ -151,6 +168,37 @@ test("native-to-docs rename cannot hide the removed native input", (t) => {
   renameSync(
     join(repo.cwd, "crates/example/src/lib.rs"),
     join(repo.cwd, "docs/moved.md"),
+  );
+  const head = repo.commit();
+  assert.match(
+    repo.git("diff", "--name-status", "--find-renames", base, head),
+    /^R100/,
+  );
+  assert.equal(repo.scope(base, head), true);
+});
+
+test("frontend additions, edits, and deletions may skip native checks", (t) => {
+  const repo = repository(t);
+  repo.write("apps/web/src/old.tsx", "base");
+  const base = repo.commit();
+  repo.write("apps/web/src/old.tsx", "edited");
+  repo.write("apps/web/src/nested/helper.ts", "added");
+  const edited = repo.commit();
+  assert.equal(repo.scope(base, edited), false);
+  repo.git("rm", "apps/web/src/old.tsx");
+  const deleted = repo.commit();
+  assert.equal(repo.scope(edited, deleted), false);
+  assert.equal(repo.scope(base, deleted), false);
+});
+
+test("native-to-frontend rename cannot hide the removed native input", (t) => {
+  const repo = repository(t);
+  repo.write("crates/example/src/lib.rs", "identical content");
+  const base = repo.commit();
+  mkdirSync(join(repo.cwd, "apps/web/src"), { recursive: true });
+  renameSync(
+    join(repo.cwd, "crates/example/src/lib.rs"),
+    join(repo.cwd, "apps/web/src/moved.tsx"),
   );
   const head = repo.commit();
   assert.match(

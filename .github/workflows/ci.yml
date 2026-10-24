@@ -400,7 +400,7 @@ jobs:
           ## Windows native scope
 
           - Scope classification and local workspace tests passed.
-          - The entire pull request changes only allowlisted browser JavaScript or Markdown documentation.
+          - The entire pull request changes only allowlisted frontend/browser source or documentation.
           - Windows Rust/V8 setup, build, tests, and native artifacts were skipped; Linux checks use their own documentation scope.
           "@ | Add-Content $env:GITHUB_STEP_SUMMARY
 

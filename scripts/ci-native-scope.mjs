@@ -2,9 +2,10 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
-// Keep this deliberately narrow: extraction-prompt.txt is embedded in Rust.
+// Web source is compiled by Vite; the agent bundler reads its package manifest.
+// Keep manifests and shared inputs native: extraction-prompt.txt is embedded.
 const safePath =
-  /^(?:packages\/browser-runner\/(?:src|test)\/.+\.mjs|docs\/.+\.md|README\.md|CONTRIBUTING\.md)$/;
+  /^(?:apps\/web\/src\/.+\.tsx?|packages\/browser-runner\/(?:src|test)\/.+\.mjs|docs\/.+\.md|README\.md|CONTRIBUTING\.md)$/;
 
 export function nativeRequired({ eventName, baseRef, paths } = {}) {
   return (
