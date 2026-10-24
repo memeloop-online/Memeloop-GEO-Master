@@ -28,7 +28,7 @@ const translations = {
     declined: "排名下降 {{value}} 位",
     unchanged: "排名持平",
     rankNotComparable: "这两次结果无法比较明确排名。",
-    ambiguous: "同名同类型有多个结果，排名不唯一",
+    ambiguous: "同一关注对象出现不同排名，暂无法确定排名",
     chronologyUnknown: "测量时间缺失或重复，暂无法确定最近两次的先后。",
     kind_product: "产品",
     kind_restaurant: "餐馆",
@@ -47,7 +47,8 @@ const translations = {
     providerModel: "平台：{{provider}} · 模型：{{model}}",
     conditions: "{{surface}} · {{market}} · {{language}} · {{searchMode}}",
     evidence: "查看原文依据",
-    exactNames: "对象按提取出的名称与类型对应，别名尚未合并。",
+    exactNames:
+      "关注对象按当前设置的名称或别名及类型匹配。完整历史保留回答中的原始名称。",
   },
   en: {
     title: "Recommendation rank history",
@@ -82,7 +83,8 @@ const translations = {
     declined: "Rank declined by {{value}}",
     unchanged: "Rank unchanged",
     rankNotComparable: "These two results have no comparable explicit ranks.",
-    ambiguous: "Multiple results share this name and type; rank is not unique",
+    ambiguous:
+      "This target has conflicting ranks, so no single rank can be determined",
     chronologyUnknown:
       "Missing or duplicate measurement times prevent identifying the latest two in order.",
     kind_product: "Product",
@@ -103,7 +105,7 @@ const translations = {
     conditions: "{{surface}} · {{market}} · {{language}} · {{searchMode}}",
     evidence: "View supporting excerpt",
     exactNames:
-      "Items are matched by their extracted name and type. Aliases have not been combined.",
+      "Tracked targets match your current names or aliases and types. Full history preserves the original names from each answer.",
   },
 };
 
