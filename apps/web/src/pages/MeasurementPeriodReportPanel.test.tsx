@@ -12,11 +12,16 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import * as api from "../api/measurementReports";
+import type { MeasurementTarget } from "../api/projects";
+import * as csv from "./measurementReportsCsv";
 import { MeasurementPeriodReportPanel } from "./MeasurementPeriodReportPanel";
 import i18n from "../i18n";
 
 const auth = vi.hoisted(() => ({ role: "member" }));
-const focus = vi.hoisted(() => ({ name: "" }));
+const focus = vi.hoisted(() => ({
+  name: "",
+  targets: null as MeasurementTarget[] | null,
+}));
 vi.mock("../api/projects", () => ({
   useProjectQuery: () => ({
     data: {
@@ -24,9 +29,11 @@ vi.mock("../api/projects", () => ({
       settings: {
         brand_name: "Enterprise",
         competitors: [],
-        measurement_targets: focus.name
-          ? [{ name: focus.name, kind: "product", aliases: [] }]
-          : [],
+        measurement_targets:
+          focus.targets ??
+          (focus.name
+            ? [{ name: focus.name, kind: "product", aliases: [] }]
+            : []),
       },
     },
     isPending: false,
@@ -168,11 +175,206 @@ async function openReportDetails(language = "zh-CN") {
 afterEach(async () => {
   auth.role = "member";
   focus.name = "";
+  focus.targets = null;
   cleanup();
   vi.restoreAllMocks();
   await i18n.changeLanguage("zh-CN");
 });
 describe("cycle-free measurement report", () => {
+  it.each([
+    { alreadySaved: false, language: "en" },
+    { alreadySaved: true, language: "en" },
+    { alreadySaved: false, language: "zh-CN" },
+    { alreadySaved: true, language: "zh-CN" },
+  ] as const)(
+    "exports the displayed report and selected view without writes: saved=$alreadySaved, locale=$language",
+    async ({ alreadySaved, language }) => {
+      await i18n.changeLanguage(language);
+      const input = structuredClone(scopedPreview);
+      const result: api.MeasurementPeriodReport = {
+        ...structuredClone(saved),
+        samples: structuredClone(input.samples),
+        report_id: "displayed-report",
+        revision: 7,
+      };
+      focus.targets = [
+        { name: "Example lamp", kind: "product", aliases: [] },
+        { name: "Example tent", kind: "product", aliases: ["Tent alias"] },
+      ];
+      const download = vi
+        .spyOn(csv, "downloadMeasurementReportCsv")
+        .mockImplementation(() => {});
+      const { load, list, detail, save } = setup(
+        input,
+        alreadySaved ? [result] : [],
+      );
+      detail.mockResolvedValue(result);
+      if (alreadySaved) {
+        await openReportDetails(language);
+        await userEvent.selectOptions(
+          screen.getByRole("combobox", {
+            name: language === "en" ? "Report period" : "报告时间",
+          }),
+          result.report_id,
+        );
+        await screen.findByRole("link", {
+          name:
+            language === "en"
+              ? "Analyze this report with AI"
+              : "用 AI 分析这份报告",
+        });
+      }
+      await userEvent.selectOptions(
+        await screen.findByRole("combobox", {
+          name: language === "en" ? "View tracked item" : "查看关注对象",
+        }),
+        JSON.stringify(["product", "Example tent"]),
+      );
+      const question = input.samples[1].conditions.question;
+      await userEvent.selectOptions(
+        screen.getByRole("combobox", {
+          name: language === "en" ? "AI measurement question" : "AI 测量问题",
+        }),
+        question,
+      );
+      await userEvent.click(
+        screen.getByRole("button", {
+          name: language === "en" ? "Download measurement CSV" : "下载测量 CSV",
+        }),
+      );
+      expect(download).toHaveBeenCalledTimes(1);
+      const captured = download.mock.calls[0][0];
+      expect(captured).toEqual({
+        report: alreadySaved ? result : input,
+        view: { question, target: focus.targets[1] },
+        locale: language,
+      });
+      expect(captured.report).not.toBe(alreadySaved ? result : input);
+      expect(captured.view.target).not.toBe(focus.targets[1]);
+      expect(save).not.toHaveBeenCalled();
+      expect(load).toHaveBeenCalledTimes(1);
+      expect(list).toHaveBeenCalledTimes(1);
+      expect(detail).toHaveBeenCalledTimes(alreadySaved ? 1 : 0);
+      const frozen = structuredClone(captured);
+      focus.targets[1].aliases.push("Later alias");
+      input.samples[0].conditions.question = "Later question";
+      result.revision = 8;
+      await userEvent.selectOptions(
+        screen.getByRole("combobox", {
+          name: language === "en" ? "AI measurement question" : "AI 测量问题",
+        }),
+        "",
+      );
+      await act(async () => {
+        await i18n.changeLanguage(language === "en" ? "zh-CN" : "en");
+      });
+      expect(captured).toEqual(frozen);
+    },
+  );
+
+  it("exports raw preview evidence for read-only viewers without configured targets or a saved ID", async () => {
+    auth.role = "viewer";
+    const download = vi
+      .spyOn(csv, "downloadMeasurementReportCsv")
+      .mockImplementation(() => {});
+    const { load, list, detail, save } = setup();
+    await userEvent.click(
+      await screen.findByRole("button", { name: "下载测量 CSV" }),
+    );
+    expect(download).toHaveBeenCalledExactlyOnceWith({
+      report: preview,
+      view: { question: null, target: null },
+      locale: "zh-CN",
+    });
+    expect(download.mock.calls[0][0].report).not.toHaveProperty("report_id");
+    expect(save).not.toHaveBeenCalled();
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(detail).not.toHaveBeenCalled();
+  });
+
+  it("does not offer an export for a report outside the current project", async () => {
+    const download = vi
+      .spyOn(csv, "downloadMeasurementReportCsv")
+      .mockImplementation(() => {});
+    setup({ ...preview, project_id: "other-project" });
+    await screen.findByRole("alert");
+    expect(
+      screen.queryByRole("button", { name: "下载测量 CSV" }),
+    ).not.toBeInTheDocument();
+    expect(download).not.toHaveBeenCalled();
+  });
+
+  it("keeps export selection aligned with current target aliases and removal fallback", async () => {
+    focus.targets = [
+      { name: "Example lamp", kind: "product", aliases: [] },
+      { name: "Example tent", kind: "product", aliases: ["Old alias"] },
+    ];
+    const download = vi
+      .spyOn(csv, "downloadMeasurementReportCsv")
+      .mockImplementation(() => {});
+    setup(structuredClone(scopedPreview));
+    await userEvent.selectOptions(
+      await screen.findByRole("combobox", { name: "查看关注对象" }),
+      JSON.stringify(["product", "Example tent"]),
+    );
+    focus.targets = [
+      focus.targets[0],
+      { ...focus.targets[1], aliases: ["Current alias"] },
+    ];
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "AI 测量问题" }),
+      scopedPreview.samples[1].conditions.question,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "下载测量 CSV" }));
+    expect(download.mock.calls[0][0].view.target).toEqual(focus.targets[1]);
+    focus.targets = [focus.targets[0]];
+    await userEvent.selectOptions(
+      screen.getByRole("combobox", { name: "AI 测量问题" }),
+      "",
+    );
+    expect(screen.getByRole("combobox", { name: "查看关注对象" })).toHaveValue(
+      JSON.stringify(["product", "Example lamp"]),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "下载测量 CSV" }));
+    expect(download.mock.calls[1][0].view.target).toEqual(focus.targets[0]);
+  });
+
+  it("does not export cached evidence hidden after a report refresh fails", async () => {
+    const download = vi
+      .spyOn(csv, "downloadMeasurementReportCsv")
+      .mockImplementation(() => {});
+    const { load } = setup();
+    await screen.findByRole("button", { name: "下载测量 CSV" });
+    load.mockRejectedValue(new Error("Read failed"));
+    await userEvent.click(screen.getByRole("button", { name: "刷新测量报告" }));
+    await screen.findByRole("alert");
+    expect(
+      screen.queryByRole("button", { name: "下载测量 CSV" }),
+    ).not.toBeInTheDocument();
+    expect(download).not.toHaveBeenCalled();
+  });
+
+  it.each(["en", "zh-CN"])(
+    "localizes download failure without exposing error details in %s",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      vi.spyOn(csv, "downloadMeasurementReportCsv").mockImplementation(() => {
+        throw new Error("Internal download failure");
+      });
+      const { save } = setup();
+      await userEvent.click(
+        await screen.findByRole("button", {
+          name: language === "en" ? "Download measurement CSV" : "下载测量 CSV",
+        }),
+      );
+      expect(await screen.findByRole("alert")).not.toHaveTextContent(
+        "Internal download failure",
+      );
+      expect(save).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([
     { alreadySaved: false, failedStart: "none", next: "recommendation" },
     { alreadySaved: true, failedStart: "none", next: "recommendation" },

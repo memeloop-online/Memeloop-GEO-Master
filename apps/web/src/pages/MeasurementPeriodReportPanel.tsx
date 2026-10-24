@@ -38,6 +38,9 @@ import {
 import { MeasurementFocusPanel } from "../components/MeasurementFocusPanel";
 import { RecommendationFocusComparison } from "../components/RecommendationFocusComparison";
 import { Link, useNavigate } from "react-router-dom";
+import { captureMeasurementReportExport } from "./measurementReportExport";
+import { downloadMeasurementReportCsv } from "./measurementReportsCsv";
+import "../i18n/measurementReportExport";
 
 const knownStatuses = new Set([
   "pending",
@@ -98,6 +101,15 @@ export function MeasurementPeriodReportPanel({
   const project = useProjectQuery(tenantId, projectId);
   const focusTargets = measurementFocusTargets(project.data?.settings);
   const { t, i18n } = useTranslation("measurementReports");
+  const { t: exportText } = useTranslation("measurementReportExport");
+  const [selectedTargetKey, setSelectedTargetKey] = useState<string>();
+  const targetKey = (target: MeasurementTarget) =>
+    JSON.stringify([target.kind, target.name.trim()]);
+  const selectedTarget =
+    focusTargets.find((target) => targetKey(target) === selectedTargetKey) ??
+    focusTargets[0] ??
+    null;
+  const [exportFailed, setExportFailed] = useState(false);
   const [localSelected, setLocalSelected] = useState<string>();
   const [questionFilter, setQuestionFilter] = useState("");
   const selected = onSelectReport ? selectedReportId : localSelected;
@@ -376,6 +388,32 @@ export function MeasurementPeriodReportPanel({
       >
         {t("refresh")}
       </Button>
+      {scopedReport && !current.isPending && !current.isError && (
+        <Button
+          onClick={() => {
+            try {
+              const input = captureMeasurementReportExport({
+                report: scopedReport,
+                view: {
+                  question: activeQuestion || null,
+                  target: selectedTarget,
+                },
+                locale:
+                  (i18n.resolvedLanguage || i18n.language) === "en"
+                    ? "en"
+                    : "zh-CN",
+              });
+              downloadMeasurementReportCsv(input);
+              setExportFailed(false);
+            } catch {
+              setExportFailed(true);
+            }
+          }}
+        >
+          {exportText("downloadCsv")}
+        </Button>
+      )}
+      {exportFailed && <p role="alert">{exportText("downloadFailed")}</p>}
       {selected && (
         <Button onClick={() => setSelected(undefined)}>
           {t(questionSet ? "questionSetBack" : "back")}
@@ -635,6 +673,10 @@ export function MeasurementPeriodReportPanel({
             <RecommendationPlatformComparison
               samples={platformRecommendations}
               focusTargets={focusTargets}
+              selectedTarget={selectedTarget}
+              onSelectTarget={(target) =>
+                setSelectedTargetKey(targetKey(target))
+              }
               planWindow={{
                 start: report.report_window_start_at,
                 end: report.report_window_end_at,

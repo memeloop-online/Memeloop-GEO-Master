@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { useState } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
@@ -59,14 +60,23 @@ function setup(
   samples: RecommendationTrendSample[],
   targets: MeasurementTarget[] = [target],
 ) {
-  return render(
-    <FluentProvider theme={webLightTheme}>
+  function ControlledComparison() {
+    const [selectedTarget, setSelectedTarget] =
+      useState<MeasurementTarget | null>(targets[0] ?? null);
+    return (
       <RecommendationPlatformComparison
         samples={samples}
         focusTargets={targets}
+        selectedTarget={selectedTarget}
+        onSelectTarget={setSelectedTarget}
         planWindow={planWindow}
         timezone="UTC"
       />
+    );
+  }
+  return render(
+    <FluentProvider theme={webLightTheme}>
+      <ControlledComparison />
     </FluentProvider>,
   );
 }
@@ -89,6 +99,38 @@ afterEach(async () => {
 });
 
 describe("platform recommendation comparison", () => {
+  it("uses the controlled target and reports selection without overriding the parent", async () => {
+    const second: MeasurementTarget = {
+      name: "Example tent",
+      kind: "product",
+      aliases: ["Tent alias"],
+    };
+    const onSelectTarget = vi.fn();
+    render(
+      <FluentProvider theme={webLightTheme}>
+        <RecommendationPlatformComparison
+          samples={[sample("controlled")]}
+          focusTargets={[target, second]}
+          selectedTarget={second}
+          onSelectTarget={onSelectTarget}
+          planWindow={planWindow}
+        />
+      </FluentProvider>,
+    );
+    const selector = screen.getByRole("combobox", {
+      name: "View tracked item",
+    });
+    expect(selector).toHaveValue(JSON.stringify([second.kind, second.name]));
+    expect(within(table()).getByText(/0 \/ 1/)).toBeVisible();
+    await userEvent.selectOptions(
+      selector,
+      JSON.stringify([target.kind, target.name]),
+    );
+    expect(onSelectTarget).toHaveBeenCalledExactlyOnceWith(target);
+    expect(selector).toHaveValue(JSON.stringify([second.kind, second.name]));
+    expect(within(table()).getByText(/0 \/ 1/)).toBeVisible();
+  });
+
   it.each(["en", "zh-CN"])(
     "keeps independent platform denominators and conditional ranks in %s",
     async (language) => {
