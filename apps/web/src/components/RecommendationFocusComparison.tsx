@@ -1,6 +1,7 @@
 import { Badge, Button, Card, tokens } from "@fluentui/react-components";
 import { useTranslation } from "react-i18next";
 import { isMeasurementFocus } from "../api/measurementFocus";
+import type { MeasurementTarget } from "../api/projects";
 import type { RecommendationItem } from "../api/recommendations";
 import { safeOriginalPublicUrl } from "../pages/PublicationLookupPanel";
 import "../i18n/recommendationFocusComparison";
@@ -86,21 +87,19 @@ export function RecommendationFocusComparison({
   analysisPending,
 }: {
   items: RecommendationItem[];
-  focusTargets: readonly string[];
+  focusTargets: readonly MeasurementTarget[];
   onAnalyze?: (item: RecommendationItem) => void;
   analysisPending?: boolean;
 }) {
   const { t } = useTranslation("recommendationFocusComparison");
-  const focusGroups = new Map<string, RecommendationItem[]>();
-  for (const item of items) {
-    if (!isMeasurementFocus(item, focusTargets)) continue;
-    const key = JSON.stringify([item.name.trim(), item.kind]);
-    const group = focusGroups.get(key) ?? [];
-    group.push(item);
-    focusGroups.set(key, group);
-  }
+  const focusGroups = focusTargets
+    .map((target) => ({
+      target,
+      matches: items.filter((item) => isMeasurementFocus(item, [target])),
+    }))
+    .filter(({ matches }) => matches.length > 0);
   if (!focusTargets.length || !items.length) return null;
-  if (!focusGroups.size) {
+  if (!focusGroups.length) {
     return (
       <section
         aria-label={t("recommendedTitle")}
@@ -130,10 +129,10 @@ export function RecommendationFocusComparison({
     >
       <h5 style={{ margin: 0 }}>{t("title")}</h5>
       <p style={{ margin: 0 }}>{t("scope")}</p>
-      {[...focusGroups].map(([key, matches]) => {
-        const focus = matches[0];
+      {focusGroups.map(({ target: focus, matches }) => {
+        const key = JSON.stringify([focus.kind, focus.name]);
         const ambiguous = new Set(matches.map((item) => item.rank)).size > 1;
-        const rank = focus.rank;
+        const rank = matches[0].rank;
         const ahead =
           !ambiguous && rank !== null
             ? items
@@ -142,7 +141,7 @@ export function RecommendationFocusComparison({
                     item.kind === focus.kind &&
                     item.rank !== null &&
                     item.rank < rank &&
-                    item.name.trim() !== focus.name.trim(),
+                    !isMeasurementFocus(item, focusTargets),
                 )
                 .sort((left, right) => left.rank! - right.rank!)
             : [];
