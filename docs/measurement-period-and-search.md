@@ -19,6 +19,18 @@ P00 沿用 `report_get`、`report_preview`、`report_reduce`，用 `kind: measur
 
 主要入口为 `crates/domain/src/measurement/measurement_report.rs`、`crates/api/src/measurement/measurement_reports.rs`、`crates/persistence/src/measurement/report.rs`，迁移 `0048`。
 
+## 独立报告下载契约
+
+CSV 下载同时面向未保存预览与已保存报告，不要求先保存或配置关注对象。点击时同步复制当前已校验作用域的报告、问题筛选、选中关注对象及显式别名、界面语言；后续切换页面、筛选或语言不改变本次导出。下载只读取已有页面数据，不保存报告、不调用模型或测量供应商。
+
+- 预览标为未保存，仅使用实际窗口、生成时间和输入摘要；不虚构报告 ID 或修订。已保存报告保留精确 ID、修订和更正关联。
+- 全报告覆盖、当前问题筛选下的 AI 结果、全报告传统搜索结果分别标明范围。关注对象是导出时的查看条件，不冒充报告冻结配置；未配置对象时仍导出原始证据。
+- 按精确问题引用／版本与测量条件分组，复用页面比较函数计算推荐频次、首位率和排名分布。每份回答按对象去重，排名冲突与无排名单列，零分母不造百分比；实际观测时间不由计划时间替代。
+- 保留原始答案、理由、引用、来源、状态和时间。系统标签使用当前中英文界面语言；稳定字段代码、ISO 时间和原始数值单独保留，不翻译用户内容。
+- 复用共用 CSV 序列化，保留 UTF-8 BOM、CRLF、完整引号和公式防护；既有运营周期 CSV 的输出格式不变。
+
+入口为 `measurementReportExport.ts`（点击快照）、`measurementReportsCsv.ts`（导出）、`MeasurementPeriodReportPanel.tsx`（页面操作）。PDF 后续复用既有字体与分页机制，不伪造运营周期或新增第二套通用 PDF 渲染器。实现、审查、部署和实际浏览器下载的完成状态分别见 WORKLOG 与 TODO。
+
 ## 传统搜索观察
 
 `SerpMeasurement` 与 AI 渠道账号、AI 引用和站长数据分开。当前首个适配采用 DataForSEO Google Organic Standard 的异步任务 API；普通 LLM 回答不替代搜索结果。

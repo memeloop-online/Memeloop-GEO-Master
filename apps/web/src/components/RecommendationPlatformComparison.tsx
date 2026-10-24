@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { Card, Field, Select } from "@fluentui/react-components";
 import { useTranslation } from "react-i18next";
 import type { MeasurementTarget } from "../api/projects";
@@ -16,21 +15,21 @@ import "./RecommendationPlatformComparison.css";
 export function RecommendationPlatformComparison({
   samples,
   focusTargets,
+  selectedTarget: target,
+  onSelectTarget,
   planWindow,
   timezone = "UTC",
 }: {
   samples: readonly RecommendationTrendSample[];
   focusTargets: readonly MeasurementTarget[];
+  selectedTarget: MeasurementTarget | null;
+  onSelectTarget: (target: MeasurementTarget) => void;
   planWindow: { start: string; end: string };
   timezone?: string;
 }) {
   const { t, i18n } = useTranslation("recommendationPlatformComparison");
-  const [selectedKey, setSelectedKey] = useState<string>();
   const targetKey = (target: MeasurementTarget) =>
     JSON.stringify([target.kind, target.name.trim()]);
-  const target =
-    focusTargets.find((item) => targetKey(item) === selectedKey) ??
-    focusTargets[0];
   const locale = i18n.resolvedLanguage || i18n.language;
   const number = new Intl.NumberFormat(locale);
   const percent = new Intl.NumberFormat(locale, {
@@ -82,7 +81,12 @@ export function RecommendationPlatformComparison({
           <Select
             aria-label={t("target")}
             value={targetKey(target)}
-            onChange={(_, data) => setSelectedKey(data.value)}
+            onChange={(_, data) => {
+              const selected = focusTargets.find(
+                (item) => targetKey(item) === data.value,
+              );
+              if (selected) onSelectTarget(selected);
+            }}
           >
             {focusTargets.map((item) => (
               <option key={targetKey(item)} value={targetKey(item)}>
