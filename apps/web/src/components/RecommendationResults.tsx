@@ -11,6 +11,7 @@ import { useTranslation } from "react-i18next";
 import type { ReactNode } from "react";
 import { decodeVerifiedRecommendations } from "../api/recommendations";
 import { isMeasurementFocus } from "../api/measurementFocus";
+import type { MeasurementTarget } from "../api/projects";
 import { safeOriginalPublicUrl } from "../pages/PublicationLookupPanel";
 import "../i18n/observationAnalysis";
 import "../i18n/measurementFocus";
@@ -41,7 +42,7 @@ export function RecommendationResults({
   focusTargets = [],
 }: {
   value: unknown;
-  focusTargets?: readonly string[];
+  focusTargets?: readonly MeasurementTarget[];
 }) {
   const { t } = useTranslation("observationAnalysis");
   const { t: focusT } = useTranslation("measurementFocus");
@@ -59,17 +60,26 @@ export function RecommendationResults({
       {decoded !== null &&
         focusTargets
           .filter(
-            (name) =>
-              !items.some((item) => isMeasurementFocus(item, [name])),
+            (target) =>
+              !items.some((item) => isMeasurementFocus(item, [target])),
           )
-          .map((name) => (
-            <div key={name} style={{ marginBottom: 12 }}>
-              <strong>{focusT("resultTitle", { name })}</strong>
-              <p>{focusT("notFound", { name })}</p>
+          .map((target) => (
+            <div
+              key={JSON.stringify([target.kind, target.name])}
+              style={{ marginBottom: 12 }}
+            >
+              <strong>
+                {focusT("resultTitle", { name: target.name })} ·{" "}
+                {focusT(`kind_${target.kind}`)}
+              </strong>
+              <p>{focusT("notFound", { name: target.name })}</p>
             </div>
           ))}
       {decoded !== null && (
-        <RecommendationFocusComparison items={items} focusTargets={focusTargets} />
+        <RecommendationFocusComparison
+          items={items}
+          focusTargets={focusTargets}
+        />
       )}
       {value == null ? (
         <p>{t("recommendationsNotAnalyzed")}</p>
