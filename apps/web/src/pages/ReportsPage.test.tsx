@@ -152,7 +152,12 @@ function mockApi({
         response({
           project_id: "project-1",
           revision: 1,
-          settings: { brand_name: "", product_name: null, competitors: [] },
+          settings: {
+            brand_name: "",
+            product_name: null,
+            competitors: [],
+            measurement_targets: [],
+          },
         }),
       );
     if (url.pathname.endsWith("/projects/project-1/cycles/current"))

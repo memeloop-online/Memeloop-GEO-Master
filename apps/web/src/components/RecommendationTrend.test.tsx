@@ -1,3 +1,4 @@
+import type { MeasurementTarget } from "../api/projects";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup,
@@ -13,6 +14,9 @@ import {
 import i18n from "../i18n";
 import userEvent from "@testing-library/user-event";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
+
+const trackedTargets = (names: string[]): MeasurementTarget[] =>
+  names.map((name) => ({ name, kind: "product", aliases: [] }));
 
 afterEach(() => {
   cleanup();
@@ -116,7 +120,7 @@ describe("recommendation rank history", () => {
             previous,
             datedSample("unranked", 3, [{ ...item, rank: null }]),
           ]}
-          focusTargets={[item.name]}
+          focusTargets={trackedTargets([item.name])}
         />,
       );
       const frequency = within(screen.getByRole("region", { name: region }));
@@ -161,7 +165,7 @@ describe("recommendation rank history", () => {
             ),
             datedSample("empty", 2, []),
           ]}
-          focusTargets={[item.name]}
+          focusTargets={trackedTargets([item.name])}
         />,
       );
       const frequency = within(
@@ -186,7 +190,10 @@ describe("recommendation rank history", () => {
             { ...item, name: `${item.name} plus`, rank: 1 },
           ]),
         ]}
-        focusTargets={[item.name]}
+        focusTargets={[
+          ...trackedTargets([item.name]),
+          { name: item.name, kind: "brand", aliases: [] },
+        ]}
       />,
     );
     const frequency = within(screen.getByRole("region", { name: "推荐频次" }));
@@ -199,18 +206,18 @@ describe("recommendation rank history", () => {
     expect(frequency.queryByText(`${item.name} plus`)).not.toBeInTheDocument();
   });
 
-  it("preserves exact raw names in frequency despite shared focus selection", () => {
+  it("counts trimmed names as the same configured target", () => {
     render(
       <RecommendationTrend
         samples={[
           datedSample("spaced", 1, [{ ...item, name: ` ${item.name} ` }]),
           datedSample("plain", 2),
         ]}
-        focusTargets={[item.name]}
+        focusTargets={trackedTargets([item.name])}
       />,
     );
     const frequency = within(screen.getByRole("region", { name: "推荐频次" }));
-    expect(frequency.getAllByText("推荐 1 / 2 次 · 50%")).toHaveLength(2);
+    expect(frequency.getByText("推荐 2 / 2 次 · 100%")).toBeVisible();
   });
 
   it.each([
@@ -221,7 +228,7 @@ describe("recommendation rank history", () => {
     render(
       <RecommendationTrend
         samples={[datedSample("only", 1, items)]}
-        focusTargets={[item.name]}
+        focusTargets={trackedTargets([item.name])}
       />,
     );
     const frequency = within(screen.getByRole("region", { name: "推荐频次" }));
@@ -252,7 +259,7 @@ describe("recommendation rank history", () => {
             ...datedSample(`unavailable-${index}`, index + 1),
             recommendations: result,
           }))}
-          focusTargets={[item.name]}
+          focusTargets={trackedTargets([item.name])}
         />,
       );
       const frequency = within(screen.getByRole("region", { name: region }));
@@ -278,7 +285,7 @@ describe("recommendation rank history", () => {
       render(
         <RecommendationTrend
           samples={[last, first]}
-          focusTargets={[item.name]}
+          focusTargets={trackedTargets([item.name])}
         />,
       );
       const summary = within(
@@ -313,7 +320,7 @@ describe("recommendation rank history", () => {
           { ...datedSample("missing", 2), recommendations: undefined },
           datedSample("latest", 3, [{ ...item, rank: 1 }]),
         ]}
-        focusTargets={[item.name]}
+        focusTargets={trackedTargets([item.name])}
       />,
     );
     const summary = within(
@@ -341,7 +348,7 @@ describe("recommendation rank history", () => {
     [recommendations([item], "unverified"), "推荐结果暂不可用"],
     [
       recommendations([item, { ...item, rank: 1, mention_order: 2 }]),
-      "同名同类型有多个结果，排名不唯一",
+      "同一关注对象出现不同排名，暂无法确定排名",
     ],
   ])(
     "shows a distinct latest state when rank cannot be compared",
@@ -352,7 +359,7 @@ describe("recommendation rank history", () => {
             datedSample("first", 1),
             { ...datedSample("last", 2), recommendations: result },
           ]}
-          focusTargets={[item.name]}
+          focusTargets={trackedTargets([item.name])}
         />,
       );
       const summary = within(
@@ -376,7 +383,10 @@ describe("recommendation rank history", () => {
             { ...item, name: `${item.name} plus`, rank: 1, mention_order: 2 },
           ]),
         ]}
-        focusTargets={[item.name]}
+        focusTargets={[
+          ...trackedTargets([item.name]),
+          { name: item.name, kind: "brand", aliases: [] },
+        ]}
       />,
     );
     const summary = within(
@@ -405,7 +415,7 @@ describe("recommendation rank history", () => {
             { ...item, name: ` ${item.name} `, rank: 1 },
           ]),
         ]}
-        focusTargets={[item.name, ` ${item.name} `]}
+        focusTargets={trackedTargets([item.name, ` ${item.name} `])}
       />,
     );
     const summary = within(
@@ -421,7 +431,7 @@ describe("recommendation rank history", () => {
     });
   });
 
-  it("keeps raw extracted names separate across samples despite focus whitespace matching", () => {
+  it("compares trimmed target names while preserving raw names in full history", () => {
     render(
       <RecommendationTrend
         samples={[
@@ -430,17 +440,15 @@ describe("recommendation rank history", () => {
           ]),
           datedSample("last", 2, [{ ...item, rank: 1 }]),
         ]}
-        focusTargets={[item.name]}
+        focusTargets={trackedTargets([item.name])}
       />,
     );
     const summary = within(
       screen.getByRole("region", { name: "关注对象最近变化" }),
     );
-    expect(summary.getAllByRole("region")).toHaveLength(2);
-    expect(summary.getAllByText("未出现在推荐结果中")).toHaveLength(2);
-    expect(
-      summary.queryByText(/排名上升|排名下降|排名持平/),
-    ).not.toBeInTheDocument();
+    expect(summary.getAllByRole("region")).toHaveLength(1);
+    expect(summary.queryByText("未出现在推荐结果中")).not.toBeInTheDocument();
+    expect(summary.getByText("排名上升 2 位")).toBeVisible();
     fireEvent.click(screen.getByText("完整排名对比"));
     expect(screen.getAllByText("关注对象")).toHaveLength(2);
     expect(screen.getAllByRole("row")).toHaveLength(3);
@@ -453,13 +461,13 @@ describe("recommendation rank history", () => {
           datedSample("first", 1, []),
           { ...datedSample("last", 2, []), recommendations: undefined },
         ]}
-        focusTargets={["Tracked sample"]}
+        focusTargets={trackedTargets(["Tracked sample"])}
       />,
     );
     const summary = within(
       screen.getByRole("region", { name: "关注对象最近变化" }),
     );
-    expect(summary.getByText("Tracked sample")).toBeVisible();
+    expect(summary.getByText(/Tracked sample/)).toBeVisible();
     expect(summary.getByText(/未出现在推荐结果中/)).toBeVisible();
     expect(summary.getByText(/推荐结果尚未分析/)).toBeVisible();
   });
@@ -473,7 +481,7 @@ describe("recommendation rank history", () => {
             { ...datedSample("first", 1, [{ ...item, rank: 3 }]), observedAt },
             datedSample("last", 2, [{ ...item, rank: 1 }]),
           ]}
-          focusTargets={[item.name]}
+          focusTargets={trackedTargets([item.name])}
         />,
       );
       const summary = within(
@@ -496,7 +504,7 @@ describe("recommendation rank history", () => {
           datedSample("tied", 1),
           datedSample("last", 2),
         ]}
-        focusTargets={[item.name]}
+        focusTargets={trackedTargets([item.name])}
       />,
     );
     expect(
@@ -511,9 +519,11 @@ describe("recommendation rank history", () => {
       datedSample("last", 2, [{ ...item, mention_order: 3 }]),
       datedSample("first", 1),
     ];
-    const focusTargets = [item.name, item.name];
+    const focusTargets = trackedTargets([item.name, item.name]);
     const original = JSON.stringify({ samples, focusTargets });
-    render(<RecommendationTrend samples={samples} focusTargets={focusTargets} />);
+    render(
+      <RecommendationTrend samples={samples} focusTargets={focusTargets} />,
+    );
     expect(JSON.stringify({ samples, focusTargets })).toBe(original);
     expect(
       screen.getAllByRole("region", { name: `${item.name} · 产品` }),
@@ -535,7 +545,7 @@ describe("recommendation rank history", () => {
           datedSample("old", 1, [{ ...item, rank: 7 }]),
           previous,
         ]}
-        focusTargets={[item.name]}
+        focusTargets={trackedTargets([item.name])}
       />,
     );
     const summary = within(
@@ -568,7 +578,12 @@ describe("recommendation rank history", () => {
     async (language, region, rank, noPrevious) => {
       await i18n.changeLanguage(language);
       const only = datedSample("only", 1);
-      render(<RecommendationTrend samples={[only]} focusTargets={[item.name]} />);
+      render(
+        <RecommendationTrend
+          samples={[only]}
+          focusTargets={trackedTargets([item.name])}
+        />,
+      );
       const summary = within(screen.getByRole("region", { name: region }));
       expect(summary.getByText(rank, { selector: "strong" })).toBeVisible();
       expect(summary.getByText(noPrevious)).toBeVisible();
@@ -589,7 +604,7 @@ describe("recommendation rank history", () => {
     render(
       <RecommendationTrend
         samples={[datedSample("old", 1, [{ ...item, rank: 7 }]), latest]}
-        focusTargets={[item.name]}
+        focusTargets={trackedTargets([item.name])}
       />,
     );
     const summary = within(
@@ -628,7 +643,7 @@ describe("recommendation rank history", () => {
       <FluentProvider theme={webLightTheme}>
         <RecommendationTrend
           samples={[first, latest]}
-          focusTargets={[item.name]}
+          focusTargets={trackedTargets([item.name])}
         />
       </FluentProvider>,
     );
@@ -750,7 +765,7 @@ describe("recommendation rank history", () => {
     render(
       <RecommendationTrend
         samples={[first, second]}
-        focusTargets={[item.name]}
+        focusTargets={trackedTargets([item.name])}
       />,
     );
     screen
@@ -794,7 +809,7 @@ describe("recommendation rank history", () => {
     render(
       <RecommendationTrend
         samples={[first, second]}
-        focusTargets={[item.name]}
+        focusTargets={trackedTargets([item.name])}
       />,
     );
     expect(screen.getAllByRole("table", { hidden: true })).toHaveLength(2);
@@ -892,5 +907,67 @@ describe("recommendation rank history", () => {
     ).toBeVisible();
     expect(screen.getByText("No explicit rank")).toBeVisible();
     expect(screen.getByText("Mention order: 1")).toBeVisible();
+  });
+
+  it.each([
+    [2, 2, "第 2 位：1 次"],
+    [1, 3, "排名不一致：1 次"],
+    [1, null, "排名不一致：1 次"],
+  ])(
+    "counts a canonical name and alias once per sample, preserving conflicting ranks: %s / %s",
+    (first, second, bucket) => {
+      const targets: MeasurementTarget[] = [
+        { name: item.name, kind: "product", aliases: ["Purifier short"] },
+        { name: item.name, kind: "restaurant", aliases: [] },
+      ];
+      const samples = [
+        datedSample("aliases", 1, [
+          { ...item, rank: first },
+          { ...item, name: "Purifier short", rank: second, mention_order: 2 },
+          { ...item, kind: "brand", rank: 1, mention_order: 3 },
+        ]),
+        datedSample("empty", 2, []),
+      ];
+      const original = JSON.stringify({ targets, samples });
+      render(<RecommendationTrend focusTargets={targets} samples={samples} />);
+      const frequency = within(
+        screen.getByRole("region", { name: "推荐频次" }),
+      );
+      const product = within(
+        frequency.getByRole("group", { name: item.name + " · 产品" }),
+      );
+      expect(product.getByText("推荐 1 / 2 次 · 50%")).toBeVisible();
+      expect(product.getByText(bucket)).toBeVisible();
+      expect(
+        within(
+          frequency.getByRole("group", { name: item.name + " · 餐馆" }),
+        ).getByText("推荐 0 / 2 次 · 0%"),
+      ).toBeVisible();
+      expect(JSON.stringify({ targets, samples })).toBe(original);
+    },
+  );
+  it("compares explicit aliases across the latest pair while preserving full history names", () => {
+    render(
+      <RecommendationTrend
+        focusTargets={[
+          { name: item.name, kind: "product", aliases: ["Purifier short"] },
+        ]}
+        samples={[
+          datedSample("first", 1, [{ ...item, rank: 3 }]),
+          datedSample("last", 2, [
+            { ...item, name: "Purifier short", rank: 1 },
+          ]),
+        ]}
+      />,
+    );
+    const changes = within(
+      screen.getByRole("region", { name: "关注对象最近变化" }),
+    );
+    expect(changes.getByText("排名上升 2 位")).toBeVisible();
+    expect(changes.queryByText("Purifier short")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("完整排名对比"));
+    expect(
+      within(screen.getByRole("table")).getByText("Purifier short"),
+    ).toBeVisible();
   });
 });

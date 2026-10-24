@@ -1,39 +1,65 @@
 import { describe, expect, it } from "vitest";
 import {
   isMeasurementFocus,
-  measurementFocusNames,
+  measurementFocusTargets,
   measurementFocusPatch,
 } from "./measurementFocus";
+import type { MeasurementTarget } from "./projects";
 
-describe("measurement focus", () => {
-  it("prefers the specific product without treating its brand as an alias", () => {
-    expect(
-      measurementFocusNames({
-        brand_name: "Example",
-        product_name: "Example X",
-      }),
-    ).toEqual(["Example X"]);
-    expect(measurementFocusNames({ brand_name: "Example" })).toEqual([
-      "Example",
+const target: MeasurementTarget = {
+  name: "Example X",
+  kind: "product",
+  aliases: ["Example short"],
+};
+
+describe("measurement targets", () => {
+  it("uses independent targets without inferring enterprise metadata", () => {
+    const settings = {
+      brand_name: "Example",
+      product_name: "Example X",
+      measurement_targets: [],
+    };
+    expect(measurementFocusTargets(settings)).toEqual([]);
+    expect(measurementFocusTargets(undefined)).toEqual([]);
+    expect(measurementFocusTargets({ measurement_targets: [target] })).toEqual([
+      target,
     ]);
-    expect(measurementFocusNames(undefined)).toEqual([]);
   });
 
-  it("matches explicit names without merging models, case or substrings", () => {
-    expect(isMeasurementFocus(" Example X ", ["Example X"])).toBe(true);
-    expect(isMeasurementFocus("Example X Pro", ["Example X"])).toBe(false);
-    expect(isMeasurementFocus("Example", ["Example X"])).toBe(false);
-    expect(isMeasurementFocus("example x", ["Example X"])).toBe(false);
+  it("matches exact trimmed names or explicit aliases only within the configured kind", () => {
+    for (const name of [" Example X ", "Example short"]) {
+      expect(isMeasurementFocus({ name, kind: "product" }, [target])).toBe(
+        true,
+      );
+    }
+    for (const name of ["Example", "example x", "Example X Pro"]) {
+      expect(isMeasurementFocus({ name, kind: "product" }, [target])).toBe(
+        false,
+      );
+    }
+    expect(
+      isMeasurementFocus({ name: target.name, kind: "brand" }, [target]),
+    ).toBe(false);
+    expect(
+      isMeasurementFocus({ name: "Example short", kind: "restaurant" }, [
+        target,
+      ]),
+    ).toBe(false);
   });
 
-  it("patches only the focus fields at the edited revision", () => {
-    expect(measurementFocusPatch(4, " Example ", " X ")).toEqual({
+  it("replaces only target settings at the edited revision and clears with an empty list", () => {
+    expect(
+      measurementFocusPatch(4, [
+        { ...target, name: " Example X ", aliases: [" short ", "", "short"] },
+      ]),
+    ).toEqual({
       revision: 4,
-      settings: { brand_name: "Example", product_name: "X" },
+      settings: { measurement_targets: [{ ...target, aliases: ["short"] }] },
     });
-    expect(measurementFocusPatch(4, "", "")).toEqual({
+    expect(measurementFocusPatch(4, [])).toEqual({
       revision: 4,
-      settings: { brand_name: "", product_name: null },
+      settings: { measurement_targets: [] },
     });
+    expect(target.aliases).toEqual(["Example short"]);
   });
 });

@@ -838,8 +838,8 @@ function SampleRecommendations({
   const items = decodeVerifiedRecommendations(sample.recommendations);
   if (items === null) return <p>{t("recommendationsPending")}</p>;
   if (!items.length) return <p>{t("recommendationsEmpty")}</p>;
-  const focused = items.filter((item) =>
-    isMeasurementFocus(item, focusTargets),
+  const absentTargets = focusTargets.filter(
+    (target) => !items.some((item) => isMeasurementFocus(item, [target])),
   );
   const table = (
     <table className="report-table">
@@ -906,17 +906,16 @@ function SampleRecommendations({
   );
   return (
     <div className="measurement-report-recommendations">
-      {focusTargets.length > 0 && focused.length === 0 && (
-        <p className="measurement-report-focus">
-          <strong>
-            {t("currentFocus", {
-              name: focusTargets.map((target) => target.name).join(" / "),
-            })}
-          </strong>
+      {absentTargets.map((target) => (
+        <p
+          key={JSON.stringify([target.kind, target.name])}
+          className="measurement-report-focus"
+        >
+          <strong>{t("currentFocus", { name: target.name })}</strong>
           {" · "}
           {t("focusNotFound")}
         </p>
-      )}
+      ))}
       <RecommendationFocusComparison
         items={items}
         focusTargets={focusTargets}

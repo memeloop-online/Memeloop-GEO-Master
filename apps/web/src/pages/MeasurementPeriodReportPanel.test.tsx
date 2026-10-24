@@ -21,7 +21,13 @@ vi.mock("../api/projects", () => ({
   useProjectQuery: () => ({
     data: {
       revision: 1,
-      settings: { brand_name: focus.name, competitors: [] },
+      settings: {
+        brand_name: "Enterprise",
+        competitors: [],
+        measurement_targets: focus.name
+          ? [{ name: focus.name, kind: "product", aliases: [] }]
+          : [],
+      },
     },
     isPending: false,
   }),

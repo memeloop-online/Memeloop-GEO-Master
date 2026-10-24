@@ -1,3 +1,4 @@
+import type { MeasurementTarget } from "../api/projects";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   cleanup,
@@ -8,6 +9,9 @@ import {
 } from "@testing-library/react";
 import { RecommendationResults } from "./RecommendationResults";
 import i18n from "../i18n";
+
+const trackedTargets = (names: string[]): MeasurementTarget[] =>
+  names.map((name) => ({ name, kind: "product", aliases: [] }));
 
 afterEach(cleanup);
 beforeEach(async () => {
@@ -42,7 +46,7 @@ describe("recommendation results", () => {
             rank: null,
           },
         ])}
-        focusTargets={["Sample purifier"]}
+        focusTargets={trackedTargets(["Sample purifier"])}
       />,
     );
     expect(screen.getByText("推荐第 2 位")).toBeVisible();
@@ -51,11 +55,17 @@ describe("recommendation results", () => {
 
   it("does not call missing analysis an absent recommendation", () => {
     const { rerender } = render(
-      <RecommendationResults value={null} focusTargets={["Example"]} />,
+      <RecommendationResults
+        value={null}
+        focusTargets={trackedTargets(["Example"])}
+      />,
     );
     expect(screen.queryByText(/本次推荐名单/)).not.toBeInTheDocument();
     rerender(
-      <RecommendationResults value={result([item])} focusTargets={["Example"]} />,
+      <RecommendationResults
+        value={result([item])}
+        focusTargets={trackedTargets(["Example"])}
+      />,
     );
     expect(screen.getByText("本次推荐名单中没有“Example”")).toBeVisible();
   });
@@ -67,7 +77,7 @@ describe("recommendation results", () => {
           { ...item, mention_order: 2, rank: null, reason: null },
           { ...item, name: "Sample restaurant", kind: "restaurant", rank: 1 },
         ])}
-        focusTargets={["Sample purifier Pro", "Another focus"]}
+        focusTargets={trackedTargets(["Sample purifier Pro", "Another focus"])}
       />,
     );
     expect(
@@ -99,7 +109,10 @@ describe("recommendation results", () => {
     render(
       <RecommendationResults
         value={result([item])}
-        focusTargets={["Sample purifier", "Sample purifier Pro"]}
+        focusTargets={trackedTargets([
+          "Sample purifier",
+          "Sample purifier Pro",
+        ])}
       />,
     );
     expect(
@@ -124,7 +137,12 @@ describe("recommendation results", () => {
   ])(
     "does not show fallback cards for unavailable or empty extraction (%s)",
     (value) => {
-      render(<RecommendationResults value={value} focusTargets={["Example"]} />);
+      render(
+        <RecommendationResults
+          value={value}
+          focusTargets={trackedTargets(["Example"])}
+        />,
+      );
       expect(screen.queryByRole("article")).not.toBeInTheDocument();
       expect(screen.queryByText("查看完整推荐列表")).not.toBeInTheDocument();
       expect(
@@ -244,7 +262,7 @@ describe("recommendation results", () => {
     render(
       <RecommendationResults
         value={result([item])}
-        focusTargets={["Sample purifier Pro"]}
+        focusTargets={trackedTargets(["Sample purifier Pro"])}
       />,
     );
     expect(
@@ -259,5 +277,31 @@ describe("recommendation results", () => {
     fireEvent.click(summary);
     expect(details).toHaveAttribute("open");
     expect(table).toBeVisible();
+  });
+
+  it("matches explicit aliases by kind while keeping original evidence names", () => {
+    render(
+      <RecommendationResults
+        focusTargets={[
+          { name: "Canonical product", kind: "product", aliases: [item.name] },
+          {
+            name: "Canonical restaurant",
+            kind: "restaurant",
+            aliases: [item.name],
+          },
+        ]}
+        value={result([item])}
+      />,
+    );
+    expect(
+      screen.queryByText("本次推荐名单中没有“Canonical product”"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText("本次推荐名单中没有“Canonical restaurant”"),
+    ).toBeVisible();
+    expect(screen.getByRole("article", { name: item.name })).toBeVisible();
+    expect(
+      within(screen.getByRole("table")).getByText(item.name),
+    ).toBeVisible();
   });
 });

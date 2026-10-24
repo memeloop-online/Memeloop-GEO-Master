@@ -195,6 +195,7 @@ describe("authentication and workspace guards", () => {
         settings: {
           brand_name: "Northstar AI",
           product_name: "Northstar Pro",
+          measurement_targets: [],
           market: "中国大陆",
           language: "简体中文",
           target_audience: null,

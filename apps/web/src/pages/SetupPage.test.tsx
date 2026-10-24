@@ -39,6 +39,7 @@ function projectForRevision(revision: number) {
     settings: {
       brand_name: "Northstar AI",
       product_name: null,
+      measurement_targets: [],
       market: "中国大陆",
       language: "简体中文",
       target_audience: null,

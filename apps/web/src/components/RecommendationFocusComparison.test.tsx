@@ -1,3 +1,4 @@
+import type { MeasurementTarget } from "../api/projects";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup,
@@ -9,6 +10,9 @@ import {
 import type { RecommendationItem } from "../api/recommendations";
 import i18n from "../i18n";
 import { RecommendationFocusComparison } from "./RecommendationFocusComparison";
+
+const trackedTargets = (names: string[]): MeasurementTarget[] =>
+  names.map((name) => ({ name, kind: "product", aliases: [] }));
 
 afterEach(cleanup);
 beforeEach(async () => {
@@ -35,7 +39,7 @@ describe("tracked recommendation comparison", () => {
     const onAnalyze = vi.fn();
     render(
       <RecommendationFocusComparison
-        focusTargets={[first.name]}
+        focusTargets={trackedTargets([first.name])}
         items={[first, second]}
         onAnalyze={onAnalyze}
       />,
@@ -50,7 +54,7 @@ describe("tracked recommendation comparison", () => {
   it("shows the target first and only same-kind recommendations with strictly smaller ranks", () => {
     render(
       <RecommendationFocusComparison
-        focusTargets={["Example target"]}
+        focusTargets={trackedTargets(["Example target"])}
         items={[
           item({
             name: "Second alternative",
@@ -83,7 +87,7 @@ describe("tracked recommendation comparison", () => {
   it("does not treat ties or earlier mentions as recommendations ranked ahead", () => {
     render(
       <RecommendationFocusComparison
-        focusTargets={["Example target"]}
+        focusTargets={trackedTargets(["Example target"])}
         items={[
           item({ name: "Earlier mention", rank: null, mention_order: 1 }),
           item({ name: "Tied alternative", rank: 2, mention_order: 2 }),
@@ -101,7 +105,7 @@ describe("tracked recommendation comparison", () => {
   it("keeps an unranked target unranked without inferring a comparison", () => {
     render(
       <RecommendationFocusComparison
-        focusTargets={["Example target"]}
+        focusTargets={trackedTargets(["Example target"])}
         items={[
           item({ name: "Ranked alternative", rank: 1 }),
           item({ rank: null, mention_order: 4 }),
@@ -118,7 +122,7 @@ describe("tracked recommendation comparison", () => {
   it("shows conflicting target occurrences without choosing a rank for comparison", () => {
     render(
       <RecommendationFocusComparison
-        focusTargets={["Example target"]}
+        focusTargets={trackedTargets(["Example target"])}
         items={[
           item({ rank: 2, reason: "First observed reason." }),
           item({
@@ -138,7 +142,7 @@ describe("tracked recommendation comparison", () => {
     expect(screen.getByText("First observed reason.")).toBeVisible();
     expect(screen.getByText("Second observed reason.")).toBeVisible();
     expect(
-      screen.getByText("同名同类型出现不同排名，暂无法比较先后。"),
+      screen.getByText("同一关注对象出现不同排名，暂无法比较先后。"),
     ).toBeVisible();
     expect(screen.queryByText("Alternative")).not.toBeInTheDocument();
     expect(screen.queryByText("排名更靠前的推荐")).not.toBeInTheDocument();
@@ -147,7 +151,10 @@ describe("tracked recommendation comparison", () => {
   it("keeps equal names in different kinds in separate comparisons", () => {
     render(
       <RecommendationFocusComparison
-        focusTargets={["Example target"]}
+        focusTargets={[
+          ...trackedTargets(["Example target"]),
+          { name: "Example target", kind: "brand", aliases: [] },
+        ]}
         items={[
           item(),
           item({ kind: "brand", rank: 1 }),
@@ -172,7 +179,7 @@ describe("tracked recommendation comparison", () => {
   it("matches trimmed exact names without matching other models or casing", () => {
     render(
       <RecommendationFocusComparison
-        focusTargets={["  Example target  "]}
+        focusTargets={trackedTargets(["  Example target  "])}
         items={[
           item({ name: " Example target " }),
           item({ name: "Example target Pro", rank: 4 }),
@@ -188,12 +195,15 @@ describe("tracked recommendation comparison", () => {
 
   it.each([
     { focusTargets: [], items: [item()] },
-    { focusTargets: ["Example target"], items: [] },
+    { focusTargets: trackedTargets(["Example target"]), items: [] },
   ])(
     "renders nothing without focus names or recommendations ($focusTargets)",
     ({ focusTargets, items }) => {
       const { container } = render(
-        <RecommendationFocusComparison items={items} focusTargets={focusTargets} />,
+        <RecommendationFocusComparison
+          items={items}
+          focusTargets={focusTargets}
+        />,
       );
       expect(container).toBeEmptyDOMElement();
     },
@@ -202,7 +212,7 @@ describe("tracked recommendation comparison", () => {
   it("shows every occurrence and its actual kind in mention order when the exact model is absent", () => {
     render(
       <RecommendationFocusComparison
-        focusTargets={["Example target Pro"]}
+        focusTargets={trackedTargets(["Example target Pro"])}
         items={[
           item({ kind: "brand", mention_order: 4, rank: 1 }),
           item({ name: "Other item", kind: "other", mention_order: 6 }),
@@ -264,7 +274,7 @@ describe("tracked recommendation comparison", () => {
     (focusName) => {
       const { container } = render(
         <RecommendationFocusComparison
-          focusTargets={[focusName]}
+          focusTargets={trackedTargets([focusName])}
           items={[
             item({
               evidence_quote: "<script>literal evidence</script>",
@@ -308,7 +318,7 @@ describe("tracked recommendation comparison", () => {
     await i18n.changeLanguage("en");
     render(
       <RecommendationFocusComparison
-        focusTargets={["Example target Pro"]}
+        focusTargets={trackedTargets(["Example target Pro"])}
         items={[item({ reason: null, rank: null })]}
       />,
     );
@@ -331,7 +341,7 @@ describe("tracked recommendation comparison", () => {
     await i18n.changeLanguage("en");
     render(
       <RecommendationFocusComparison
-        focusTargets={["Example target"]}
+        focusTargets={trackedTargets(["Example target"])}
         items={[item({ reason: null }), item({ name: "Alternative", rank: 1 })]}
       />,
     );
@@ -343,5 +353,69 @@ describe("tracked recommendation comparison", () => {
     expect(screen.getByText("Recommendations ranked ahead")).toBeVisible();
     expect(screen.getByText("No recommendation reason given")).toBeVisible();
     expect(screen.getByText("Recommended at #3")).toBeVisible();
+  });
+
+  it("groups explicit aliases under the canonical target and excludes all tracked aliases from competitors", () => {
+    const canonical = {
+      name: "Example target",
+      kind: "product" as const,
+      aliases: ["Target short"],
+    };
+    const companion = {
+      name: "Example companion",
+      kind: "product" as const,
+      aliases: ["Companion short"],
+    };
+    const aliasItem = item({ name: "Target short", rank: 3 });
+    const onAnalyze = vi.fn();
+    render(
+      <RecommendationFocusComparison
+        focusTargets={[canonical, companion]}
+        items={[
+          aliasItem,
+          item({ name: "Companion short", rank: 1, mention_order: 2 }),
+          item({ name: "Alternative", rank: 2, mention_order: 3 }),
+        ]}
+        onAnalyze={onAnalyze}
+      />,
+    );
+    const target = within(
+      screen.getByRole("region", { name: "Example target · 产品" }),
+    );
+    expect(target.getByText("Target short")).toBeVisible();
+    expect(target.getByText("Alternative")).toBeVisible();
+    expect(target.queryByText("Companion short")).not.toBeInTheDocument();
+    fireEvent.click(
+      within(target.getByRole("article", { name: "Target short" })).getByRole(
+        "button",
+        { name: "分析改进方向" },
+      ),
+    );
+    expect(onAnalyze).toHaveBeenCalledExactlyOnceWith(aliasItem);
+  });
+  it.each([
+    [1, 3],
+    [1, null],
+  ])("keeps conflicting alias ranks ambiguous: %j", (first, second) => {
+    render(
+      <RecommendationFocusComparison
+        focusTargets={[
+          {
+            name: "Example target",
+            kind: "product",
+            aliases: ["Target short"],
+          },
+        ]}
+        items={[
+          item({ rank: first }),
+          item({ name: "Target short", rank: second, mention_order: 2 }),
+          item({ name: "Alternative", rank: 1, mention_order: 3 }),
+        ]}
+      />,
+    );
+    expect(
+      screen.getByText("同一关注对象出现不同排名，暂无法比较先后。"),
+    ).toBeVisible();
+    expect(screen.queryByText("Alternative")).not.toBeInTheDocument();
   });
 });

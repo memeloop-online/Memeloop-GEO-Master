@@ -1,4 +1,8 @@
-import type { MeasurementTarget, ProjectSettings, UpdateProjectInput } from "./projects";
+import type {
+  MeasurementTarget,
+  ProjectSettings,
+  UpdateProjectInput,
+} from "./projects";
 
 /** Current viewing preferences, independent of enterprise metadata and saved evidence. */
 export function measurementFocusTargets(
@@ -11,9 +15,12 @@ export function isMeasurementFocus(
   item: Pick<MeasurementTarget, "name" | "kind">,
   focusTargets: readonly MeasurementTarget[],
 ) {
-  return focusTargets.some((target) =>
-    target.kind === item.kind &&
-    [target.name, ...target.aliases].some((name) => name.trim() === item.name.trim()),
+  return focusTargets.some(
+    (target) =>
+      target.kind === item.kind &&
+      [target.name, ...target.aliases].some(
+        (name) => name.trim() === item.name.trim(),
+      ),
   );
 }
 
@@ -26,7 +33,9 @@ export function measurementFocusPatch(
     measurement_targets: targets.map((target) => ({
       name: target.name.trim(),
       kind: target.kind,
-      aliases: [...new Set(target.aliases.map((alias) => alias.trim()).filter(Boolean))],
+      aliases: [
+        ...new Set(target.aliases.map((alias) => alias.trim()).filter(Boolean)),
+      ],
     })),
   };
   return { revision, settings };
