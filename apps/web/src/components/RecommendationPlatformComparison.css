@@ -1,0 +1,69 @@
+.recommendation-platform-comparison,
+.recommendation-platform-question {
+  display: grid;
+  min-width: 0;
+  max-width: 100%;
+  gap: 12px;
+}
+
+.recommendation-platform-comparison p,
+.recommendation-platform-comparison h3,
+.recommendation-platform-comparison h4 {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.recommendation-platform-scroll {
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.recommendation-platform-scroll:focus-visible {
+  outline: 2px solid var(--colorStrokeFocus2);
+  outline-offset: -2px;
+}
+
+.recommendation-platform-table {
+  width: 100%;
+  min-width: 960px;
+  border-collapse: collapse;
+}
+
+.recommendation-platform-table caption {
+  text-align: left;
+  font-weight: 600;
+  padding-block: 8px;
+}
+
+.recommendation-platform-table th,
+.recommendation-platform-table td {
+  padding: 12px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--colorNeutralStroke2);
+  overflow-wrap: anywhere;
+  max-width: 280px;
+}
+
+.recommendation-platform-table dl {
+  margin: 8px 0 0;
+  font-weight: normal;
+}
+
+.recommendation-platform-table dt {
+  color: var(--colorNeutralForeground2);
+}
+
+.recommendation-platform-table dd {
+  margin: 0 0 6px;
+}
+
+.recommendation-platform-table td p + p {
+  margin-top: 8px;
+}
+
+.recommendation-platform-table ul {
+  margin: 8px 0 0;
+  padding-inline-start: 20px;
+}

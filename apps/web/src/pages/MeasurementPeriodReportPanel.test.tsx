@@ -1616,3 +1616,106 @@ const searchFixture: api.MeasurementPeriodSearchSection = {
     },
   ],
 };
+
+describe("platform comparison report integration", () => {
+  it.each([false, true])(
+    "uses the displayed preview or saved evidence without creating measurements (saved=%s)",
+    async (alreadySaved) => {
+      focus.name = "Example lamp";
+      const recommendation = {
+        version: "geo.recommendations.v1",
+        status: "verified",
+        items: [
+          {
+            name: focus.name,
+            kind: "product",
+            mention_order: 1,
+            rank: 1,
+            reason: "Portable",
+            evidence_quote: "Portable lamp",
+            citation_urls: [],
+          },
+        ],
+      };
+      const input: api.MeasurementPeriodPreview = {
+        ...preview,
+        samples: [
+          {
+            ...preview.samples[0],
+            recommendations: recommendation,
+            observation: {
+              ...preview.samples[0].observation!,
+              observed_at: "2026-10-11T10:00:00Z",
+            },
+          },
+          {
+            ...preview.samples[0],
+            plan_id: "other-plan",
+            target_id: "other-target",
+            attempt_id: "other-attempt",
+            observation: null,
+            recommendations: undefined,
+            conditions: {
+              ...preview.samples[0].conditions,
+              provider: "provider-b",
+            },
+          },
+        ],
+      };
+      const result: api.MeasurementPeriodReport = {
+        ...saved,
+        ...input,
+        kind: "measurement_period",
+        report_id: "selected-report",
+      };
+      const { load, list, detail, save } = setup(
+        input,
+        alreadySaved ? [result] : [],
+      );
+      detail.mockResolvedValue(result);
+      if (alreadySaved) {
+        await openReportDetails();
+        await userEvent.selectOptions(
+          screen.getByRole("combobox", { name: "报告时间" }),
+          result.report_id,
+        );
+        await screen.findByRole("link", { name: "用 AI 分析这份报告" });
+      }
+      const comparison = within(
+        await screen.findByRole("region", { name: "平台推荐对比" }),
+      );
+      const table = comparison.getByRole("table");
+      expect(within(table).getAllByRole("row")).toHaveLength(3);
+      expect(within(table).getByText("有效 1 次 · 不可用 0 次")).toBeVisible();
+      expect(within(table).getByText("有效 0 次 · 不可用 1 次")).toBeVisible();
+      expect(within(table).getByText("时间未记录：1 次")).toBeVisible();
+      expect(comparison.getByText(/计划采样窗口：/)).toHaveTextContent(
+        "含开始、不含结束",
+      );
+      const actual = new Intl.DateTimeFormat("zh-CN", {
+        dateStyle: "medium",
+        timeStyle: "short",
+        timeZone: "UTC",
+      }).format(new Date("2026-10-11T10:00:00Z"));
+      expect(within(table).getByText(`${actual} 至 ${actual}`)).toBeVisible();
+      for (const summary of within(table).getAllByText("查看 1 次样本"))
+        await userEvent.click(summary);
+      const links = within(table).getAllByRole("link");
+      expect(links[0]).toHaveAttribute(
+        "href",
+        "/app/tenant/project/measurement?tab=records&record=plan&target=target&attempt=attempt&analysisRevision=analysis-revision",
+      );
+      expect(links[1]).toHaveAttribute(
+        "href",
+        "/app/tenant/project/measurement?tab=records&record=other-plan&target=other-target&attempt=other-attempt",
+      );
+      expect(save).not.toHaveBeenCalled();
+      expect(load).toHaveBeenCalledTimes(1);
+      expect(list).toHaveBeenCalledTimes(1);
+      expect(detail).toHaveBeenCalledTimes(alreadySaved ? 1 : 0);
+      expect(
+        screen.getByRole("region", { name: "推荐排名变化" }),
+      ).toBeVisible();
+    },
+  );
+});
