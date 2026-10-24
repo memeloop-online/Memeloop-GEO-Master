@@ -1942,7 +1942,9 @@ async function main() {
     .click();
   const previewArea = page.getByRole("region", { name: "临时报告预览" });
   await previewArea
-    .getByText("临时预览 · 未保存为正式周报", { exact: false })
+    .getByText("此预览尚未保存。刷新后，结果可能随新数据更新。", {
+      exact: false,
+    })
     .waitFor();
   await page.getByRole("heading", { name: "尚无周报快照" }).waitFor();
   assert(
