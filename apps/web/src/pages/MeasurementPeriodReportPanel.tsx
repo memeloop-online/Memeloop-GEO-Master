@@ -18,6 +18,7 @@ import {
   RecommendationTrend,
   type RecommendationTrendSample,
 } from "../components/RecommendationTrend";
+import { RecommendationPlatformComparison } from "../components/RecommendationPlatformComparison";
 import { ReportSupplementaryMeasurements } from "./ReportSupplementaryMeasurements";
 import { safeOriginalPublicUrl } from "./PublicationLookupPanel";
 import "../i18n/measurementReports";
@@ -206,6 +207,11 @@ export function MeasurementPeriodReportPanel({
       recommendations: sample.recommendations,
     }),
   );
+  const platformRecommendations = recommendations.map((sample, index) => ({
+    ...sample,
+    // Planned time is not evidence of an actual observation.
+    observedAt: visibleSamples[index].observation?.observed_at ?? null,
+  }));
   const hasAnswer = (sample: MeasurementPeriodProjection["samples"][number]) =>
     Boolean(sample.observation?.raw_answer.trim());
   const available = visibleSamples.filter(hasAnswer);
@@ -626,6 +632,15 @@ export function MeasurementPeriodReportPanel({
         report && (
           <>
             {questions.length > 1 && questionSelector}
+            <RecommendationPlatformComparison
+              samples={platformRecommendations}
+              focusTargets={focusTargets}
+              planWindow={{
+                start: report.report_window_start_at,
+                end: report.report_window_end_at,
+              }}
+              timezone={report.report_timezone}
+            />
             {recommendations.length > 0 && (
               <RecommendationTrend
                 samples={recommendations}
