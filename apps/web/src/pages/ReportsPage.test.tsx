@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
@@ -17,6 +17,7 @@ import {
 } from "../api/reports";
 import { reportSnapshotCsv } from "./reportsCsv";
 import { downloadReportPdf } from "./reportsPdf";
+import i18n from "../i18n";
 
 vi.mock("./reportsPdf", () => ({ downloadReportPdf: vi.fn() }));
 
@@ -238,6 +239,10 @@ function renderPage(
   );
 }
 
+beforeEach(async () => {
+  await i18n.changeLanguage("zh-CN");
+});
+
 afterEach(() => {
   vi.mocked(downloadReportPdf).mockReset();
   setCsrfToken(undefined);
@@ -280,7 +285,7 @@ describe("P14 immutable reports", () => {
       name: "临时报告预览",
     });
     expect(
-      within(previewSection).getByText(/临时预览 · 未保存为正式周报/),
+      within(previewSection).getByText(/此预览尚未保存/),
     ).toBeInTheDocument();
     expect(
       within(previewSection).getByText("资料不足的文档分支"),
@@ -697,7 +702,7 @@ describe("P14 immutable reports", () => {
     renderPage("/app/tenant-1/project-1/reports/report-1");
     expect(
       await screen.findByRole("heading", {
-        name: /2026\/09\/21 00:00 UTC（报告时区无效）/,
+        name: /2026\/09\/21 00:00 UTC（报告时区不可用）/,
       }),
     ).toBeInTheDocument();
   });
@@ -857,4 +862,340 @@ describe("P14 immutable reports", () => {
       "/cycles/cycle%2Fother/report-preview?tenant_id=tenant-other&project_id=project-other",
     );
   });
+});
+
+describe("weekly report localization", () => {
+  it.each([
+    [
+      "zh-CN",
+      "本期报告预览",
+      "已保存的周报",
+      "临时报告预览",
+      "周报 · 2026/09/21 08:00",
+      "文档清单",
+      "资料不足的文档分支",
+    ],
+    [
+      "en",
+      "Current report preview",
+      "Saved weekly reports",
+      "Temporary report preview",
+      "Weekly report · 09/21/2026, 08:00",
+      "Document plan",
+      "资料不足的文档分支",
+    ],
+  ])(
+    "localizes the preview, saved list and detail in %s while preserving saved text",
+    async (
+      language,
+      previewTitle,
+      savedTitle,
+      previewAria,
+      detailTitle,
+      manifest,
+      savedSummary,
+    ) => {
+      await i18n.changeLanguage(language);
+      mockApi();
+      const user = userEvent.setup();
+      renderPage();
+      const disclosure = await screen.findByText(
+        language === "en" ? "Operations reports" : "运营周报",
+      );
+      expect(disclosure.closest("details")).not.toHaveAttribute("open");
+      await user.click(disclosure);
+      expect(
+        await screen.findByRole("heading", { name: previewTitle }),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("region", { name: previewAria }),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("region", { name: savedTitle }),
+      ).toBeInTheDocument();
+      expect(screen.getByText(savedSummary)).toBeInTheDocument();
+      expect(screen.getByText(new RegExp(manifest))).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: /CSV/ }),
+      ).not.toBeInTheDocument();
+      await user.click(screen.getByRole("link", { name: /2026.*2026/ }));
+      expect(
+        await screen.findByRole("heading", { name: detailTitle }),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", {
+          name:
+            language === "en"
+              ? "Download coverage and evidence CSV"
+              : "下载覆盖与证据 CSV",
+        }),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", {
+          name:
+            language === "en"
+              ? "Download coverage and evidence PDF"
+              : "下载覆盖与证据 PDF",
+        }),
+      ).toBeInTheDocument();
+      expect(screen.getByText("report-original")).toBeInTheDocument();
+      expect(screen.getByText("item-1")).toBeInTheDocument();
+      expect(
+        screen.getByText(language === "en" ? "Evidence type" : "证据类型"),
+      ).toBeInTheDocument();
+    },
+  );
+
+  it("switches labels, dates and formatted counts without refetching or changing the open report", async () => {
+    const fetchMock = mockApi({
+      detail: {
+        ...snapshot,
+        documents: {
+          ...snapshot.documents,
+          expected_count: 12345,
+          observed_count: 1234,
+          counts: { planned: 1234 },
+        },
+        measurement_groups: [
+          {
+            comparison_key: "protocol-one",
+            purpose: "frozen_evaluation",
+            coverage: { ...snapshot.documents },
+          },
+        ],
+      },
+    });
+    const user = userEvent.setup();
+    renderPage("/app/tenant-1/project-1/reports/report-1");
+    expect(
+      await screen.findByRole("heading", { name: "周报 · 2026/09/21 08:00" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("2026/09/26 16:00")).toBeInTheDocument();
+    const recordDetails = screen.getByText("记录详情");
+    await user.click(recordDetails);
+    expect(recordDetails.closest("details")).toHaveAttribute("open");
+    const requestsBeforeSwitch = fetchMock.mock.calls.length;
+    await act(() => i18n.changeLanguage("en"));
+    expect(
+      screen.getByRole("heading", {
+        name: "Weekly report · 09/21/2026, 08:00",
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("09/26/2026, 16:00")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Total planned 12,345 · Observed 1,234/),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "1,234" })).toBeInTheDocument();
+    expect(
+      screen.getByText("Record details").closest("details"),
+    ).toHaveAttribute("open");
+    expect(screen.getByText("protocol-one")).toBeInTheDocument();
+    expect(screen.getByText("report-original")).toBeInTheDocument();
+    expect(screen.getByText("一个分支仍需资料")).toBeInTheDocument();
+    expect(screen.getAllByText("尚无封存输入")).toHaveLength(2);
+    expect(fetchMock).toHaveBeenCalledTimes(requestsBeforeSwitch);
+  });
+
+  it.each([
+    [
+      "zh-CN",
+      "正在生成临时报告预览",
+      "无法加载临时预览",
+      "重试",
+      "暂无活动周期",
+      "当前没有可预览的运营周期。已保存的报告仍可在下方查看。",
+    ],
+    [
+      "en",
+      "Generating report preview",
+      "Unable to load the preview",
+      "Retry",
+      "No active cycle",
+      "There is no current operating cycle to preview. Saved reports are still available below.",
+    ],
+  ])(
+    "localizes asynchronous preview and no-cycle states in %s",
+    async (language, loading, error, retry, noCycle, hint) => {
+      await i18n.changeLanguage(language);
+      let finish!: () => void;
+      mockApi({
+        previewWait: new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+      });
+      const loadingPage = renderPage();
+      expect(await screen.findByLabelText(loading)).toBeInTheDocument();
+      finish();
+      loadingPage.unmount();
+      mockApi({ previewStatus: 503 });
+      const errorPage = renderPage();
+      expect(await screen.findByText(error)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: retry })).toBeInTheDocument();
+      errorPage.unmount();
+      mockApi({ cycleStatus: 404 });
+      renderPage();
+      expect(await screen.findByText(noCycle)).toBeInTheDocument();
+      expect(screen.getByText(hint)).toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    ["zh-CN", 403, "权限不足", "暂时无法读取，请重试。"],
+    [
+      "en",
+      403,
+      "Access denied",
+      "This information is temporarily unavailable. Try again.",
+    ],
+    ["zh-CN", 404, "未找到报告", "暂时无法读取，请重试。"],
+    [
+      "en",
+      404,
+      "Report not found",
+      "This information is temporarily unavailable. Try again.",
+    ],
+    [
+      "en",
+      503,
+      "Unable to load reports",
+      "This information is temporarily unavailable. Try again.",
+    ],
+  ])("localizes detail error %s/%s", async (language, status, title, hint) => {
+    await i18n.changeLanguage(language as string);
+    mockApi({ detailStatus: status as number });
+    renderPage("/app/tenant-1/project-1/reports/report-1");
+    expect(await screen.findByText(title as string)).toBeInTheDocument();
+    expect(screen.getByText(hint as string)).toBeInTheDocument();
+    expect(screen.queryByText("无权读取报告")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["zh-CN", "权限不足", "尚无周报快照"],
+    ["en", "Access denied", "No weekly report snapshots yet"],
+  ])(
+    "localizes saved-list permissions and empty state in %s",
+    async (language, permission, empty) => {
+      await i18n.changeLanguage(language);
+      mockApi({ listStatus: 403 });
+      const deniedPage = renderPage();
+      expect(await screen.findByText(permission)).toBeInTheDocument();
+      expect(screen.queryByText(empty)).not.toBeInTheDocument();
+      deniedPage.unmount();
+      mockApi({ reports: [] });
+      renderPage();
+      expect(await screen.findByText(empty)).toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    ["zh-CN", "无法读取证据明细", "重试", "证据类型"],
+    ["en", "Unable to load evidence details", "Retry", "Evidence type"],
+  ])(
+    "retries evidence in %s without hiding saved coverage",
+    async (language, error, retry, evidenceType) => {
+      await i18n.changeLanguage(language);
+      const fetchMock = mockApi({ evidenceStatus: 503 });
+      const user = userEvent.setup();
+      renderPage("/app/tenant-1/project-1/reports/report-1");
+      expect(await screen.findByText(error)).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          language === "en"
+            ? "Document coverage and information gaps"
+            : "文档覆盖与资料缺口",
+        ),
+      ).toBeInTheDocument();
+      fetchMock.mockImplementationOnce(() =>
+        Promise.resolve(response({ items: snapshot.evidence })),
+      );
+      await user.click(screen.getByRole("button", { name: retry }));
+      expect(await screen.findByText(evidenceType)).toBeInTheDocument();
+      expect(screen.queryByText(error)).not.toBeInTheDocument();
+      expect(
+        fetchMock.mock.calls.filter(([request]) =>
+          String(request).includes("/reports/report-1/evidence"),
+        ),
+      ).toHaveLength(2);
+    },
+  );
+
+  it.each([
+    ["zh-CN", "结果未知", "缺测", "拒答", "未提及", "其他状态"],
+    [
+      "en",
+      "Result unknown",
+      "Missing measurement",
+      "Refused",
+      "Not mentioned",
+      "Other status",
+    ],
+  ])(
+    "keeps unknown, missing, refusal, non-mention and future statuses distinct in %s",
+    async (language, unknown, missing, refused, notMentioned, other) => {
+      await i18n.changeLanguage(language);
+      mockApi({
+        detail: {
+          ...snapshot,
+          measurements: {
+            availability: "available",
+            expected_count: 5,
+            observed_count: 5,
+            counts: {
+              unknown: 1,
+              missing: 1,
+              refused: 1,
+              not_mentioned: 1,
+              future_status: 1,
+            },
+            reason: null,
+          },
+        },
+      });
+      renderPage("/app/tenant-1/project-1/reports/report-1");
+      for (const label of [unknown, missing, refused, notMentioned, other]) {
+        expect(
+          await screen.findByRole("rowheader", { name: label }),
+        ).toBeInTheDocument();
+      }
+      expect(
+        screen.queryByText(/future_status|future status/),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([
+    ["zh-CN", "2026/09/21 00:00 UTC（报告时区不可用）", "未记录"],
+    [
+      "en",
+      "09/21/2026, 00:00 UTC (report time zone unavailable)",
+      "Not recorded",
+    ],
+  ])(
+    "localizes invalid-timezone fallback and missing timestamps in %s while preserving invalid dates",
+    async (language, fallback, missing) => {
+      await i18n.changeLanguage(language);
+      mockApi({
+        detail: {
+          ...snapshot,
+          report_timezone: "Unknown/Invalid",
+          evidence: [
+            {
+              ...snapshot.evidence[0],
+              occurred_at: null,
+              received_at: "invalid-date",
+              resource_version: null,
+            },
+          ],
+        },
+      });
+      renderPage("/app/tenant-1/project-1/reports/report-1");
+      expect(
+        await screen.findByRole("heading", {
+          name: new RegExp(fallback.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        }),
+      ).toBeInTheDocument();
+      expect(await screen.findAllByText(missing)).toHaveLength(2);
+      expect(screen.getByText("invalid-date")).toBeInTheDocument();
+    },
+  );
 });
