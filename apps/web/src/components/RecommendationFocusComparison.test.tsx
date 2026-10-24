@@ -355,7 +355,7 @@ describe("tracked recommendation comparison", () => {
     expect(screen.getByText("Recommended at #3")).toBeVisible();
   });
 
-  it("groups explicit aliases under the canonical target and excludes all tracked aliases from competitors", () => {
+  it("groups aliases under their target while retaining independent tracked competitors", () => {
     const canonical = {
       name: "Example target",
       kind: "product" as const,
@@ -384,7 +384,10 @@ describe("tracked recommendation comparison", () => {
     );
     expect(target.getByText("Target short")).toBeVisible();
     expect(target.getByText("Alternative")).toBeVisible();
-    expect(target.queryByText("Companion short")).not.toBeInTheDocument();
+    expect(target.getByText("Companion short")).toBeVisible();
+    expect(
+      target.getAllByRole("article", { name: "Target short" }),
+    ).toHaveLength(1);
     fireEvent.click(
       within(target.getByRole("article", { name: "Target short" })).getByRole(
         "button",

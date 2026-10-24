@@ -141,7 +141,7 @@ export function RecommendationFocusComparison({
                     item.kind === focus.kind &&
                     item.rank !== null &&
                     item.rank < rank &&
-                    !isMeasurementFocus(item, focusTargets),
+                    !isMeasurementFocus(item, [focus]),
                 )
                 .sort((left, right) => left.rank! - right.rank!)
             : [];
