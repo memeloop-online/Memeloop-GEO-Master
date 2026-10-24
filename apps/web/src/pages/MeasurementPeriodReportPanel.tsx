@@ -29,10 +29,10 @@ import {
 } from "../api/recommendations";
 import type { MeasurementRecommendationReference } from "../components/MeasurementReportDraftBridge";
 import "./MeasurementPeriodReportPanel.css";
-import { useProjectQuery } from "../api/projects";
+import { useProjectQuery, type MeasurementTarget } from "../api/projects";
 import {
   isMeasurementFocus,
-  measurementFocusNames,
+  measurementFocusTargets,
 } from "../api/measurementFocus";
 import { MeasurementFocusPanel } from "../components/MeasurementFocusPanel";
 import { RecommendationFocusComparison } from "../components/RecommendationFocusComparison";
@@ -95,7 +95,7 @@ export function MeasurementPeriodReportPanel({
   const { session } = useAuth();
   const navigate = useNavigate();
   const project = useProjectQuery(tenantId, projectId);
-  const focusNames = measurementFocusNames(project.data?.settings);
+  const focusTargets = measurementFocusTargets(project.data?.settings);
   const { t, i18n } = useTranslation("measurementReports");
   const [localSelected, setLocalSelected] = useState<string>();
   const [questionFilter, setQuestionFilter] = useState("");
@@ -629,7 +629,7 @@ export function MeasurementPeriodReportPanel({
             {recommendations.length > 0 && (
               <RecommendationTrend
                 samples={recommendations}
-                focusNames={focusNames}
+                focusTargets={focusTargets}
                 embedded
               />
             )}
@@ -654,7 +654,7 @@ export function MeasurementPeriodReportPanel({
               </p>
               <SampleRecommendations
                 sample={sample}
-                focusNames={focusNames}
+                focusTargets={focusTargets}
                 onAnalyze={
                   canWrite
                     ? (item) => analyzeRecommendation(sample, item)
@@ -825,12 +825,12 @@ export function MeasurementPeriodReportPanel({
 /** Display persisted AI extraction only; never infer rankings from answer text. */
 function SampleRecommendations({
   sample,
-  focusNames,
+  focusTargets,
   onAnalyze,
   analysisPending,
 }: {
   sample: MeasurementPeriodSample;
-  focusNames: readonly string[];
+  focusTargets: readonly MeasurementTarget[];
   onAnalyze?: (item: RecommendationItem) => void;
   analysisPending?: boolean;
 }) {
@@ -839,7 +839,7 @@ function SampleRecommendations({
   if (items === null) return <p>{t("recommendationsPending")}</p>;
   if (!items.length) return <p>{t("recommendationsEmpty")}</p>;
   const focused = items.filter((item) =>
-    isMeasurementFocus(item.name, focusNames),
+    isMeasurementFocus(item, focusTargets),
   );
   const table = (
     <table className="report-table">
@@ -858,7 +858,7 @@ function SampleRecommendations({
             <tr
               key={`${item.kind}/${item.name}/${index}`}
               className={
-                isMeasurementFocus(item.name, focusNames)
+                isMeasurementFocus(item, focusTargets)
                   ? "measurement-report-focus-row"
                   : undefined
               }
