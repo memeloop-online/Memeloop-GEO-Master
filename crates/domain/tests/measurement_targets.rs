@@ -8,7 +8,10 @@ fn measurement_targets_are_explicit_trimmed_and_serialize_in_current_settings() 
         product_name: Some("Enterprise model".to_owned()),
         ..ProjectSettings::default()
     };
-    assert_eq!(serde_json::to_value(&empty).unwrap()["measurement_targets"], json!([]));
+    assert_eq!(
+        serde_json::to_value(&empty).unwrap()["measurement_targets"],
+        json!([])
+    );
     let settings: ProjectSettings = serde_json::from_value(json!({
         "measurement_targets": [
             {"name":" Model A ","kind":"product","aliases":[" A "]},
@@ -18,7 +21,8 @@ fn measurement_targets_are_explicit_trimmed_and_serialize_in_current_settings() 
             {"name":"Care","kind":"service","aliases":[]},
             {"name":"Venue","kind":"other","aliases":[]}
         ]
-    })).unwrap();
+    }))
+    .unwrap();
     let normalized = settings.validate_draft().unwrap();
     assert_eq!(normalized.measurement_targets[0].name, "Model A");
     assert_eq!(normalized.measurement_targets[0].aliases, ["A"]);
@@ -26,7 +30,10 @@ fn measurement_targets_are_explicit_trimmed_and_serialize_in_current_settings() 
     assert!(normalized.brand_name.is_empty());
     assert!(normalized.product_name.is_none());
     let encoded = serde_json::to_value(&normalized).unwrap();
-    assert_eq!(serde_json::from_value::<ProjectSettings>(encoded).unwrap(), normalized);
+    assert_eq!(
+        serde_json::from_value::<ProjectSettings>(encoded).unwrap(),
+        normalized
+    );
 }
 
 #[test]
@@ -40,7 +47,8 @@ fn target_validation_rejects_ambiguous_exact_terms_within_a_kind() {
             "measurement_targets": [
                 {"name":"Model A","kind":"product","aliases":["A"]}, second
             ]
-        })).unwrap();
+        }))
+        .unwrap();
         let error = settings.validate_draft().unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidRequest);
         assert_eq!(error.details.unwrap()["field"], "measurement_targets");
@@ -57,16 +65,23 @@ fn target_validation_rejects_blank_and_oversized_terms_and_unknown_shapes() {
     ] {
         let settings: ProjectSettings = serde_json::from_value(json!({
             "measurement_targets": [target]
-        })).unwrap();
-        assert_eq!(settings.validate_draft().unwrap_err().code, ErrorCode::InvalidRequest);
+        }))
+        .unwrap();
+        assert_eq!(
+            settings.validate_draft().unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
     }
     for target in [
         json!({"name":"Model","kind":"unknown","aliases":[]}),
         json!({"name":"Model","kind":"product"}),
         json!({"name":"Model","kind":"product","aliases":[],"brand":"Example"}),
     ] {
-        assert!(serde_json::from_value::<ProjectSettings>(json!({
-            "measurement_targets": [target]
-        })).is_err());
+        assert!(
+            serde_json::from_value::<ProjectSettings>(json!({
+                "measurement_targets": [target]
+            }))
+            .is_err()
+        );
     }
 }

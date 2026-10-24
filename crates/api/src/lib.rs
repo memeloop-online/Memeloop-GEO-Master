@@ -108,8 +108,8 @@ use axum::{
 use futures_util::StreamExt;
 use geo_domain::{
     AgentRepository, AgentRuntime, AppError, ConnectorCapabilityRepository, DistributionScope,
-    DocumentScope, EventEnvelope, InitialSource, KnowledgeRepository, MeasurementTarget, Membership,
-    MemoryAgentRepository, MemoryAuthRepository, MemoryConnectorCapabilityRepository,
+    DocumentScope, EventEnvelope, InitialSource, KnowledgeRepository, MeasurementTarget,
+    Membership, MemoryAgentRepository, MemoryAuthRepository, MemoryConnectorCapabilityRepository,
     MemoryKnowledgeRepository, MissingAgentRuntime, Operation, Operator, Project, ProjectCreate,
     ProjectId, ProjectOverview, ProjectPage, ProjectPatch, ProjectRepository, ProjectSettings,
     ProjectStartAcceptance, ReportRepository, ReportSchedule, ResourceMode, Role,

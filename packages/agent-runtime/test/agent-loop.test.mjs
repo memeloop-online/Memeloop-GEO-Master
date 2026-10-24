@@ -1088,7 +1088,15 @@ test("chat onboarding calls scoped project tools and preserves acceptance semant
       {
         expected_revision: 1,
         idempotency_key: "draft-one",
-        patch: { brand_name: "Example", market: "global", language: "en" },
+        patch: {
+          brand_name: "Example",
+          market: "global",
+          language: "en",
+          measurement_targets: [
+            { name: "Model A", kind: "product", aliases: ["A"] },
+            { name: "Model A Pro", kind: "product", aliases: [] },
+          ],
+        },
         source_version_ids: [],
       },
     ],
@@ -1166,6 +1174,26 @@ test("chat onboarding calls scoped project tools and preserves acceptance semant
     ).function.parameters;
     assert.equal(revise.properties.patch.additionalProperties, false);
     assert.equal(revise.properties.patch.properties.initial_sources, undefined);
+    const targets = revise.properties.patch.properties.measurement_targets;
+    assert.equal(targets.type, "array");
+    assert.equal(targets.items.additionalProperties, false);
+    assert.deepEqual(targets.items.required, ["name", "kind", "aliases"]);
+    assert.deepEqual(targets.items.properties.kind.enum, [
+      "product",
+      "restaurant",
+      "brand",
+      "service",
+      "other",
+    ]);
+    assert.equal(targets.items.properties.aliases.items.type, "string");
+    assert.match(
+      canonicalSystemContent(requests[0]),
+      /only user-supplied aliases/u,
+    );
+    assert.match(
+      canonicalSystemContent(requests[0]),
+      /Never inject target names or aliases/u,
+    );
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }
