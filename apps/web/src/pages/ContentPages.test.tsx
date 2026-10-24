@@ -631,6 +631,9 @@ describe("P08 content assets", () => {
       },
     });
     renderPage("/app/tenant-1/project-1/content", client);
+    await act(async () => {
+      await import("./ContentPages");
+    });
     const saved = await screen.findByRole("region", { name: "已保存内容" });
     expect(
       await within(saved).findByRole("link", { name: "有来源的指南" }),

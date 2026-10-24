@@ -16,6 +16,10 @@ const translations = {
     frequencyRate: "推荐 {{recommended}} / {{valid}} 次 · {{percentage}}",
     frequencySamples: "有效样本 {{valid}} 次 · 暂不可用 {{unavailable}} 次",
     noValidSamples: "暂无有效结果",
+    firstPlaceShare: "首位比例（明确排名的推荐中）",
+    firstPlaceRate: "首位 {{first}} / {{ranked}} 次 · {{percentage}}",
+    firstPlaceBasis: "仅计入排名明确且一致的推荐样本。",
+    noRankedSamples: "不适用 · 明确排名推荐 0 次",
     rankDistribution: "推荐排名分布",
     rankCount: "第 {{rank}} 位：{{value}} 次",
     unrankedCount: "未明确排名：{{value}} 次",
@@ -70,6 +74,12 @@ const translations = {
       "Recommended {{recommended}} / {{valid}} times · {{percentage}}",
     frequencySamples: "Valid samples: {{valid}} · Unavailable: {{unavailable}}",
     noValidSamples: "No valid results yet",
+    firstPlaceShare: "First-place share among ranked recommendations",
+    firstPlaceRate:
+      "First place: {{first}} / {{ranked}} samples · {{percentage}}",
+    firstPlaceBasis:
+      "Only recommendations with a clear, consistent rank count.",
+    noRankedSamples: "Not applicable · 0 ranked recommendation samples",
     rankDistribution: "Recommendation rank distribution",
     rankCount: "Rank {{rank}} · Samples: {{value}}",
     unrankedCount: "Unranked samples: {{value}}",

@@ -94,7 +94,14 @@ function recommendationFrequency(
       else ranks.set(rank, (ranks.get(rank) ?? 0) + 1);
     }
   }
-  return { valid, recommended, unranked, ambiguous, ranks };
+  return {
+    valid,
+    recommended,
+    unranked,
+    ambiguous,
+    ranks,
+    ranked: recommended - unranked - ambiguous,
+  };
 }
 
 function entityState(entry: TrendEntry, target: MeasurementTarget) {
@@ -264,6 +271,29 @@ export function RecommendationTrend({
                               ),
                             })}
                           </Text>
+                          <div role="group" aria-label={t("firstPlaceShare")}>
+                            <Text size={200}>{t("firstPlaceShare")}</Text>
+                            <div>
+                              {frequency.ranked === 0
+                                ? t("noRankedSamples")
+                                : t("firstPlaceRate", {
+                                    first: number.format(
+                                      frequency.ranks.get(1) ?? 0,
+                                    ),
+                                    ranked: number.format(frequency.ranked),
+                                    percentage: percent.format(
+                                      (frequency.ranks.get(1) ?? 0) /
+                                        frequency.ranked,
+                                    ),
+                                  })}
+                            </div>
+                            <Text
+                              size={200}
+                              className="recommendation-trend-secondary"
+                            >
+                              {t("firstPlaceBasis")}
+                            </Text>
+                          </div>
                           {frequency.valid > 0 && (
                             <div
                               role="group"

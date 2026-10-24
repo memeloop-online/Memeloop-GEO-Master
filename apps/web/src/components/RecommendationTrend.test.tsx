@@ -144,6 +144,126 @@ describe("recommendation rank history", () => {
   );
 
   it.each([
+    [
+      "zh-CN",
+      "推荐频次",
+      "首位比例（明确排名的推荐中）",
+      "首位 1 / 2 次 · 50%",
+      "推荐 5 / 7 次 · 71.4%",
+      "有效样本 7 次 · 暂不可用 3 次",
+      "未明确排名：1 次",
+      "排名不一致：2 次",
+    ],
+    [
+      "en",
+      "Recommendation frequency",
+      "First-place share among ranked recommendations",
+      "First place: 1 / 2 samples · 50%",
+      "Recommended 5 / 7 times · 71.4%",
+      "Valid samples: 7 · Unavailable: 3",
+      "Unranked samples: 1",
+      "Conflicting rank samples: 2",
+    ],
+  ])(
+    "calculates first-place share only among unambiguous ranked target recommendations in %s",
+    async (
+      language,
+      frequencyLabel,
+      shareLabel,
+      rate,
+      frequencyRate,
+      counts,
+      unranked,
+      conflicting,
+    ) => {
+      await i18n.changeLanguage(language);
+      const alias = { ...item, name: "Purifier short", mention_order: 2 };
+      render(
+        <RecommendationTrend
+          focusTargets={[
+            { name: item.name, kind: "product", aliases: [alias.name] },
+          ]}
+          samples={[
+            datedSample("first", 1, [
+              { ...item, rank: 1 },
+              { ...alias, rank: 1 },
+            ]),
+            datedSample("third", 2, [{ ...alias, rank: 3 }]),
+            datedSample("unranked", 3, [
+              { ...item, rank: null },
+              { ...alias, rank: null },
+            ]),
+            datedSample("conflicting", 4, [
+              { ...item, rank: 1 },
+              { ...alias, rank: 2 },
+            ]),
+            datedSample("mixed", 5, [
+              { ...item, rank: 1 },
+              { ...alias, rank: null },
+            ]),
+            datedSample("empty", 6, []),
+            datedSample("different-kind", 7, [
+              { ...item, kind: "brand", rank: 1 },
+            ]),
+            { ...datedSample("missing", 8), recommendations: undefined },
+            {
+              ...datedSample("unverified", 9),
+              recommendations: recommendations(
+                [{ ...item, rank: 1 }],
+                "unverified",
+              ),
+            },
+            {
+              ...datedSample("malformed", 10),
+              recommendations: recommendations([{ ...item, rank: "first" }]),
+            },
+          ]}
+        />,
+      );
+      const frequency = within(
+        screen.getByRole("region", { name: frequencyLabel }),
+      );
+      const share = within(frequency.getByRole("group", { name: shareLabel }));
+      expect(share.getByText(rate)).toBeVisible();
+      expect(frequency.getByText(frequencyRate)).toBeVisible();
+      expect(frequency.getByText(counts)).toBeVisible();
+      expect(frequency.getByText(unranked)).toBeVisible();
+      expect(frequency.getByText(conflicting)).toBeVisible();
+    },
+  );
+
+  it.each([
+    ["zh-CN", "首位比例（明确排名的推荐中）", "不适用 · 明确排名推荐 0 次"],
+    [
+      "en",
+      "First-place share among ranked recommendations",
+      "Not applicable · 0 ranked recommendation samples",
+    ],
+  ])(
+    "shows a zero first-place denominator as not applicable in %s",
+    async (language, shareLabel, unavailable) => {
+      await i18n.changeLanguage(language);
+      render(
+        <RecommendationTrend
+          focusTargets={trackedTargets([item.name])}
+          samples={[
+            datedSample("unranked", 1, [{ ...item, rank: null }]),
+            datedSample("conflicting", 2, [
+              { ...item, rank: 1 },
+              { ...item, rank: 2, mention_order: 2 },
+            ]),
+            datedSample("empty", 3, []),
+            { ...datedSample("missing", 4), recommendations: undefined },
+          ]}
+        />,
+      );
+      const share = within(screen.getByRole("group", { name: shareLabel }));
+      expect(share.getByText(unavailable)).toBeVisible();
+      expect(share.queryByText(/%/)).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([
     [[2, 2], "第 2 位：1 次", "未明确排名：0 次"],
     [[null, null], "未明确排名：1 次", "未明确排名：1 次"],
     [[1, 3], "排名不一致：1 次", "未明确排名：0 次"],
@@ -202,6 +322,11 @@ describe("recommendation rank history", () => {
         frequency.getByRole("group", { name: `${item.name} · ${kind}` }),
       );
       expect(entity.getByText("推荐 1 / 3 次 · 33.3%")).toBeVisible();
+      expect(
+        entity.getByText(
+          kind === "产品" ? "首位 0 / 1 次 · 0%" : "首位 1 / 1 次 · 100%",
+        ),
+      ).toBeVisible();
     }
     expect(frequency.queryByText(`${item.name} plus`)).not.toBeInTheDocument();
   });
@@ -761,6 +886,7 @@ describe("recommendation rank history", () => {
     const first = sample("first");
     const second = sample("second", {
       measurement: { ...first.measurement, [field]: value },
+      recommendations: recommendations([{ ...item, rank: 1 }]),
     });
     render(
       <RecommendationTrend
@@ -774,6 +900,8 @@ describe("recommendation rank history", () => {
     expect(screen.getAllByRole("table")).toHaveLength(2);
     expect(screen.getAllByText("推荐结果可用 1 / 1 次")).toHaveLength(2);
     expect(screen.getAllByText("推荐 1 / 1 次 · 100%")).toHaveLength(2);
+    expect(screen.getByText("首位 0 / 1 次 · 0%")).toBeVisible();
+    expect(screen.getByText("首位 1 / 1 次 · 100%")).toBeVisible();
     expect(
       screen.getAllByRole("region", { name: "关注对象最近变化" }),
     ).toHaveLength(2);
@@ -910,12 +1038,14 @@ describe("recommendation rank history", () => {
   });
 
   it.each([
-    [2, 2, "第 2 位：1 次"],
-    [1, 3, "排名不一致：1 次"],
-    [1, null, "排名不一致：1 次"],
+    [2, 2, "第 2 位：1 次", "首位 0 / 1 次 · 0%"],
+    [1, 1, "第 1 位：1 次", "首位 1 / 1 次 · 100%"],
+    [1, 3, "排名不一致：1 次", "不适用 · 明确排名推荐 0 次"],
+    [1, null, "排名不一致：1 次", "不适用 · 明确排名推荐 0 次"],
+    [null, null, "未明确排名：1 次", "不适用 · 明确排名推荐 0 次"],
   ])(
     "counts a canonical name and alias once per sample, preserving conflicting ranks: %s / %s",
-    (first, second, bucket) => {
+    (first, second, bucket, firstPlace) => {
       const targets: MeasurementTarget[] = [
         { name: item.name, kind: "product", aliases: ["Purifier short"] },
         { name: item.name, kind: "restaurant", aliases: [] },
@@ -938,6 +1068,10 @@ describe("recommendation rank history", () => {
       );
       expect(product.getByText("推荐 1 / 2 次 · 50%")).toBeVisible();
       expect(product.getByText(bucket)).toBeVisible();
+      const share = within(
+        product.getByRole("group", { name: "首位比例（明确排名的推荐中）" }),
+      );
+      expect(share.getByText(firstPlace)).toBeVisible();
       expect(
         within(
           frequency.getByRole("group", { name: item.name + " · 餐馆" }),
