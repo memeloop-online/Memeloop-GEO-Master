@@ -17,7 +17,7 @@ import { useAuth } from "../auth/AuthProvider";
 import { ObservationAnswer } from "../components/ObservationAnswer";
 import { RecommendationResults } from "../components/RecommendationResults";
 import { useProjectQuery } from "../api/projects";
-import { measurementFocusNames } from "../api/measurementFocus";
+import { measurementFocusTargets } from "../api/measurementFocus";
 import { safeOriginalPublicUrl } from "./PublicationLookupPanel";
 import {
   analysisFailureMessageKey,
@@ -207,7 +207,7 @@ export function ObservationAnalysisPanel({
           <>
             <RecommendationResults
               value={grounded.audit.recommendations}
-              focusNames={measurementFocusNames(project.data?.settings)}
+              focusTargets={measurementFocusTargets(project.data?.settings)}
             />
             <h5>{t("answer")}</h5>
             <ObservationAnswer text={grounded.raw_answer} />

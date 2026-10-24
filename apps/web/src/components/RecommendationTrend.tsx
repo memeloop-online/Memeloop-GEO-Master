@@ -13,6 +13,7 @@ import {
 import { useTranslation } from "react-i18next";
 import type { ChannelTargetInput } from "../api/channelJobs";
 import { isMeasurementFocus } from "../api/measurementFocus";
+import type { MeasurementTarget } from "../api/projects";
 import {
   decodeVerifiedRecommendations,
   type RecommendationItem,
@@ -70,7 +71,7 @@ type TrendEntry = {
 
 function recommendationFrequency(
   entries: readonly TrendEntry[],
-  entityId: string | undefined,
+  target: MeasurementTarget,
 ) {
   let valid = 0;
   let recommended = 0;
@@ -80,7 +81,7 @@ function recommendationFrequency(
   for (const { items } of entries) {
     if (items === null) continue;
     valid += 1;
-    const matches = items.filter((item) => entityKey(item) === entityId);
+    const matches = items.filter((item) => isMeasurementFocus(item, [target]));
     if (!matches.length) continue;
     recommended += 1;
     // Each answer contributes once. Conflicting ranks have no single rank bucket.
@@ -96,15 +97,18 @@ function recommendationFrequency(
   return { valid, recommended, unranked, ambiguous, ranks };
 }
 
-function entityState(entry: TrendEntry, entityId: string | undefined) {
+function entityState(entry: TrendEntry, target: MeasurementTarget) {
   if (entry.items === null)
     return {
       label:
         entry.sample.recommendations == null ? "notAnalyzed" : "unverified",
     };
-  const matches = entry.items.filter((item) => entityKey(item) === entityId);
+  const matches = entry.items.filter((item) =>
+    isMeasurementFocus(item, [target]),
+  );
   if (!matches.length) return { label: "absent" };
-  if (matches.length > 1) return { label: "ambiguous" };
+  if (new Set(matches.map((item) => item.rank)).size > 1)
+    return { label: "ambiguous" };
   return matches[0].rank === null
     ? { label: "unranked" }
     : { label: "rank", rank: matches[0].rank };
@@ -113,11 +117,11 @@ function entityState(entry: TrendEntry, entityId: string | undefined) {
 /** Compare verified extracted recommendations; never derive entities or ranks from prose. */
 export function RecommendationTrend({
   samples,
-  focusNames = [],
+  focusTargets = [],
   embedded = false,
 }: {
   samples: readonly RecommendationTrendSample[];
-  focusNames?: readonly string[];
+  focusTargets?: readonly MeasurementTarget[];
   embedded?: boolean;
 }) {
   const { t, i18n } = useTranslation("recommendationTrend");
@@ -168,23 +172,17 @@ export function RecommendationTrend({
             }
             const input = ordered[0].measurement;
             const focusEntities = [
-              ...new Set(focusNames.map((name) => name.trim())),
-            ].flatMap<{
-              id: string | undefined;
-              name: string;
-              kind: RecommendationItem["kind"] | undefined;
-            }>((name) => {
-              const matches = [...entities].filter(([, entity]) =>
-                isMeasurementFocus(entity.name, [name]),
-              );
-              return matches.length
-                ? matches.map(([id, entity]) => ({
-                    id,
-                    name: entity.name,
-                    kind: entity.kind,
-                  }))
-                : [{ id: undefined, name, kind: undefined }];
-            });
+              ...new Map(
+                focusTargets.map((target) => [
+                  JSON.stringify([target.kind, target.name.trim()]),
+                  target,
+                ]),
+              ).values(),
+            ].map((target) => ({
+              ...target,
+              name: target.name.trim(),
+              id: JSON.stringify([target.kind, target.name.trim()]),
+            }));
             // Unknown times or ties at the latest-pair boundary cannot establish chronology.
             const latestPair = entries.slice(-2);
             const chronologyKnown =
@@ -225,7 +223,7 @@ export function RecommendationTrend({
                     {focusEntities.map((entity) => {
                       const frequency = recommendationFrequency(
                         entries,
-                        entity.id,
+                        entity,
                       );
                       return (
                         <div
@@ -305,7 +303,7 @@ export function RecommendationTrend({
                   <section aria-label={t("focusChanges")}>
                     {focusEntities.map((entity) => {
                       const states = latestPair.map((entry) =>
-                        entityState(entry, entity.id),
+                        entityState(entry, entity),
                       );
                       const latest = latestPair[latestPair.length - 1];
                       const latestState = states[states.length - 1];
@@ -507,7 +505,7 @@ export function RecommendationTrend({
                           <TableRow
                             key={entityId}
                             style={
-                              isMeasurementFocus(entity.name, focusNames)
+                              isMeasurementFocus(entity, focusTargets)
                                 ? {
                                     backgroundColor:
                                       tokens.colorBrandBackground2,
@@ -518,7 +516,7 @@ export function RecommendationTrend({
                             <TableCell style={{ overflowWrap: "anywhere" }}>
                               <div>{entity.name}</div>
                               <small>{t(`kind_${entity.kind}`)}</small>
-                              {isMeasurementFocus(entity.name, focusNames) && (
+                              {isMeasurementFocus(entity, focusTargets) && (
                                 <div>{t("tracked")}</div>
                               )}
                             </TableCell>

@@ -582,6 +582,7 @@ function SetupForm({
       settings: {
         brand_name: brandName.trim(),
         product_name: productName.trim() || null,
+        measurement_targets: settings?.measurement_targets ?? [],
         market: market.trim(),
         language: language.trim(),
         target_audience: targetAudience.trim() || null,

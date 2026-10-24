@@ -21,7 +21,13 @@ vi.mock("../api/projects", () => ({
   useProjectQuery: () => ({
     data: {
       revision: 1,
-      settings: { brand_name: focus.name, competitors: [] },
+      settings: {
+        brand_name: "Enterprise",
+        competitors: [],
+        measurement_targets: focus.name
+          ? [{ name: focus.name, kind: "product", aliases: [] }]
+          : [],
+      },
     },
     isPending: false,
   }),
@@ -674,7 +680,7 @@ describe("cycle-free measurement report", () => {
       focus.name = "Trail light";
       setup(preview, [saved]);
       const focusPanel = screen.getByLabelText(
-        language === "en" ? "Tracked product or brand" : "关注对象",
+        language === "en" ? "Tracked targets" : "关注对象",
       );
       const trend = await screen.findByRole("region", {
         name:

@@ -277,11 +277,69 @@ impl Default for DistributionScope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasurementTargetKind {
+    Product,
+    Restaurant,
+    Brand,
+    Service,
+    Other,
+}
+
+/// An explicit comparison target, independent of enterprise metadata and questions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementTarget {
+    pub name: String,
+    pub kind: MeasurementTargetKind,
+    pub aliases: Vec<String>,
+}
+
+fn validate_measurement_targets(
+    targets: Vec<MeasurementTarget>,
+) -> Result<Vec<MeasurementTarget>, AppError> {
+    let mut terms = HashMap::new();
+    targets
+        .into_iter()
+        .enumerate()
+        .map(|(index, target)| {
+            let name = validate_text("measurement_targets.name", target.name, 200)?;
+            let aliases = target
+                .aliases
+                .into_iter()
+                .map(|alias| validate_text("measurement_targets.aliases", alias, 200))
+                .collect::<Result<Vec<_>, _>>()?;
+            for term in std::iter::once(&name).chain(aliases.iter()) {
+                if let Some(previous_index) = terms.insert((target.kind, term.clone()), index)
+                    && previous_index != index
+                {
+                    return Err(AppError::invalid_request(
+                        "measurement targets of the same kind must not share names or aliases",
+                    )
+                    .with_details(json!({
+                        "field": "measurement_targets",
+                        "target_index": index,
+                        "conflicting_target_index": previous_index,
+                    })));
+                }
+            }
+            Ok(MeasurementTarget {
+                name,
+                kind: target.kind,
+                aliases,
+            })
+        })
+        .collect()
+}
+
 /// Editable project configuration.  Draft validation deliberately permits
 /// incomplete inputs; only `validate_start` turns this into an executable
 /// snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ProjectSettings {
+    #[serde(default)]
+    pub measurement_targets: Vec<MeasurementTarget>,
     #[serde(default)]
     pub brand_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -322,6 +380,7 @@ pub struct ProjectSettings {
 impl Default for ProjectSettings {
     fn default() -> Self {
         Self {
+            measurement_targets: Vec::new(),
             brand_name: String::new(),
             product_name: None,
             market: String::new(),
@@ -344,6 +403,7 @@ impl Default for ProjectSettings {
 
 impl ProjectSettings {
     pub fn validate_draft(self) -> Result<Self, AppError> {
+        let measurement_targets = validate_measurement_targets(self.measurement_targets)?;
         let brand_name = validate_optional_text("brand_name", self.brand_name, 200)?;
         let product_name = self
             .product_name
@@ -411,6 +471,7 @@ impl ProjectSettings {
         let document_scope = validate_document_scope(self.document_scope)?;
         let distribution_scope = validate_distribution_scope(self.distribution_scope)?;
         Ok(Self {
+            measurement_targets,
             brand_name,
             product_name,
             market,
@@ -628,6 +689,7 @@ pub type CreateProject = ProjectCreate;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ProjectPatch {
+    pub measurement_targets: Option<Vec<MeasurementTarget>>,
     pub slug: Option<String>,
     pub display_name: Option<String>,
     pub brand_name: Option<String>,
@@ -901,6 +963,9 @@ impl ProjectPatch {
             project.display_name = validate_text("display_name", display_name.clone(), 200)?;
         }
         let mut settings = project.settings.clone();
+        if let Some(value) = &self.measurement_targets {
+            settings.measurement_targets = value.clone();
+        }
         if let Some(value) = &self.brand_name {
             settings.brand_name = value.clone();
         }

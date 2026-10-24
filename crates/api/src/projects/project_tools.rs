@@ -313,6 +313,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn measurement_targets_share_current_revision_replay_and_http_patch_contract() {
+        let (state, scope) = fixture().await;
+        let empty = current(&state, &scope).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(empty).unwrap()["project"]["settings"]["measurement_targets"],
+            json!([])
+        );
+        let targets = json!([
+            {"name":"Model A","kind":"product","aliases":["A"]},
+            {"name":"Model A Pro","kind":"product","aliases":[]}
+        ]);
+        let update = request(1, "targets", json!({"measurement_targets":targets}));
+        let saved = revise(&state, &scope, update.clone()).await.unwrap();
+        let replay = revise(&state, &scope, update).await.unwrap();
+        assert_eq!(saved.project, replay.project);
+        assert_eq!(
+            saved.project,
+            current(&state, &scope).await.unwrap().project
+        );
+        assert!(saved.project.settings.brand_name.is_empty());
+        assert!(saved.project.settings.product_name.is_none());
+
+        let unrelated = revise(
+            &state,
+            &scope,
+            request(
+                saved.project.revision,
+                "metadata",
+                json!({
+                    "brand_name":"Enterprise", "product_name":"Enterprise model"
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unrelated.project.settings.measurement_targets,
+            saved.project.settings.measurement_targets
+        );
+        let input: ProjectPatchRequest = serde_json::from_value(json!({
+            "settings":{"measurement_targets":[]}
+        }))
+        .unwrap();
+        let (_, clear) = input.into_domain();
+        let id = scope.project_id.unwrap();
+        let cleared = state
+            .project_repository()
+            .update(&scope, id, unrelated.project.revision, clear)
+            .await
+            .unwrap();
+        assert!(cleared.project.settings.measurement_targets.is_empty());
+        assert!(
+            current(&state, &scope)
+                .await
+                .unwrap()
+                .project
+                .settings
+                .measurement_targets
+                .is_empty()
+        );
+        assert_eq!(
+            revise(
+                &state,
+                &scope,
+                request(
+                    1,
+                    "stale-targets",
+                    json!({
+                        "measurement_targets":targets
+                    })
+                )
+            )
+            .await
+            .unwrap_err()
+            .code,
+            ErrorCode::Conflict
+        );
+    }
+
+    #[tokio::test]
     async fn repository_host_uses_only_bound_project_scope_and_explicit_state() {
         use geo_worker::{HostOpErrorCode, HostOps, ProjectCurrentRequest};
         let (state, scope) = fixture().await;

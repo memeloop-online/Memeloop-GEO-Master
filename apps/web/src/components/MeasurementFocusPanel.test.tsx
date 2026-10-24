@@ -20,6 +20,9 @@ const state = vi.hoisted(() => ({
       brand_name: "Example",
       product_name: "Example X",
       competitors: ["Other X"],
+      measurement_targets: [
+        { name: "Example X", kind: "product", aliases: [] as string[] },
+      ],
     },
   },
   mutateAsync: vi.fn(),
@@ -51,6 +54,9 @@ beforeEach(async () => {
       brand_name: "Example",
       product_name: "Example X",
       competitors: ["Other X"],
+      measurement_targets: [
+        { name: "Example X", kind: "product", aliases: [] as string[] },
+      ],
     },
   };
   await i18n.changeLanguage("zh-CN");
@@ -100,7 +106,7 @@ describe("measurement focus panel", () => {
   );
   it("shows the saved product and competitors without an initial form", () => {
     renderPanel();
-    expect(screen.getByText("Example X")).toBeVisible();
+    expect(screen.getByText(/Example X · 产品/)).toBeVisible();
     expect(screen.getByText("对比对象：Other X")).toBeVisible();
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
   });
@@ -108,17 +114,18 @@ describe("measurement focus panel", () => {
   it("saves a partial revision-bound edit and leaves unrelated settings alone", async () => {
     renderPanel();
     fireEvent.click(screen.getByRole("button", { name: "修改" }));
-    fireEvent.change(
-      screen.getByRole("textbox", { name: "具体产品（可选）" }),
-      {
-        target: { value: "Example Y" },
-      },
-    );
+    fireEvent.change(screen.getByRole("textbox", { name: "名称" }), {
+      target: { value: "Example Y" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
     await waitFor(() =>
       expect(state.mutateAsync).toHaveBeenCalledWith({
         revision: 7,
-        settings: { brand_name: "Example", product_name: "Example Y" },
+        settings: {
+          measurement_targets: [
+            { name: "Example Y", kind: "product", aliases: [] },
+          ],
+        },
       }),
     );
     await waitFor(() =>
@@ -129,25 +136,21 @@ describe("measurement focus panel", () => {
   it("allows no target and does not require setup for measurement", () => {
     state.data.settings.brand_name = "";
     state.data.settings.product_name = "";
+    state.data.settings.measurement_targets = [];
     renderPanel();
     expect(screen.getByText("也可以不设置，直接测量任何问题。")).toBeVisible();
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
   });
 
-  it("clears the specific product with the existing nullable API field", async () => {
+  it("clears targets with an empty list without changing enterprise metadata", async () => {
     renderPanel();
     fireEvent.click(screen.getByRole("button", { name: "修改" }));
-    fireEvent.change(
-      screen.getByRole("textbox", { name: "具体产品（可选）" }),
-      {
-        target: { value: "" },
-      },
-    );
+    fireEvent.click(screen.getByRole("button", { name: "移除关注对象 1" }));
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
     await waitFor(() =>
       expect(state.mutateAsync).toHaveBeenCalledWith({
         revision: 7,
-        settings: { brand_name: "Example", product_name: null },
+        settings: { measurement_targets: [] },
       }),
     );
   });
@@ -158,25 +161,54 @@ describe("measurement focus panel", () => {
     );
     renderPanel();
     fireEvent.click(screen.getByRole("button", { name: "修改" }));
-    fireEvent.change(
-      screen.getByRole("textbox", { name: "具体产品（可选）" }),
-      {
-        target: { value: "Example Y" },
-      },
-    );
+    fireEvent.change(screen.getByRole("textbox", { name: "名称" }), {
+      target: { value: "Example Y" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
     expect(
       await screen.findByText("项目信息已更新，请重新打开修改。"),
     ).toBeVisible();
-    expect(
-      screen.getByRole("textbox", { name: "具体产品（可选）" }),
-    ).toHaveValue("Example Y");
+    expect(screen.getByRole("textbox", { name: "名称" })).toHaveValue(
+      "Example Y",
+    );
     expect(state.refetch).toHaveBeenCalledOnce();
+  });
+
+  it("adds independent targets with explicit aliases and types", async () => {
+    renderPanel();
+    fireEvent.click(screen.getByRole("button", { name: "修改" }));
+    fireEvent.click(screen.getByRole("button", { name: "添加关注对象" }));
+    fireEvent.change(screen.getAllByRole("textbox", { name: "名称" })[1], {
+      target: { value: "Example table" },
+    });
+    fireEvent.change(screen.getAllByRole("combobox", { name: "类型" })[1], {
+      target: { value: "restaurant" },
+    });
+    fireEvent.change(
+      screen.getAllByRole("textbox", { name: "别名（可选）" })[1],
+      { target: { value: "Example dining\nTable short" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() =>
+      expect(state.mutateAsync).toHaveBeenCalledWith({
+        revision: 7,
+        settings: {
+          measurement_targets: [
+            { name: "Example X", kind: "product", aliases: [] },
+            {
+              name: "Example table",
+              kind: "restaurant",
+              aliases: ["Example dining", "Table short"],
+            },
+          ],
+        },
+      }),
+    );
   });
 
   it("offers no editing controls to a read-only member", () => {
     renderPanel(false);
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
-    expect(screen.getByText("Example X")).toBeVisible();
+    expect(screen.getByText(/Example X · 产品/)).toBeVisible();
   });
 });

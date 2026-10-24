@@ -37,3 +37,12 @@
   display: grid;
   gap: 12px;
 }
+
+.measurement-focus-target {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  margin: 0;
+  border: 1px solid var(--colorNeutralStroke2);
+  border-radius: 6px;
+}
