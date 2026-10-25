@@ -15,6 +15,7 @@
     "build": "pnpm -r --if-present run build",
     "format": "prettier --write .github package.json pnpm-workspace.yaml compose.yaml README.md CONTRIBUTING.md \"scripts/**/*.mjs\" && pnpm -r --if-present run format",
     "format:check": "prettier --check .github package.json pnpm-workspace.yaml compose.yaml README.md CONTRIBUTING.md \"scripts/**/*.mjs\" && pnpm -r --if-present run format:check",
+    "check": "pnpm -r --if-present run check",
     "lint": "pnpm -r --if-present run lint",
     "typecheck": "pnpm --filter @memeloop-geo/web exec tsc --build --pretty false",
     "test": "pnpm -r --if-present run test"

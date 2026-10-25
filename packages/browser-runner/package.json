@@ -8,6 +8,8 @@
   },
   "scripts": {
     "start": "node src/server.mjs",
+    "check": "node scripts/check-syntax.mjs",
+    "verify": "node scripts/check-syntax.mjs && node --test",
     "test": "node --test",
     "format": "prettier --write \"**/*.{json,mjs,md}\"",
     "format:check": "prettier --check \"**/*.{json,mjs,md}\""
