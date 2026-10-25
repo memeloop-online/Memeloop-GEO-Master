@@ -11,9 +11,11 @@ import { inspectDeepSeekMeasurementOptions } from "./deepseek-model-discovery.mj
 import { capturedNewConversationId } from "./provider-conversation-ownership.mjs";
 import { consumerWebProviders } from "./consumer-web-providers.mjs";
 import { probeDeepseekAccount } from "./consumer-web-identity.mjs";
+import { baiduCreatorAdapter } from "./providers/baidu-creator.mjs";
 import { doubaoAdapter } from "./providers/doubao.mjs";
 import { glmAdapter } from "./providers/glm.mjs";
 import { qianwenAdapter } from "./providers/qianwen.mjs";
+import { xiaohongshuAdapter } from "./providers/xiaohongshu.mjs";
 import { yuanbaoAdapter } from "./providers/yuanbao.mjs";
 import {
   CONNECTOR_VERSION,
@@ -38,11 +40,11 @@ export {
   probeQianwenAccount,
 } from "./consumer-web-identity.mjs";
 export { CONNECTOR_VERSION, probeOwnAccount } from "./providers/contract.mjs";
+export { baiduIdentity, publishBaidu } from "./providers/baidu-creator.mjs";
+export { xiaohongshuIdentity } from "./providers/xiaohongshu.mjs";
 
 const ZHIHU_SELF = "https://www.zhihu.com/api/v4/me";
-const BAIDU_SELF = "https://baijiahao.baidu.com/builder/app/appinfo";
 const ZHIHU_EDITOR = "https://zhuanlan.zhihu.com/write";
-const BAIDU_EDITOR = "https://baijiahao.baidu.com/builder/rc/edit?type=news";
 const ZHIHU_POST_ORIGIN = "https://zhuanlan.zhihu.com";
 const ZHIHU_ARTICLES_PAGE_SIZE = 20;
 const ZHIHU_OWNERSHIP_MAX_PAGES = 10;
@@ -54,11 +56,6 @@ const KIMI_SELF = "/apiv2/kimi.gateway.account.v1.UserService/GetCurrentUser";
 
 export function zhihuIdentity(data) {
   return ownIdentity(data?.id, data?.name, data?.avatar_url);
-}
-
-export function baiduIdentity(data) {
-  const user = data?.data?.user;
-  return ownIdentity(user?.userid, user?.name, user?.avatar);
 }
 
 export function kimiIdentity(data) {
@@ -493,42 +490,6 @@ export async function measureDeepseek(
   ]);
 }
 
-export async function xiaohongshuIdentity(
-  page,
-  { trustedOrigin = "https://creator.xiaohongshu.com" } = {},
-) {
-  try {
-    const current = new URL(page.url());
-    if (
-      current.origin !== trustedOrigin ||
-      !(
-        current.pathname === "/" ||
-        current.pathname.startsWith("/new/") ||
-        current.pathname.startsWith("/publish/")
-      )
-    ) {
-      return null;
-    }
-    // Scoped to the current creator dashboard's own-user control, never a
-    // public note/author link supplied by a caller.
-    const own = page.locator(".main-container .user");
-    const href = await own
-      .locator("a[href^='/user/profile/']")
-      .first()
-      .getAttribute("href", {
-        timeout: 2_000,
-      });
-    const id = href?.match(/^\/user\/profile\/([\w-]{1,128})\/?$/u)?.[1];
-    const name = await own
-      .locator(".user-name")
-      .first()
-      .textContent({ timeout: 2_000 });
-    return ownIdentity(id, name);
-  } catch {
-    return null;
-  }
-}
-
 function zhihuPostUrl(value, origin = ZHIHU_POST_ORIGIN) {
   try {
     const url = new URL(value);
@@ -956,83 +917,6 @@ export async function publishZhihu(
   };
 }
 
-function plainTextHtml(text) {
-  return text
-    .split(/\r?\n/u)
-    .map(
-      (line) =>
-        `<p>${line.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;") || "<br>"}</p>`,
-    )
-    .join("");
-}
-
-export async function publishBaidu(
-  page,
-  payload,
-  { editorUrl = BAIDU_EDITOR } = {},
-) {
-  const content = contentPayload(payload);
-  if (!content) return unsupported("invalid_content_payload");
-  await page.goto(editorUrl, {
-    waitUntil: "domcontentloaded",
-    timeout: 20_000,
-  });
-  if (/\/login\b/.test(new URL(page.url()).pathname)) {
-    return {
-      status: "login_required",
-      evidence: [],
-      connector_version: CONNECTOR_VERSION,
-    };
-  }
-  const modernFields = page.locator(
-    "div[class*='FeEditorApp-'][contenteditable='true']:visible",
-  );
-  const modern = (await modernFields.count()) === 2;
-  const legacyTitle = page
-    .locator(
-      "[data-testid='news-title-input'], .title-input__inner, .input-box",
-    )
-    .first();
-  const title = modern ? modernFields.nth(0) : legacyTitle;
-  if (!(await title.isVisible().catch(() => false)))
-    return unsupported("editor_selectors_unverified");
-  let stage = "draft";
-  try {
-    await title.fill(content.title);
-    let filled;
-    if (modern) {
-      await modernFields.nth(1).fill(content.body);
-      filled = true;
-    } else {
-      // Static, developer-owned bridge to the page's single UEditor instance.
-      // User text is escaped and serialized as data, never executable script.
-      filled = await page.evaluate((html) => {
-        const editors = Object.values(window.UE?.instants ?? {}).filter(
-          (editor) => typeof editor?.setContent === "function",
-        );
-        if (editors.length !== 1) return false;
-        editors[0].setContent(html);
-        return true;
-      }, plainTextHtml(content.body));
-    }
-    if (!filled) return unknown("body_editor_unverified", "draft");
-    stage = "submit";
-    await page
-      .getByRole("button", { name: "发布", exact: true })
-      .click({ timeout: 8_000 });
-    const confirm = page.getByRole("button", { name: "确认发布", exact: true });
-    if (await confirm.isVisible({ timeout: 2_000 }).catch(() => false)) {
-      await confirm.click({ timeout: 8_000 });
-    }
-  } catch {
-    return unknown("draft_or_submit_unverified", stage);
-  }
-  // "审核中" and toast success prove at most submission, not public content.
-  return unknown("public_readback_unverified", "submit", [
-    { kind: "submission_attempted" },
-  ]);
-}
-
 export const adapters = Object.freeze({
   zhihu: Object.freeze({
     loginEntryAvailable: true,
@@ -1062,35 +946,8 @@ export const adapters = Object.freeze({
       return unsupported("operation_not_supported");
     },
   }),
-  baidu_creator: Object.freeze({
-    loginEntryAvailable: true,
-    loginSupported: true,
-    connectorVersion: CONNECTOR_VERSION,
-    origin: "https://baijiahao.baidu.com",
-    entry: "https://baijiahao.baidu.com/builder/theme/bjh/login",
-    operations: Object.freeze(["publish", "lookup"]),
-    identify(page) {
-      return probeOwnAccount(page, BAIDU_SELF, baiduIdentity);
-    },
-    async execute(page, operation, payload) {
-      if (operation === "publish") return publishBaidu(page, payload);
-      return unsupported("public_lookup_unverified");
-    },
-  }),
-  xiaohongshu: Object.freeze({
-    loginEntryAvailable: true,
-    loginSupported: true,
-    connectorVersion: CONNECTOR_VERSION,
-    origin: "https://creator.xiaohongshu.com",
-    entry: "https://creator.xiaohongshu.com/login",
-    operations: Object.freeze(["publish", "lookup"]),
-    identify(page) {
-      return xiaohongshuIdentity(page);
-    },
-    async execute() {
-      return unsupported("media_or_article_flow_unverified");
-    },
-  }),
+  baidu_creator: baiduCreatorAdapter,
+  xiaohongshu: xiaohongshuAdapter,
   kimi: Object.freeze({
     ...consumerWebProviders.kimi,
     inspectMeasurementOptions: inspectKimiMeasurementOptions,
