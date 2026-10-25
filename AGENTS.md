@@ -13,3 +13,10 @@ This is a public repository.
 - Remote account login must use a maintained remote-desktop client/server stack. Remove legacy screenshot-polling and coordinate/key-action APIs rather than retaining them as a fallback. Do not add custom RFB, keyboard/composition, clipboard, or remote text-injection protocols. Thin tenant/session authorization, lifecycle, and library integration adapters remain product responsibilities; validate the actual library-backed UX instead of adding homegrown controls.
 - AI conversation is the primary operating surface. Show the composer immediately and create the first conversation only on send. Detail pages inspect and fine-tune the same persisted data; do not make users complete setup forms before chatting or measuring arbitrary topics. Follow the UX consolidation backlog in `docs/ux-consolidation.md`.
 - Product UI copy is for end users, not an engineering progress report. Describe the user's task, actual state, and available next action. Keep work-package IDs, implementation milestones, test/acceptance claims, API wiring notes, and roadmap narration in documentation, not interface labels or tooltips. Explain genuine limitations concisely without inventing capabilities or concealing failure. Use shared internationalization resources as they become available, rather than adding scattered brand or language literals.
+
+## Engineering principles
+
+- Use current-version business contracts and remove retired schemas and compatibility branches.
+- Implement business behavior directly in small domain modules. Remove obsolete branches, repeated conditions, and forwarding-only layers.
+- Validate each input once at the actual boundary responsible for that input.
+- Write product copy in plain, affirmative language about the user's task, current state, and next action. Document engineering constraints in engineering documentation.
