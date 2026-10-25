@@ -1,55 +1,14 @@
-import fontkit from "@pdf-lib/fontkit";
-import { PDFDocument, rgb, type PDFFont, type PDFPage } from "pdf-lib";
+import type { PDFDocument, PDFFont } from "pdf-lib";
+import {
+  PdfLayout,
+  createPdfDocument,
+  loadPdfFont,
+  downloadPdfBytes,
+  yieldToBrowser,
+} from "./pdfLayout";
+export { wrapPdfText } from "./pdfLayout";
 import type { ReportCoverage, ReportSnapshot } from "../api/reports";
 import { reportAnalysisText as analysisText } from "../i18n/reportAnalysis";
-
-const PAGE_WIDTH = 595.28; // A4 in PDF points
-const PAGE_HEIGHT = 841.89;
-const MARGIN = 46;
-const CONTENT_WIDTH = PAGE_WIDTH - MARGIN * 2;
-const FOOTER_Y = 27;
-const CONTENT_BOTTOM = 53;
-const INK = rgb(0.13, 0.17, 0.23);
-const MUTED = rgb(0.35, 0.4, 0.46);
-
-/** Measure and split by Unicode code point, so even an unbroken opaque key fits. */
-export function wrapPdfText(
-  value: string,
-  maxWidth: number,
-  widthOf: (value: string) => number,
-): string[] {
-  if (maxWidth <= 0) throw new Error("PDF text width must be positive");
-  const lines: string[] = [];
-  for (const paragraph of value.split(/\r\n|\r|\n/u)) {
-    let line = "";
-    for (const character of paragraph) {
-      if (line && widthOf(line + character) > maxWidth) {
-        lines.push(line);
-        line = "";
-      }
-      // A glyph wider than the usable page width cannot be clipped silently.
-      if (widthOf(character) > maxWidth) {
-        throw new Error("PDF 字体中有字符无法适配页面，请更换字体后重试。");
-      }
-      line += character;
-    }
-    lines.push(line);
-  }
-  return lines;
-}
-
-function printable(value: string, supported: Set<number>): string {
-  return [...value]
-    .map((character) => {
-      const code = character.codePointAt(0)!;
-      if (character === "\n" || character === "\r") return character;
-      if (code < 32 || code === 127 || !supported.has(code)) {
-        return `[U+${code.toString(16).toUpperCase().padStart(4, "0")}]`;
-      }
-      return character;
-    })
-    .join("");
-}
 
 function display(value: string | number | null | undefined): string {
   return value === null || value === undefined ? "未记录" : String(value);
@@ -77,96 +36,28 @@ function localTime(value: string | null, timezone: string): string {
   }
 }
 
-class Layout {
-  private page!: PDFPage;
-  private y = 0;
-  private readonly pages: PDFPage[] = [];
-  private readonly supported: Set<number>;
+const fontErrors = {
+  missing: "报告中文字库不可用，请刷新页面后重试下载。",
+  invalid: "报告中文字库无效，请刷新页面后重试下载。",
+  download: "报告中文字库下载失败，请检查网络后重试。",
+  incomplete: "报告中文字库下载不完整，请检查网络后重试。",
+};
 
+class Layout extends PdfLayout {
   constructor(
-    private readonly document: PDFDocument,
-    private readonly font: PDFFont,
-    private readonly snapshot: ReportSnapshot,
-    private readonly signal?: AbortSignal,
+    document: PDFDocument,
+    font: PDFFont,
+    snapshot: ReportSnapshot,
+    signal?: AbortSignal,
   ) {
-    this.supported = new Set(font.getCharacterSet());
-    this.newPage();
-  }
-
-  private newPage(): void {
-    this.page = this.document.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
-    this.pages.push(this.page);
-    this.y = PAGE_HEIGHT - MARGIN;
-  }
-
-  private ensureSpace(height: number): void {
-    if (this.y - height < CONTENT_BOTTOM) this.newPage();
-  }
-
-  private textWidth(value: string, size: number): number {
-    return this.font.widthOfTextAtSize(value, size);
-  }
-
-  private drawLine(
-    line: string,
-    x: number,
-    y: number,
-    size: number,
-    muted: boolean,
-    page = this.page,
-  ): void {
-    page.drawText(line, {
-      x,
-      y,
-      size,
-      font: this.font,
-      color: muted ? MUTED : INK,
-    });
-  }
-
-  text(
-    value: string,
-    options: {
-      size?: number;
-      indent?: number;
-      gap?: number;
-      muted?: boolean;
-    } = {},
-  ): void {
-    this.signal?.throwIfAborted();
-    const size = options.size ?? 9;
-    const indent = options.indent ?? 0;
-    const lineHeight = size * 1.55;
-    const width = CONTENT_WIDTH - indent;
-    const clean = printable(value, this.supported);
-    const lines = wrapPdfText(clean, width, (candidate) =>
-      this.textWidth(candidate, size),
+    super(
+      document,
+      font,
+      (page, total) =>
+        `不可变周报 · 修订 ${snapshot.revision} · ${page} / ${total}`,
+      signal,
     );
-    for (const line of lines) {
-      this.ensureSpace(lineHeight);
-      this.drawLine(
-        line,
-        MARGIN + indent,
-        this.y - size,
-        size,
-        !!options.muted,
-      );
-      this.y -= lineHeight;
-    }
-    this.y -= options.gap ?? 3;
   }
-
-  heading(title: string): void {
-    const headingLines = wrapPdfText(
-      printable(title, this.supported),
-      CONTENT_WIDTH,
-      (line) => this.textWidth(line, 13),
-    ).length;
-    this.ensureSpace(12 + headingLines * (13 * 1.55) + 8 + 9 * 1.55);
-    this.y -= 12;
-    this.text(title, { size: 13, gap: 8 });
-  }
-
   field(label: string, value: string | number | null | undefined): void {
     this.text(`${label}：${display(value)}`, { indent: 10 });
   }
@@ -187,27 +78,6 @@ class Layout {
     if (!counts.length) this.field("分类计数", "无");
     for (const [key, count] of counts) this.field(`冻结状态 ${key}`, count);
   }
-
-  finish(): void {
-    for (const [index, page] of this.pages.entries()) {
-      const footer = `不可变周报 · 修订 ${this.snapshot.revision} · ${index + 1} / ${this.pages.length}`;
-      const lines = wrapPdfText(
-        printable(footer, this.supported),
-        CONTENT_WIDTH,
-        (line) => this.textWidth(line, 8),
-      );
-      for (const [lineIndex, line] of lines.entries()) {
-        this.drawLine(
-          line,
-          MARGIN,
-          FOOTER_Y + (lines.length - lineIndex - 1) * 9,
-          8,
-          true,
-          page,
-        );
-      }
-    }
-  }
 }
 
 /** Build solely from the selected immutable snapshot; no API calls or writes. */
@@ -217,26 +87,7 @@ export async function buildReportPdf(
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
   signal?.throwIfAborted();
-  if (!fontBytes.length) {
-    throw new Error("报告中文字库不可用，请刷新页面后重试下载。");
-  }
-  const document = await PDFDocument.create();
-  document.registerFontkit(fontkit);
-  let font: PDFFont;
-  try {
-    // CFF subsetting loses Chinese outlines in PDFBox. This font's localized
-    // alternate digits map to private-use code points in pdf-lib's ToUnicode
-    // table, so disable that substitution to preserve searchable ASCII IDs.
-    font = await document.embedFont(fontBytes, {
-      subset: false,
-      features: { locl: false },
-    });
-    if (!font.getCharacterSet().includes("中".codePointAt(0)!)) {
-      throw new Error("Chinese glyph missing");
-    }
-  } catch {
-    throw new Error("报告中文字库无效，请刷新页面后重试下载。");
-  }
+  const { document, font } = await createPdfDocument(fontBytes, fontErrors);
   document.setTitle(`周报 ${snapshot.report_id} 修订 ${snapshot.revision}`);
   document.setSubject("不可变报告快照；无商业费用和下一轮动作数据");
   document.setCreator("GEO");
@@ -423,58 +274,17 @@ export async function buildReportPdf(
   }
 }
 
-async function yieldToBrowser(
-  index: number,
-  signal?: AbortSignal,
-): Promise<void> {
-  signal?.throwIfAborted();
-  if (index > 0 && index % 20 === 0) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    signal?.throwIfAborted();
-  }
-}
-
 /** Invoked after the user selects an already-loaded, saved report. */
 export async function downloadReportPdf(
   snapshot: ReportSnapshot,
   options: { signal?: AbortSignal } = {},
 ): Promise<void> {
   options.signal?.throwIfAborted();
-  let response: Response;
-  try {
-    response = await fetch("/fonts/NotoSansCJKsc-Regular.otf", {
-      credentials: "same-origin",
-      signal: options.signal,
-    });
-    if (!response.ok) throw new Error("Font unavailable");
-  } catch (error) {
-    options.signal?.throwIfAborted();
-    if (error instanceof DOMException && error.name === "AbortError")
-      throw error;
-    throw new Error("报告中文字库下载失败，请检查网络后重试。");
-  }
-  let fontBytes: Uint8Array;
-  try {
-    fontBytes = new Uint8Array(await response.arrayBuffer());
-  } catch {
-    options.signal?.throwIfAborted();
-    throw new Error("报告中文字库下载不完整，请检查网络后重试。");
-  }
+  const fontBytes = await loadPdfFont(fontErrors, options.signal);
   const bytes = await buildReportPdf(snapshot, fontBytes, options.signal);
-  options.signal?.throwIfAborted();
-  const blob = new Blob([new Uint8Array(bytes)], { type: "application/pdf" });
-  options.signal?.throwIfAborted();
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `report-${snapshot.report_id}-r${snapshot.revision}.pdf`;
-  link.hidden = true;
-  document.body.append(link);
-  try {
-    options.signal?.throwIfAborted();
-    link.click();
-  } finally {
-    link.remove();
-    URL.revokeObjectURL(url);
-  }
+  downloadPdfBytes(
+    bytes,
+    `report-${snapshot.report_id}-r${snapshot.revision}.pdf`,
+    options.signal,
+  );
 }
