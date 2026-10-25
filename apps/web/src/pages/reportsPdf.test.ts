@@ -7,7 +7,7 @@ import { buildReportPdf, downloadReportPdf, wrapPdfText } from "./reportsPdf";
 import { reportSnapshotCsv } from "./reportsCsv";
 
 const fontBytes = new Uint8Array(
-  readFileSync("public/fonts/NotoSansCJKsc-Regular.otf"),
+  readFileSync("src/assets/fonts/NotoSansCJKsc-Regular.otf"),
 );
 
 function snapshot(): ReportSnapshot {
@@ -241,10 +241,14 @@ describe("report PDF", () => {
         expect(this.href).toBe(objectUrl);
       });
     await downloadReportPdf(snapshot());
-    expect(fetch).toHaveBeenCalledWith("/fonts/NotoSansCJKsc-Regular.otf", {
-      credentials: "same-origin",
-      signal: undefined,
-    });
+    expect(fetch).toHaveBeenCalledWith(
+      new URL("../assets/fonts/NotoSansCJKsc-Regular.otf", import.meta.url)
+        .href,
+      {
+        credentials: "same-origin",
+        signal: undefined,
+      },
+    );
     expect(created).toHaveBeenCalledOnce();
     expect(created.mock.calls[0][0]).toMatchObject({ type: "application/pdf" });
     expect(click).toHaveBeenCalledOnce();
