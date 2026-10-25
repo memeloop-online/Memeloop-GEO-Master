@@ -224,10 +224,14 @@ export async function loadPdfFont(
   signal?.throwIfAborted();
   let response: Response;
   try {
-    response = await fetch("/fonts/NotoSansCJKsc-Regular.otf", {
-      credentials: "same-origin",
-      signal,
-    });
+    response = await fetch(
+      new URL("../assets/fonts/NotoSansCJKsc-Regular.otf", import.meta.url)
+        .href,
+      {
+        credentials: "same-origin",
+        signal,
+      },
+    );
     if (!response.ok) throw new Error("Font unavailable");
   } catch (error) {
     signal?.throwIfAborted();

@@ -15,7 +15,7 @@ import {
 } from "./measurementReportsPdf";
 
 const fontBytes = new Uint8Array(
-  readFileSync("public/fonts/NotoSansCJKsc-Regular.otf"),
+  readFileSync("src/assets/fonts/NotoSansCJKsc-Regular.otf"),
 );
 const item = (
   rank: number | null = 1,
@@ -157,10 +157,14 @@ describe("independent measurement PDF", () => {
       );
       expect(JSON.stringify(request)).toBe(before);
       expect(fetch).toHaveBeenCalledTimes(1);
-      expect(fetch).toHaveBeenCalledWith("/fonts/NotoSansCJKsc-Regular.otf", {
-        credentials: "same-origin",
-        signal: undefined,
-      });
+      expect(fetch).toHaveBeenCalledWith(
+        new URL("../assets/fonts/NotoSansCJKsc-Regular.otf", import.meta.url)
+          .href,
+        {
+          credentials: "same-origin",
+          signal: undefined,
+        },
+      );
       expect(bytes.byteLength).toBeGreaterThan(10_000);
     },
     20_000,

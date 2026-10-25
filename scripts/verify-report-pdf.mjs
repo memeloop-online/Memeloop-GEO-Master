@@ -201,7 +201,7 @@ async function main() {
     const { buildReportPdf } = await import(pathToFileURL(modulePath).href);
     const fontBytes = new Uint8Array(
       await readFile(
-        join(webRoot, "public", "fonts", "NotoSansCJKsc-Regular.otf"),
+        join(webRoot, "src", "assets", "fonts", "NotoSansCJKsc-Regular.otf"),
       ),
     );
     await mkdir(outputDir, { recursive: true });
