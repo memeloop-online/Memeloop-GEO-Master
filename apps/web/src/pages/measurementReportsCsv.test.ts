@@ -7,6 +7,7 @@ import type {
   MeasurementPeriodSample,
 } from "../api/measurementReports";
 import type { RecommendationItem } from "../api/recommendations";
+import { recommendationFrequency } from "../components/recommendationComparison";
 import {
   captureMeasurementReportExport,
   type MeasurementReportExportInput,
@@ -27,10 +28,11 @@ const item = (
   mention_order: 1,
   reason: 'Reason, "quoted"\n原文',
   evidence_quote: "Original evidence 原句",
+  brand_attribution: null,
   citation_urls: ["https://example.test/source"],
 });
 const verified = (items: RecommendationItem[]) => ({
-  version: "geo.recommendations.v1",
+  version: "geo.recommendations.v2",
   status: "verified",
   items,
 });
@@ -125,6 +127,111 @@ afterEach(async () => {
 });
 
 describe("independent measurement CSV", () => {
+  it.each(["en", "zh-CN"] as const)(
+    "keeps direct brand metrics separate from affiliated products and unknown attribution in %s",
+    (locale) => {
+      const attributed = (name: string): RecommendationItem => ({
+        ...item("Synthetic product", 1),
+        brand_attribution: {
+          name,
+          evidence_quote: "Original brand relationship 品牌原句",
+        },
+      });
+      const answers = [
+        [item("Synthetic brand", 2, "brand")],
+        [
+          attributed("Synthetic brand alias"),
+          { ...attributed("Synthetic brand"), mention_order: 2 },
+        ],
+        [
+          attributed("Synthetic brand"),
+          { ...item("Unknown product"), mention_order: 2 },
+        ],
+        [attributed("Other brand")],
+        [item("Unknown product")],
+        [],
+        null,
+      ];
+      const report = preview();
+      report.samples = answers.map((answer, index) =>
+        sample(`brand-${index}`, answer === null ? null : verified(answer)),
+      );
+      const request = { ...input(report), locale };
+      request.view.target = {
+        name: "Synthetic brand",
+        kind: "brand",
+        aliases: ["Synthetic brand alias"],
+      };
+      const frequency = recommendationFrequency(
+        answers.map((items) => ({ items })),
+        request.view.target,
+      );
+      expect(frequency.brandSummary).toEqual({
+        positiveAnswers: 2,
+        knownAnswers: 5,
+        unknownAnswers: 1,
+        validAnswers: 6,
+      });
+      const data = rows(measurementReportCsv(request));
+      expect(value(data, "group", "recommended")).toBe(
+        String(frequency.recommended),
+      );
+      expect(value(data, "group", "recommended")).toBe("1");
+      expect(value(data, "group", "valid")).toBe("6");
+      expect(value(data, "group", "rank_buckets.2")).toBe("1");
+      expect(value(data, "group", "rank_buckets.1")).toBeUndefined();
+      expect(value(data, "group", "first_place")).toBe("0");
+      expect(value(data, "group", "brand_affiliate_positive")).toBe("2");
+      expect(value(data, "group", "brand_attribution_known")).toBe("5");
+      expect(value(data, "group", "brand_attribution_unknown")).toBe("1");
+      expect(value(data, "group", "brand_attribution_valid")).toBe("6");
+      expect(
+        find(data, "recommendation", "brand_attribution.name").map(
+          (row) => row.value,
+        ),
+      ).toContain("Synthetic brand alias");
+      expect(
+        find(data, "recommendation", "brand_attribution.evidence_quote").map(
+          (row) => row.value,
+        ),
+      ).toContain("Original brand relationship 品牌原句");
+      expect(
+        find(data, "recommendation", "brand_attribution").some(
+          (row) =>
+            row.value_type === "null" &&
+            row.value_label ===
+              (locale === "en" ? "Unknown brand attribution" : "品牌归属未知"),
+        ),
+      ).toBe(true);
+      expect(
+        data
+          .filter((row) => row.field.startsWith("brand_"))
+          .every((row) => !row.field.endsWith("rate")),
+      ).toBe(true);
+      report.samples = report.samples.slice(1);
+      const affiliateOnly = rows(measurementReportCsv(request));
+      expect(value(affiliateOnly, "group", "recommended")).toBe("0");
+      expect(value(affiliateOnly, "group", "brand_affiliate_positive")).toBe(
+        "2",
+      );
+      expect(value(affiliateOnly, "group", "ranked")).toBe("0");
+      expect(value(affiliateOnly, "group", "first_place_share")).toBe("");
+      request.view.target = null;
+      const withoutTarget = rows(measurementReportCsv(request));
+      expect(
+        find(withoutTarget, "group", "brand_affiliate_positive"),
+      ).toHaveLength(0);
+      expect(value(withoutTarget, "group", "recommended")).toBe("");
+      expect(
+        find(
+          withoutTarget,
+          "recommendation",
+          "brand_attribution.evidence_quote",
+        ),
+      ).toHaveLength(4);
+    },
+  );
+
   it.each(["en", "zh-CN"] as const)(
     "exports a genuinely unsaved preview and exact saved correction in %s",
     (locale) => {

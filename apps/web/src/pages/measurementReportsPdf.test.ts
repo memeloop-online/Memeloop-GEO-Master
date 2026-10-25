@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { PDFDocument, PDFPage } from "pdf-lib";
+import Papa from "papaparse";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "../i18n";
 import type {
@@ -8,7 +9,10 @@ import type {
   MeasurementPeriodSample,
 } from "../api/measurementReports";
 import type { RecommendationItem } from "../api/recommendations";
+import { recommendationFrequency } from "../components/recommendationComparison";
+import { measurementReportExportTranslations } from "../i18n/measurementReportExport";
 import type { MeasurementReportExportInput } from "./measurementReportExport";
+import { measurementReportCsv } from "./measurementReportsCsv";
 import {
   buildMeasurementReportPdf,
   downloadMeasurementReportPdf,
@@ -27,11 +31,12 @@ const item = (
   rank,
   reason: "Original reason 原因",
   evidence_quote: "Original quote 原句",
+  brand_attribution: null,
   citation_urls: ["https://example.test/recommendation"],
   ...patch,
 });
 const verified = (items: RecommendationItem[]) => ({
-  version: "geo.recommendations.v1",
+  version: "geo.recommendations.v2",
   status: "verified",
   items,
 });
@@ -125,6 +130,85 @@ afterEach(async () => {
 
 describe("independent measurement PDF", () => {
   it.each(["en", "zh-CN"] as const)(
+    "uses the same direct and affiliated brand counts as the UI and CSV in %s",
+    async (locale) => {
+      const attributed = (name: string): RecommendationItem =>
+        item(1, {
+          name: "Synthetic product",
+          brand_attribution: {
+            name,
+            evidence_quote: "Original brand relationship 品牌原句",
+          },
+        });
+      const answers = [
+        [item(2, { name: "Synthetic brand", kind: "brand" })],
+        [
+          attributed("Synthetic brand alias"),
+          { ...attributed("Synthetic brand"), mention_order: 2 },
+        ],
+        [
+          attributed("Synthetic brand"),
+          item(1, { name: "Unknown product", mention_order: 2 }),
+        ],
+        [attributed("Other brand")],
+        [item(1, { name: "Unknown product" })],
+        [],
+        null,
+      ];
+      const report = preview();
+      report.samples = answers.map((answer, index) =>
+        sample(`brand-${index}`, answer === null ? null : verified(answer)),
+      );
+      const request = { ...input(report), locale };
+      request.view.target = {
+        name: "Synthetic brand",
+        kind: "brand",
+        aliases: ["Synthetic brand alias"],
+      };
+      const frequency = recommendationFrequency(
+        answers.map((items) => ({ items })),
+        request.view.target,
+      );
+      expect(frequency.brandSummary).toEqual({
+        positiveAnswers: 2,
+        knownAnswers: 5,
+        unknownAnswers: 1,
+        validAnswers: 6,
+      });
+      expect(frequency.recommended).toBe(1);
+      expect([...frequency.ranks]).toEqual([[2, 1]]);
+      const csv = Papa.parse<Record<string, string>>(
+        measurementReportCsv(request),
+        { header: true, skipEmptyLines: true },
+      ).data;
+      const drawn = vi.spyOn(PDFPage.prototype, "drawText");
+      const bytes = await buildMeasurementReportPdf(request);
+      const text = drawn.mock.calls.map(([value]) => value).join("\n");
+      const labels = measurementReportExportTranslations[locale];
+      for (const field of [
+        "brand_affiliate_positive",
+        "brand_attribution_known",
+        "brand_attribution_unknown",
+        "brand_attribution_valid",
+      ] as const) {
+        const count = csv.find(
+          (row) => row.section === "group" && row.field === field,
+        )?.value;
+        expect(text).toContain(`${labels[field]}: ${count}`);
+      }
+      expect(text).toContain("1 / 6");
+      expect(text).toContain("0 / 1");
+      expect(text).toContain(
+        `${labels.brand_attribution}: Synthetic brand alias`,
+      );
+      expect(text).toContain("Original brand relationship 品牌原句");
+      expect(text).toContain(labels.brand_attribution_not_recorded);
+      expect((await PDFDocument.load(bytes)).getPageCount()).toBeGreaterThan(1);
+    },
+    20_000,
+  );
+
+  it.each(["en", "zh-CN"] as const)(
     "renders readable results and exact preview metadata in %s without mutation",
     async (locale) => {
       const request = { ...input(), locale };
@@ -145,6 +229,9 @@ describe("independent measurement PDF", () => {
       expect(text).toContain("100%");
       expect(text).toContain("Original answer 原文");
       expect(text).toContain("Original reason 原因");
+      expect(text).toContain(
+        measurementReportExportTranslations[locale].verified_empty,
+      );
       expect(text).toContain("https://example.test/recommendation");
       expect(text).toContain("2026-01-02T00:01:00.000Z");
       expect(text).toContain(request.report.generated_at);
@@ -172,6 +259,8 @@ describe("independent measurement PDF", () => {
 
   it("keeps exact question/version/condition partitions and whole-report search separate", async () => {
     const report = preview();
+    // One base answer is sufficient; the added records exercise each partition.
+    report.samples = report.samples.slice(0, 1);
     const other = sample("other-question", verified([item()]), {
       conditions: {
         ...report.samples[0].conditions,
@@ -279,53 +368,77 @@ describe("independent measurement PDF", () => {
     expect(text).toContain("revision 3");
   }, 20_000);
 
-  it("exports original evidence without any tracked item and wraps long CJK/opaque content through the final marker", async () => {
-    const report = preview();
-    report.samples = [
-      sample("long", verified([]), {
-        observation: {
-          ...report.samples[0].observation!,
-          raw_answer: `${"中文长原文，".repeat(1200)}${"opaque-key".repeat(180)}\nEND_OF_LAST_EVIDENCE_4960\u{1F9EA}`,
-          provenance: {
-            revision_id: "synthetic-analysis",
-            source: { kind: "capture", capture_id: "synthetic-capture" },
-            source_sha256: "synthetic-sha",
-            observed_at: "2025-12-01T00:00:00Z",
-            analyzed_at: "2026-01-02T00:03:00Z",
-            actual_model: "synthetic-analysis-model",
-            config_revision: null,
-            prompt_version: "prompt-1",
-            parser_version: "parser-1",
+  it.each(["en", "zh-CN"] as const)(
+    "exports attribution evidence without any tracked item and wraps long CJK/opaque content through the final marker in %s",
+    async (locale) => {
+      const report = preview();
+      report.samples = [
+        sample(
+          "long",
+          verified([
+            item(1, {
+              brand_attribution: {
+                name: "Synthetic brand alias",
+                evidence_quote: "Original brand relationship 品牌原句",
+              },
+            }),
+            item(2, { name: "Unknown product", mention_order: 2 }),
+          ]),
+          {
+            observation: {
+              ...report.samples[0].observation!,
+              raw_answer: `${"中文长原文，".repeat(1200)}${"opaque-key".repeat(180)}\nEND_OF_LAST_EVIDENCE_4960\u{1F9EA}`,
+              provenance: {
+                revision_id: "synthetic-analysis",
+                source: { kind: "capture", capture_id: "synthetic-capture" },
+                source_sha256: "synthetic-sha",
+                observed_at: "2025-12-01T00:00:00Z",
+                analyzed_at: "2026-01-02T00:03:00Z",
+                actual_model: "synthetic-analysis-model",
+                config_revision: null,
+                prompt_version: "prompt-1",
+                parser_version: "parser-1",
+              },
+            },
           },
-        },
-      }),
-    ];
-    const request = input(report);
-    request.view.target = null;
-    const drawn = vi.spyOn(PDFPage.prototype, "drawText");
-    const bytes = await buildMeasurementReportPdf(request);
-    const text = drawn.mock.calls.map(([value]) => value).join("\n");
-    expect(text).toContain("No tracked item selected");
-    expect(text).toContain("Verified, with no extracted recommendations");
-    expect(text).toContain("END_OF_LAST_EVIDENCE_4960[U+1F9EA]");
-    expect(text).toContain("synthetic-analysis-model");
-    expect(text).toContain("2025-12-01T00:00:00Z");
-    const pdf = await PDFDocument.load(bytes);
-    expect(pdf.getPageCount()).toBeGreaterThan(3);
-    expect(
-      pdf
-        .getPages()
-        .every(
-          (page) => page.getWidth() === 595.28 && page.getHeight() === 841.89,
         ),
-    ).toBe(true);
-    for (const [value, options] of drawn.mock.calls) {
+      ];
+      const request = { ...input(report), locale };
+      request.view.target = null;
+      const drawn = vi.spyOn(PDFPage.prototype, "drawText");
+      const bytes = await buildMeasurementReportPdf(request);
+      const text = drawn.mock.calls.map(([value]) => value).join("\n");
+      const labels = measurementReportExportTranslations[locale];
+      expect(text).toContain(
+        locale === "en" ? "No tracked item selected" : "未选择关注对象",
+      );
+      expect(text).not.toContain(labels.brand_affiliate_positive);
+      expect(text).toContain(
+        `${labels.brand_attribution}: Synthetic brand alias`,
+      );
+      expect(text).toContain("Original brand relationship 品牌原句");
+      expect(text).toContain(labels.brand_attribution_not_recorded);
+      expect(text).toContain("END_OF_LAST_EVIDENCE_4960[U+1F9EA]");
+      expect(text).toContain("synthetic-analysis-model");
+      expect(text).toContain("2025-12-01T00:00:00Z");
+      const pdf = await PDFDocument.load(bytes);
+      expect(pdf.getPageCount()).toBeGreaterThan(3);
       expect(
-        options!.x! + options!.font!.widthOfTextAtSize(value, options!.size!),
-      ).toBeLessThanOrEqual(595.28 - 46 + 0.01);
-      expect(options!.y!).toBeGreaterThanOrEqual(27);
-    }
-  }, 20_000);
+        pdf
+          .getPages()
+          .every(
+            (page) => page.getWidth() === 595.28 && page.getHeight() === 841.89,
+          ),
+      ).toBe(true);
+      for (const [value, options] of drawn.mock.calls) {
+        expect(
+          options!.x! + options!.font!.widthOfTextAtSize(value, options!.size!),
+        ).toBeLessThanOrEqual(595.28 - 46 + 0.01);
+        expect(options!.y!).toBeGreaterThanOrEqual(27);
+      }
+    },
+    20_000,
+  );
 
   it("captures language and evidence before the font request resolves", async () => {
     let resolve!: (response: Response) => void;
@@ -339,6 +452,7 @@ describe("independent measurement PDF", () => {
       ),
     );
     const request = input();
+    request.report.samples = request.report.samples.slice(0, 1);
     const drawn = vi.spyOn(PDFPage.prototype, "drawText");
     const pending = buildMeasurementReportPdf(request);
     request.locale = "zh-CN";
@@ -367,7 +481,9 @@ describe("independent measurement PDF", () => {
       expect(this.download).toBe("measurement-report-preview.pdf");
       throw new Error("Download click failed");
     });
-    await expect(downloadMeasurementReportPdf(input())).rejects.toThrow(
+    const request = input();
+    request.report.samples = request.report.samples.slice(0, 1);
+    await expect(downloadMeasurementReportPdf(request)).rejects.toThrow(
       "Download click failed",
     );
     expect(created).toHaveBeenCalledOnce();

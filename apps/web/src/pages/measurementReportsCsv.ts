@@ -107,7 +107,13 @@ export function measurementReportCsv(
       type,
       label(section),
       label(scope),
-      label(tail),
+      label(
+        field.endsWith("brand_attribution.evidence_quote")
+          ? "brand_attribution_evidence"
+          : field.endsWith("brand_attribution.name")
+            ? "brand_attribution"
+            : tail,
+      ),
       human,
     ]);
   };
@@ -224,6 +230,15 @@ export function measurementReportCsv(
       frequency?.valid ??
       entries.filter((entry) => entry.items !== null).length;
     add("group", "filtered_ai_view", key, "valid", valid);
+    if (frequency?.brandSummary) {
+      for (const [field, value] of Object.entries({
+        brand_affiliate_positive: frequency.brandSummary.positiveAnswers,
+        brand_attribution_known: frequency.brandSummary.knownAnswers,
+        brand_attribution_unknown: frequency.brandSummary.unknownAnswers,
+        brand_attribution_valid: frequency.brandSummary.validAnswers,
+      }))
+        add("group", "filtered_ai_view", key, field, value);
+    }
     add(
       "group",
       "filtered_ai_view",
@@ -350,8 +365,29 @@ export function measurementReportCsv(
     );
     items?.forEach((item, itemIndex) => {
       const occurrence = JSON.stringify([id, itemIndex]);
-      for (const [field, value] of Object.entries(item))
-        stored("recommendation", "filtered_ai_view", occurrence, field, value);
+      for (const [field, value] of Object.entries(item)) {
+        if (
+          field === "brand_attribution" &&
+          item.kind === "product" &&
+          value === null
+        )
+          add(
+            "recommendation",
+            "filtered_ai_view",
+            occurrence,
+            field,
+            value,
+            labels.brand_attribution_not_recorded,
+          );
+        else
+          stored(
+            "recommendation",
+            "filtered_ai_view",
+            occurrence,
+            field,
+            value,
+          );
+      }
       add(
         "recommendation",
         "filtered_ai_view",
