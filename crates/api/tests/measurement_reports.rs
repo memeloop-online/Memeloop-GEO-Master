@@ -940,8 +940,8 @@ async fn no_cycle_preview_save_and_correction_preserve_unknown_and_frozen_sample
         .await
         .unwrap();
     let recommendations = json!({
-        "version":"geo.recommendations.v1","status":"verified",
-        "items":[{"name":"Synthetic product","kind":"product","mention_order":1,"rank":1,
+        "version":"geo.recommendations.v2","status":"verified",
+        "items":[{"name":"Synthetic product","brand_attribution":null,"kind":"product","mention_order":1,"rank":1,
             "reason":"A saved recommendation","evidence_quote":"A saved answer.","citation_urls":["https://example.org/source"]}]
     });
     extraction.complete(&scope, intent_id, claim.claim_token, ObservationAnalysisResult {

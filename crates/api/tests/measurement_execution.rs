@@ -142,7 +142,7 @@ async fn runner(
                     "request_model":frozen["model"],
                     "request_question_sha256":sha256_hex(frozen["question"].as_str().unwrap().as_bytes()),
                     "extraction_model":"synthetic-extractor",
-                    "extraction_prompt_version":"geo.observation.extract.v4",
+                    "extraction_prompt_version":"geo.observation.extract.v5",
                     "source_sha256":source_sha256
                 }
             });
@@ -217,7 +217,7 @@ async fn runner(
                     "kind":"observation_extraction",
                     "method":"llm_grounded",
                     "model":"synthetic-extractor",
-                    "prompt_version":"geo.observation.extract.v4",
+                    "prompt_version":"geo.observation.extract.v5",
                     "source_sha256":source_sha256,
                     "source_json":source,
                     "surface":"signed_in_browser",
@@ -619,18 +619,18 @@ async fn browser_ai_search_requires_yes_and_bound_audit_without_provider_ids() {
             ChannelOutcomeStatus::Missing,
         ),
         (
-            "geo.observation.extract.v4",
+            "geo.observation.extract.v5",
             "geo.observation.extract.v3",
             ChannelOutcomeStatus::Missing,
         ),
         (
             "geo.observation.extract.v3",
-            "geo.observation.extract.v4",
+            "geo.observation.extract.v5",
             ChannelOutcomeStatus::Missing,
         ),
         (
-            "geo.observation.extract.v4",
-            "geo.observation.extract.v4",
+            "geo.observation.extract.v5",
+            "geo.observation.extract.v5",
             ChannelOutcomeStatus::Observed,
         ),
     ] {

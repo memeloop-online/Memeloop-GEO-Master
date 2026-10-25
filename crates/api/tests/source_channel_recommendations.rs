@@ -234,12 +234,12 @@ async fn finish_accepted_search(
             "observed_at":observed,"source":"browser_response_ai","provenance":"live",
             "search_used":"yes","request_model":model,
             "request_question_sha256":sha256_hex(question.as_bytes()),
-            "extraction_model":"synthetic-extractor","extraction_prompt_version":"geo.observation.extract.v4",
+            "extraction_model":"synthetic-extractor","extraction_prompt_version":"geo.observation.extract.v5",
             "source_sha256":source_sha256
         }
     });
     let audit = json!({"kind":"observation_extraction","method":"llm_grounded",
-    "model":"synthetic-extractor","prompt_version":"geo.observation.extract.v4",
+    "model":"synthetic-extractor","prompt_version":"geo.observation.extract.v5",
     "source_json":source_json,"source_sha256":source_sha256,"surface":"model_api",
     "refs":[
         {"role":"answer_segment","path":"/messages/0/text","quote":answer},
