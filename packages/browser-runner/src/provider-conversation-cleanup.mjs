@@ -1,4 +1,4 @@
-import { probeKimiAccount } from "./adapters.mjs";
+import { probeKimiAccount } from "./providers/kimi.mjs";
 import { createHash } from "node:crypto";
 
 const ORIGIN = "https://www.kimi.com";
