@@ -20,16 +20,19 @@ import {
   probeDeepseekAccount,
   probeDoubaoAccount,
   probeQianwenAccount,
+  probeYuanbaoAccount,
 } from "./consumer-web-identity.mjs";
 export {
   glmIdentity,
   deepseekIdentity,
   doubaoIdentity,
   qianwenIdentity,
+  yuanbaoIdentity,
   probeGlmAccount,
   probeDeepseekAccount,
   probeDoubaoAccount,
   probeQianwenAccount,
+  probeYuanbaoAccount,
 } from "./consumer-web-identity.mjs";
 
 export const CONNECTOR_VERSION = "live_unverified.source_derived.v1";
@@ -1455,9 +1458,7 @@ export const adapters = Object.freeze({
     ...consumerWebProviders.yuanbao,
     connectorVersion: CONNECTOR_VERSION,
     operations: Object.freeze([]),
-    async identify() {
-      return null;
-    },
+    identify: probeYuanbaoAccount,
     async execute() {
       return unsupported("measurement_adapter_unavailable");
     },
