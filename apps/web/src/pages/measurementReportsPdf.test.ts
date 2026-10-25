@@ -514,6 +514,35 @@ describe("independent measurement PDF", () => {
     expect(drawn).not.toHaveBeenCalled();
   });
 
+  it("processes queued cancellation while building a one-sample report", async () => {
+    const report = preview();
+    report.samples = report.samples.slice(0, 1);
+    const controller = new AbortController();
+    const created = vi.fn(() => "blob:cancelled-measurement-pdf");
+    vi.stubGlobal(
+      "URL",
+      Object.assign(URL, {
+        createObjectURL: created,
+        revokeObjectURL: vi.fn(),
+      }),
+    );
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => {});
+    const timer = setTimeout(() => controller.abort(), 0);
+    try {
+      await expect(
+        downloadMeasurementReportPdf(input(report), {
+          signal: controller.signal,
+        }),
+      ).rejects.toMatchObject({ name: "AbortError" });
+      expect(created).not.toHaveBeenCalled();
+      expect(click).not.toHaveBeenCalled();
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
   it("reports font failures in the captured locale without creating a download", async () => {
     vi.stubGlobal(
       "fetch",

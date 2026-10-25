@@ -32,15 +32,18 @@ describe("shared PDF layout", () => {
     expect(lines.every((line) => width(line) <= 8)).toBe(true);
   });
 
-  it("honors cancellation after yielding to browser input", async () => {
-    vi.useFakeTimers();
-    const controller = new AbortController();
-    const pending = yieldToBrowser(20, controller.signal);
-    const rejected = expect(pending).rejects.toMatchObject({
-      name: "AbortError",
-    });
-    controller.abort();
-    await vi.runAllTimersAsync();
-    await rejected;
-  });
+  it.each([0, 20])(
+    "honors cancellation after yielding at item %i",
+    async (index) => {
+      vi.useFakeTimers();
+      const controller = new AbortController();
+      const pending = yieldToBrowser(index, controller.signal);
+      const rejected = expect(pending).rejects.toMatchObject({
+        name: "AbortError",
+      });
+      controller.abort();
+      await vi.runAllTimersAsync();
+      await rejected;
+    },
+  );
 });

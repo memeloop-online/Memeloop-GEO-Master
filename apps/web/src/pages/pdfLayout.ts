@@ -178,7 +178,9 @@ export async function yieldToBrowser(
   signal?: AbortSignal,
 ): Promise<void> {
   signal?.throwIfAborted();
-  if (index > 0 && index % 20 === 0) {
+  // A resolved promise cannot process queued browser input. Yield for small
+  // reports too, including when several exports are built consecutively.
+  if (index % 20 === 0) {
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     signal?.throwIfAborted();
   }
