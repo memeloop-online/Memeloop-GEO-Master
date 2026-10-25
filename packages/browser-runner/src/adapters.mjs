@@ -10,12 +10,11 @@ import { observeDeepSeekWebSearch } from "./deepseek-web-search.mjs";
 import { inspectDeepSeekMeasurementOptions } from "./deepseek-model-discovery.mjs";
 import { capturedNewConversationId } from "./provider-conversation-ownership.mjs";
 import { consumerWebProviders } from "./consumer-web-providers.mjs";
-import {
-  probeGlmAccount,
-  probeDeepseekAccount,
-  probeDoubaoAccount,
-  probeQianwenAccount,
-} from "./consumer-web-identity.mjs";
+import { probeDeepseekAccount } from "./consumer-web-identity.mjs";
+import { doubaoAdapter } from "./providers/doubao.mjs";
+import { glmAdapter } from "./providers/glm.mjs";
+import { qianwenAdapter } from "./providers/qianwen.mjs";
+import { yuanbaoAdapter } from "./providers/yuanbao.mjs";
 import {
   CONNECTOR_VERSION,
   completedMeasurement,
@@ -1106,17 +1105,7 @@ export const adapters = Object.freeze({
       return measureKimi(page, payload, network);
     },
   }),
-  glm: Object.freeze({
-    ...consumerWebProviders.glm,
-    connectorVersion: CONNECTOR_VERSION,
-    operations: Object.freeze([]),
-    identify(page) {
-      return probeGlmAccount(page);
-    },
-    async execute() {
-      return unsupported("measurement_adapter_unavailable");
-    },
-  }),
+  glm: glmAdapter,
   deepseek: Object.freeze({
     ...consumerWebProviders.deepseek,
     inspectMeasurementOptions: inspectDeepSeekMeasurementOptions,
@@ -1129,33 +1118,7 @@ export const adapters = Object.freeze({
       return measureDeepseek(page, payload, network);
     },
   }),
-  doubao: Object.freeze({
-    ...consumerWebProviders.doubao,
-    connectorVersion: CONNECTOR_VERSION,
-    operations: Object.freeze([]),
-    identify: probeDoubaoAccount,
-    async execute() {
-      return unsupported("measurement_adapter_unavailable");
-    },
-  }),
-  qianwen: Object.freeze({
-    ...consumerWebProviders.qianwen,
-    connectorVersion: CONNECTOR_VERSION,
-    operations: Object.freeze([]),
-    identify: probeQianwenAccount,
-    async execute() {
-      return unsupported("measurement_adapter_unavailable");
-    },
-  }),
-  yuanbao: Object.freeze({
-    ...consumerWebProviders.yuanbao,
-    connectorVersion: CONNECTOR_VERSION,
-    operations: Object.freeze([]),
-    async identify() {
-      return null;
-    },
-    async execute() {
-      return unsupported("measurement_adapter_unavailable");
-    },
-  }),
+  doubao: doubaoAdapter,
+  qianwen: qianwenAdapter,
+  yuanbao: yuanbaoAdapter,
 });
