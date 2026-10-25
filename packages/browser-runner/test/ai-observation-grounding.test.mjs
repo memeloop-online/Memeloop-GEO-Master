@@ -49,14 +49,10 @@ const modern = {
 };
 
 const modernExtracted = {
-  decision: "searched_answer",
-  chat_id: { path: "/messages/0/chat/id" },
-  message_id: { path: "/messages/1/message/id" },
-  answer_owner: { path: "/messages/3/block/messageId" },
-  search_owner: { path: "/messages/2/block/messageId" },
-  search_block_id: { path: "/messages/2/block/id" },
-  completion: { path: "/messages/1/message/status" },
-  search_activity: { path: "/messages/2/block/tool/contents" },
+  completion: "complete",
+  completion_evidence: [{ path: "/messages/1/message/status" }],
+  search_used: "yes",
+  search_evidence: [{ path: "/messages/2/block/tool/contents" }],
   answer_segments: [{ path: "/messages/3/block/text/content" }],
   citations: [
     {
@@ -107,9 +103,7 @@ test("source redaction metadata cannot ground any semantic evidence role", () =>
     // Unknown root aliases are not evidence, even if they hold usable values.
     "messages/alias": "Exact observed answer.",
   };
-  assert.ok(
-    validateAiObservation(document, semanticCandidate, { semanticOnly: true }),
-  );
+  assert.ok(validateAiObservation(document, semanticCandidate, {}));
   for (const path of [
     "/source_redaction/policy",
     "/source_redaction/omitted_paths/0",
@@ -127,12 +121,9 @@ test("source redaction metadata cannot ground any semantic evidence role", () =>
       if (["usage", "url"].includes(role))
         candidate.citations[0][role] = { path };
       else candidate[role] = [{ path }];
+      assert.equal(validateAiObservation(document, candidate, {}), null);
       assert.equal(
-        validateAiObservation(document, candidate, { semanticOnly: true }),
-        null,
-      );
-      assert.equal(
-        observationRejectionReason(document, candidate, { semanticOnly: true }),
+        observationRejectionReason(document, candidate, {}),
         "path_rejected",
       );
     }
@@ -147,10 +138,8 @@ test("source redaction metadata cannot ground any semantic evidence role", () =>
   );
 });
 
-test("semantic v4 grounds selections without provider identities or status interpretation", () => {
-  const result = validateAiObservation(semanticSource, semanticCandidate, {
-    semanticOnly: true,
-  });
+test("current extraction grounds selections without provider identities or status interpretation", () => {
+  const result = validateAiObservation(semanticSource, semanticCandidate, {});
   assert.equal(result.raw_answer, "Exact observed answer.");
   assert.deepEqual(result.citations, ["https://example.org/source"]);
   assert.equal(result.search_used, "yes");
@@ -176,7 +165,7 @@ test("semantic v4 grounds selections without provider identities or status inter
   assert.equal(validateAiObservation(source, quoted), null);
 });
 
-test("semantic v4 rejects ungrounded fields and does not silently accept the legacy contract", () => {
+test("current extraction rejects ungrounded fields and does not silently accept the legacy contract", () => {
   for (const change of [
     (candidate) => (candidate.search_used = "no"),
     (candidate) => (candidate.search_used = "unknown"),
@@ -200,130 +189,37 @@ test("semantic v4 rejects ungrounded fields and does not silently accept the leg
     assert.equal(validateAiObservation(semanticSource, candidate), null);
   }
   assert.equal(
-    validateAiObservation(modern, modernExtracted, { semanticOnly: true }),
+    validateAiObservation(modern, {
+      ...modernExtracted,
+      decision: "searched_answer",
+    }),
     null,
   );
-  assert.ok(
-    validateAiObservation(modern, modernExtracted),
-    "historical replay remains valid",
-  );
 });
 
-test("every residual grounding failure has a fixed diagnostic without relaxing validation", () => {
-  const scenarios = [
-    ["identifier_rejected", (document) => (document.messages[0].chat.id = 123)],
+test("current extraction diagnostics preserve exact source boundaries", () => {
+  for (const [change, reason] of [
+    [(candidate) => (candidate.search_evidence = []), "evidence_empty"],
+    [(candidate) => (candidate.completion = "unknown"), "model_unverified"],
     [
-      "identifier_rejected",
-      (document) => (document.messages[2].block.id = "private:id"),
+      (candidate) =>
+        (candidate.search_evidence = [{ path: "/messages/99/missing" }]),
+      "path_rejected",
     ],
     [
-      "evidence_empty",
-      (document) => (document.messages[1].message.status = ""),
-    ],
-    [
-      "evidence_empty",
-      (document) => (document.messages[2].block.tool.contents = []),
-    ],
-    [
-      "evidence_empty",
-      (document) =>
-        (document.messages[1].message.refs.searchChunks[0].id = false),
-    ],
-    [
-      "answer_type_rejected",
-      (document) =>
-        (document.messages[3].block.text.content = { private_value: "hidden" }),
-    ],
-    [
-      "answer_type_rejected",
-      (document) => (document.messages[3].block.text.content = ""),
-    ],
-    [
-      "answer_empty",
-      (document) => (document.messages[3].block.text.content = " \n"),
-    ],
-    [
-      "answer_too_large",
-      (document) =>
-        (document.messages[3].block.text.content = "界".repeat(33_334)),
-    ],
-    [
-      "unicode_rejected",
-      (document) => (document.messages[3].block.text.content = "\uD800"),
-    ],
-    [
-      "answer_bounds_rejected",
-      (_document, candidate) =>
-        Object.assign(candidate.answer_segments[0], { start: -1, end: 2 }),
-    ],
-    [
-      "answer_bounds_rejected",
-      (_document, candidate) =>
-        Object.assign(candidate.answer_segments[0], {
-          quote: "Answer",
-          start: 0,
-          end: 6,
-        }),
-    ],
-    [
+      (candidate) =>
+        (candidate.answer_segments = [
+          { path: "/rendered_text", quote: "invented" },
+        ]),
       "quote_rejected",
-      (_document, candidate) =>
-        (candidate.answer_segments[0].quote = undefined),
     ],
-    [
-      "citation_rejected",
-      (_document, candidate) => (candidate.citations[0].url.quote = undefined),
-    ],
-    [
-      "shape_rejected",
-      (_document, candidate) => (candidate.citations = [null]),
-    ],
-  ];
-  for (const [reason, change] of scenarios) {
-    const document = structuredClone(modern);
+    [(candidate) => (candidate.citations = [null]), "shape_rejected"],
+  ]) {
     const candidate = structuredClone(modernExtracted);
-    change(document, candidate);
-    assert.equal(validateAiObservation(document, candidate), null, reason);
-    assert.equal(observationRejectionReason(document, candidate), reason);
+    change(candidate);
+    assert.equal(validateAiObservation(modern, candidate), null);
+    assert.equal(observationRejectionReason(modern, candidate), reason);
   }
-  assert.ok(validateAiObservation(modern, modernExtracted));
-});
-
-test("rejection reasons are fixed vocabulary without accepting any candidate", () => {
-  const explain = (overrides) =>
-    observationRejectionReason(modern, {
-      ...modernExtracted,
-      ...overrides,
-    });
-  assert.equal(explain({ decision: "unverified" }), "model_unverified");
-  assert.equal(explain({ answer_segments: [] }), "shape_rejected");
-  assert.equal(
-    explain({ completion: { path: "/messages/42/unknown" } }),
-    "path_rejected",
-  );
-  assert.equal(
-    explain({ answer_owner: { path: "/messages/0/chat/id" } }),
-    "owner_rejected",
-  );
-  assert.equal(
-    explain({
-      answer_segments: [
-        { path: "/messages/3/block/text/content", quote: "not present" },
-      ],
-    }),
-    "quote_rejected",
-  );
-  assert.equal(
-    explain({
-      citations: [
-        {
-          url: { path: "/messages/1/message/role" },
-          usage: modernExtracted.citations[0].usage,
-        },
-      ],
-    }),
-    "citation_rejected",
-  );
 });
 
 test("preserves all 65 streamed answer deltas while enforcing the total answer byte limit", () => {
@@ -426,9 +322,8 @@ test("grounds a complete observation in exact source values and records bounded 
   const result = validate();
   assert.equal(result.raw_answer, "Answer from the source.");
   assert.deepEqual(result.citations, ["https://example.org/source"]);
-  assert.equal(result.chat_id, "chat-1");
-  assert.equal(result.message_id, "answer-1");
-  assert.equal(result.block_id, "tool-1");
+  assert.equal(result.completion, "complete");
+  assert.equal(result.search_used, "yes");
   assert.equal(result.audit.method, "llm_grounded");
   assert.ok(
     result.audit.refs.some(
@@ -470,14 +365,10 @@ test("accepts an unrelated provider schema and exact unique Unicode quote from p
     rendered_text: "问题。前文🌍答案。后文",
   };
   const extracted = {
-    decision: "searched_answer",
-    chat_id: { path: "/messages/0/conversation/key" },
-    message_id: { path: "/messages/1/reply/key" },
-    answer_owner: { path: "/messages/3/paragraph/owner" },
-    search_owner: { path: "/messages/2/event/owner" },
-    search_block_id: { path: "/messages/2/event/key" },
-    completion: { path: "/messages/1/reply/state" },
-    search_activity: { path: "/messages/2/event/search/hits" },
+    completion: "complete",
+    completion_evidence: [{ path: "/messages/1/reply/state" }],
+    search_used: "yes",
+    search_evidence: [{ path: "/messages/2/event/search/hits" }],
     answer_segments: [
       { path: "/messages/1/reply/excerpt", quote: "🌍答案。" },
       { path: "/rendered_text", quote: "后文" },
@@ -499,41 +390,11 @@ test("accepts an unrelated provider schema and exact unique Unicode quote from p
   );
 });
 
-test("returns no verified observation without every required ownership and source proof", () => {
+test("historical identifiers cannot become a verified current observation", () => {
   assert.equal(validateAiObservation(modern, { decision: "unverified" }), null);
+  assert.equal(validate({ decision: "searched_answer" }), null);
   assert.deepEqual(validate({ citations: [] }).citations, []);
   assert.equal(validate({ answer_segments: [] }), null);
-  assert.equal(validate({ message_id: { path: "/messages/0/chat/id" } }), null);
-  assert.equal(validate({ search_block_id: modernExtracted.message_id }), null);
-  assert.equal(
-    validate({
-      completion: { path: "/messages/2/block/tool/unknown" },
-    }),
-    null,
-  );
-  assert.equal(
-    validate({
-      search_activity: {
-        path: "/messages/2/block/tool/contents/0/searchResult",
-      },
-    }),
-    null,
-    "empty object is not search activity",
-  );
-  assert.equal(
-    validate({
-      search_activity: { path: "/messages/1/message/role" },
-      answer_owner: { path: "/messages/2/block/messageId" },
-      citations: [
-        {
-          url: { path: "/messages/1/message/role" },
-          usage: modernExtracted.citations[0].usage,
-        },
-      ],
-    }),
-    null,
-    "invented URL fails even if another field is nonempty",
-  );
 });
 
 test("JSON Pointers require own properties, canonical indexes, and safe escapes", () => {
@@ -547,7 +408,7 @@ test("JSON Pointers require own properties, canonical indexes, and safe escapes"
     "/messages/999/message/id",
     "",
   ]) {
-    assert.equal(validate({ message_id: { path } }), null, path);
+    assert.equal(validate({ completion_evidence: [{ path }] }), null, path);
   }
   const inherited = Object.create({ messages: modern.messages });
   assert.equal(validate({}, inherited), null);

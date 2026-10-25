@@ -40,8 +40,8 @@ const request = (overrides = {}) => {
     source_sha256: digest(source_json),
     candidate_json: JSON.stringify(candidate),
     protocol: { model: "synthetic-model", search_mode: "official_search" },
-    prompt_version: "geo.observation.extract.v4",
-    parser_version: "geo.observation.extract.v6",
+    prompt_version: "geo.observation.extract.v5",
+    parser_version: "geo.observation.extract.v7",
     ...overrides,
   };
 };
@@ -57,6 +57,7 @@ const recommendationItems = [
     reason: "because it is quiet",
     evidence_quote: "First choice: Sample Air 300, because it is quiet.",
     citation_urls: [source.messages[0].url],
+    brand_attribution: null,
   },
   {
     name: "Example Bistro",
@@ -66,6 +67,7 @@ const recommendationItems = [
     reason: null,
     evidence_quote: "Also consider Example Bistro for dinner.",
     citation_urls: [],
+    brand_attribution: null,
   },
 ];
 function recommendationRequest(items = recommendationItems) {
@@ -79,8 +81,8 @@ function recommendationRequest(items = recommendationItems) {
       ...candidate,
       ...(items === undefined ? {} : { recommendations: items }),
     }),
-    prompt_version: "geo.observation.extract.v4",
-    parser_version: "geo.observation.extract.v6",
+    prompt_version: "geo.observation.extract.v5",
+    parser_version: "geo.observation.extract.v7",
   });
 }
 
@@ -88,7 +90,7 @@ test("new replay grounds recommended products and restaurants without inventing 
   const result = groundSavedObservation(recommendationRequest());
   assert.equal(result.outcome.status, "grounded");
   assert.deepEqual(result.outcome.audit.recommendations, {
-    version: "geo.recommendations.v1",
+    version: "geo.recommendations.v2",
     status: "verified",
     items: recommendationItems,
   });
@@ -119,11 +121,88 @@ test("invalid recommendation proposals preserve the grounded answer and citation
     assert.equal(result.outcome.raw_answer, recommendationAnswer);
     assert.deepEqual(result.outcome.citations, [source.messages[0].url]);
     assert.deepEqual(result.outcome.audit.recommendations, {
-      version: "geo.recommendations.v1",
+      version: "geo.recommendations.v2",
       status: "unverified",
       items: [],
     });
   }
+});
+
+test("explicit product brand attribution preserves exact answer evidence", () => {
+  const text =
+    "Sample Air 300 is made by Example Brand. First choice: Sample Air 300, because it is quiet.";
+  const source_json = JSON.stringify({
+    messages: [{ ...source.messages[0], text }],
+  });
+  const item = {
+    ...recommendationItems[0],
+    brand_attribution: {
+      name: "Example Brand",
+      evidence_quote: "Sample Air 300 is made by Example Brand.",
+    },
+  };
+  const input = recommendationRequest([item]);
+  input.source_json = source_json;
+  input.source_sha256 = digest(source_json);
+  const result = groundSavedObservation(input);
+  assert.deepEqual(result.outcome.audit.recommendations.items, [item]);
+  assert.equal(result.outcome.audit.recommendations.items[0].rank, 1);
+});
+
+test("missing or invalid brand attribution invalidates the whole collection", () => {
+  const valid = recommendationItems[0];
+  const { brand_attribution, ...missing } = valid;
+  const invalid = [
+    missing,
+    { ...valid, brand_attribution: undefined },
+    ...[
+      false,
+      [],
+      {},
+      { name: "Sample" },
+      { name: "Sample", evidence_quote: null },
+      { name: "", evidence_quote: recommendationAnswer },
+      { name: "x".repeat(501), evidence_quote: recommendationAnswer },
+      { name: "Sample", evidence_quote: "x".repeat(8001) },
+      { name: "Sample", evidence_quote: "Sample Air 300 invented quote" },
+      { name: "Sample", evidence_quote: "Sample" },
+      { name: "Absent", evidence_quote: recommendationAnswer },
+      { name: "Sample", evidence_quote: recommendationAnswer, extra: true },
+    ].map((value) => ({ ...valid, brand_attribution: value })),
+    {
+      ...recommendationItems[1],
+      mention_order: 1,
+      brand_attribution: {
+        name: "Example",
+        evidence_quote: "Also consider Example Bistro for dinner.",
+      },
+    },
+  ];
+  for (const item of invalid) {
+    const result = groundSavedObservation(recommendationRequest([item]));
+    assert.equal(result.outcome.status, "grounded");
+    assert.deepEqual(result.outcome.audit.recommendations, {
+      version: "geo.recommendations.v2",
+      status: "unverified",
+      items: [],
+    });
+  }
+});
+
+test("brand relationship meaning belongs to the model, source binding to code", () => {
+  // No prefix or language heuristic decides ownership in application code.
+  const item = {
+    ...recommendationItems[0],
+    brand_attribution: {
+      name: "Sample",
+      evidence_quote: recommendationItems[0].evidence_quote,
+    },
+  };
+  assert.equal(
+    groundSavedObservation(recommendationRequest([item])).outcome.audit
+      .recommendations.status,
+    "verified",
+  );
 });
 
 test("optional recommendation audit overflow preserves bounded answer provenance", () => {
@@ -187,7 +266,7 @@ test("optional recommendation audit overflow preserves bounded answer provenance
     const { recommendations: _, ...baseAudit } = base.outcome.audit;
     assert.deepEqual(audit, baseAudit);
     assert.deepEqual(recommendations, {
-      version: "geo.recommendations.v1",
+      version: "geo.recommendations.v2",
       status: expected,
       items: expected === "verified" ? items : [],
     });
@@ -228,6 +307,7 @@ test("empty and missing recommendation analysis remain distinct; historical vers
   for (const [prompt_version, parser_version] of [
     ["geo.observation.extract.v2", "geo.observation.extract.v4"],
     ["geo.observation.extract.v3", "geo.observation.extract.v5"],
+    ["geo.observation.extract.v4", "geo.observation.extract.v6"],
   ]) {
     const historical = request({ prompt_version, parser_version });
     assert.equal(
@@ -276,8 +356,8 @@ test("saved prompt preparation reuses current prompt with exact saved indices an
   assert.deepEqual(result, {
     prompt: extractionPrompt(document),
     source_sha256: digest(source_json),
-    prompt_version: "geo.observation.extract.v4",
-    parser_version: "geo.observation.extract.v6",
+    prompt_version: "geo.observation.extract.v5",
+    parser_version: "geo.observation.extract.v7",
   });
   for (const key of ["rendered_text", "capture_status", "source_redaction"])
     assert.ok(
@@ -298,7 +378,7 @@ test("saved prompt preparation rejects malformed, oversized and unsupported inpu
     [
       {
         prompt_version: "geo.observation.extract.v2",
-        parser_version: "geo.observation.extract.v4",
+        parser_version: "geo.observation.extract.v5",
       },
       "version_rejected",
     ],
@@ -359,12 +439,12 @@ test("saved prompt preparation rejects malformed, oversized and unsupported inpu
 test("saved grounding requires both explicit current extraction versions", () => {
   for (const versions of [
     {},
-    { prompt_version: "geo.observation.extract.v4" },
-    { parser_version: "geo.observation.extract.v6" },
+    { prompt_version: "geo.observation.extract.v5" },
+    { parser_version: "geo.observation.extract.v7" },
     { prompt_version: null, parser_version: null },
     {
       prompt_version: "geo.observation.extract.v3",
-      parser_version: "geo.observation.extract.v6",
+      parser_version: "geo.observation.extract.v7",
     },
   ]) {
     const input = request();

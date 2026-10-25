@@ -181,7 +181,7 @@ test("independent ownership is hashed before extraction but cannot ground model 
           [field]: [{ path: "/ownership/submission/model_type" }],
         },
         document,
-        { semanticOnly: true },
+        {},
       ),
       null,
       field,
@@ -681,6 +681,12 @@ test("live recommendation grounding uses the existing extraction call", async ()
       calls += 1;
       assert.match(prompt, /ordinary numbered list is NOT proof of ranking/u);
       assert.match(prompt, /"recommendations"/u);
+      assert.match(prompt, /Every recommendation requires brand_attribution/u);
+      assert.match(
+        prompt,
+        /explicitly states the product's brand relationship/u,
+      );
+      assert.match(prompt, /outside knowledge, shared prefixes/u);
       return {
         extracted: { ...extracted, recommendations: [] },
         model: "synthetic-extractor",
@@ -689,9 +695,9 @@ test("live recommendation grounding uses the existing extraction call", async ()
     },
   });
   assert.equal(calls, 1);
-  assert.equal(result.audit.prompt_version, "geo.observation.extract.v4");
+  assert.equal(result.audit.prompt_version, "geo.observation.extract.v5");
   assert.deepEqual(result.audit.recommendations, {
-    version: "geo.recommendations.v1",
+    version: "geo.recommendations.v2",
     status: "verified",
     items: [],
   });
@@ -934,7 +940,7 @@ test("browser extraction succeeds first without API and records a document-bound
   assert.equal(result.audit.surface, "consumer_web");
   assert.equal(result.audit.kind, "observation_extraction");
   assert.equal(result.audit.method, "llm_grounded");
-  assert.equal(result.audit.prompt_version, "geo.observation.extract.v4");
+  assert.equal(result.audit.prompt_version, "geo.observation.extract.v5");
   assert.deepEqual(result.audit.attempts, [
     {
       route: "signed_in_browser",
