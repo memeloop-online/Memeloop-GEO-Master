@@ -27,7 +27,7 @@ fn validate_versions(request: &ObservationExtractionRequest) -> Result<(), AppEr
                 request.prompt_version.as_str(),
                 request.parser_version.as_str()
             ),
-            ("geo.observation.extract.v4", "geo.observation.extract.v6")
+            ("geo.observation.extract.v5", "geo.observation.extract.v7")
         )
     {
         return Err(AppError::invalid_request("extraction version unsupported"));
@@ -151,7 +151,7 @@ impl ObservationExtractionService {
         source_sha256: &str,
         prompt_version: &str,
     ) -> Result<AutomaticExtractionAdmission, AppError> {
-        if prompt_version != "geo.observation.extract.v4" {
+        if prompt_version != "geo.observation.extract.v5" {
             return Err(AppError::invalid_request("extraction version unsupported"));
         }
         let capture = self
@@ -167,7 +167,7 @@ impl ObservationExtractionService {
             manual_revision_id: None,
             source_sha256: source_sha256.into(),
             prompt_version: prompt_version.into(),
-            parser_version: "geo.observation.extract.v6".into(),
+            parser_version: "geo.observation.extract.v7".into(),
             policy_version: EXTRACTION_POLICY_VERSION.into(),
         };
         let admission = self
@@ -483,7 +483,7 @@ impl SourceAdmissionScan {
                         &item.scope,
                         item.capture_id,
                         &capture.source_sha256,
-                        "geo.observation.extract.v4",
+                        "geo.observation.extract.v5",
                     )
                     .await?;
                 Ok(())
@@ -592,8 +592,8 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(geo_domain::sha256_hex(source.as_bytes()), digest);
             assert_eq!(source, r#"{"messages":[{"text":"synthetic answer"}]}"#);
-            assert_eq!(prompt_version, "geo.observation.extract.v4");
-            assert_eq!(parser_version, "geo.observation.extract.v6");
+            assert_eq!(prompt_version, "geo.observation.extract.v5");
+            assert_eq!(parser_version, "geo.observation.extract.v7");
             if self.invalid == Some("unavailable") {
                 return Err(AppError::capability_missing(
                     "synthetic preparation unavailable",
@@ -919,7 +919,7 @@ mod tests {
                 scope,
                 captures.capture.input.capture_id,
                 source_sha256,
-                "geo.observation.extract.v4",
+                "geo.observation.extract.v5",
             )
             .await
             .unwrap()
@@ -979,21 +979,25 @@ mod tests {
                 &scope,
                 captures.capture.input.capture_id,
                 source_sha256,
-                "geo.observation.extract.v4",
+                "geo.observation.extract.v5",
             )
             .await
             .unwrap();
-        assert_eq!(intent.request.parser_version, "geo.observation.extract.v6");
+        assert_eq!(intent.request.parser_version, "geo.observation.extract.v7");
         assert!(validate_versions(&intent.request).is_ok());
         let mut mismatched = intent.request;
-        for parser in ["geo.observation.extract.v4", "geo.observation.extract.v5"] {
+        for parser in [
+            "geo.observation.extract.v4",
+            "geo.observation.extract.v5",
+            "geo.observation.extract.v6",
+        ] {
             mismatched.parser_version = parser.into();
             assert!(validate_versions(&mismatched).is_err());
         }
-        mismatched.parser_version = "geo.observation.extract.v6".into();
+        mismatched.parser_version = "geo.observation.extract.v7".into();
         mismatched.prompt_version = "geo.observation.extract.v999".into();
         assert!(validate_versions(&mismatched).is_err());
-        mismatched.prompt_version = "geo.observation.extract.v4".into();
+        mismatched.prompt_version = "geo.observation.extract.v5".into();
         mismatched.policy_version = "geo.observation.automatic.future".into();
         assert!(validate_versions(&mismatched).is_err());
     }
@@ -1155,7 +1159,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(legacy.message, "extraction version unsupported");
-        assert_eq!(current.request.parser_version, "geo.observation.extract.v6");
+        assert_eq!(current.request.parser_version, "geo.observation.extract.v7");
         assert_eq!(model.calls.load(Ordering::SeqCst), 1);
         assert!(
             repository
@@ -1177,7 +1181,7 @@ mod tests {
                     &foreign,
                     captures.capture.input.capture_id,
                     &current.request.source_sha256,
-                    "geo.observation.extract.v4"
+                    "geo.observation.extract.v5"
                 )
                 .await
                 .is_err()

@@ -183,6 +183,12 @@ export async function buildMeasurementReportPdf(
       "firstPlaceShare",
       rate(frequency.ranks.get(1) ?? 0, frequency.ranked, "no_ranked"),
     );
+    if (frequency.brandSummary) {
+      field("brand_affiliate_positive", frequency.brandSummary.positiveAnswers);
+      field("brand_attribution_known", frequency.brandSummary.knownAnswers);
+      field("brand_attribution_unknown", frequency.brandSummary.unknownAnswers);
+      field("brand_attribution_valid", frequency.brandSummary.validAnswers);
+    }
   };
   layout.text(t("title"), { size: 21, gap: 10 });
   layout.text(
@@ -387,6 +393,17 @@ export async function buildMeasurementReportPdf(
       );
       field("reason", item.reason);
       field("evidence_quote", item.evidence_quote);
+      if (item.kind === "product") {
+        field(
+          "brand_attribution",
+          item.brand_attribution?.name ?? t("brand_attribution_not_recorded"),
+        );
+        if (item.brand_attribution)
+          field(
+            "brand_attribution_evidence",
+            item.brand_attribution.evidence_quote,
+          );
+      }
       for (const url of item.citation_urls) field("citation_urls", url);
     }
     layout.text(

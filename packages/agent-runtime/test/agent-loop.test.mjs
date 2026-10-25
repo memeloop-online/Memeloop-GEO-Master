@@ -2079,12 +2079,12 @@ test("question-set report tools preserve grounded saved answers with unknown rec
         analyzed_at: "2026-10-03T00:00:10Z",
         actual_model: "synthetic-analysis-model",
         config_revision: 1,
-        prompt_version: "geo.observation.extract.v4",
-        parser_version: "geo.observation.extract.v6",
+        prompt_version: "geo.observation.extract.v5",
+        parser_version: "geo.observation.extract.v7",
       },
     },
     recommendations: {
-      version: "geo.recommendations.v1",
+      version: "geo.recommendations.v2",
       status: "verified",
       items: [
         {
@@ -2096,6 +2096,7 @@ test("question-set report tools preserve grounded saved answers with unknown rec
           evidence_quote:
             "1. Synthetic item is recommended for its documented features.",
           citation_urls: ["https://source.example.invalid/item"],
+          brand_attribution: null,
         },
       ],
     },

@@ -2225,7 +2225,7 @@ mod tests {
     #[test]
     fn recommendation_audit_survives_result_round_trip() {
         let recommendations = json!({
-            "version": "geo.recommendations.v1",
+            "version": "geo.recommendations.v2",
             "status": "verified",
             "items": [
             {
@@ -2235,7 +2235,11 @@ mod tests {
                 "rank": 1,
                 "reason": "quiet operation",
                 "evidence_quote": "First choice: Example Air 100 for quiet operation.",
-                "citation_urls": ["https://example.org/product"]
+                "citation_urls": ["https://example.org/product"],
+                "brand_attribution": {
+                    "name": "Example Brand",
+                    "evidence_quote": "Example Air 100 is made by Example Brand."
+                }
             },
             {
                 "name": "Example Kitchen",
@@ -2244,19 +2248,20 @@ mod tests {
                 "rank": null,
                 "reason": null,
                 "evidence_quote": "Also consider Example Kitchen.",
-                "citation_urls": []
+                "citation_urls": [],
+                "brand_attribution": null
             }
             ]
         });
         let mut grounded = result();
         grounded.outcome = ObservationAnalysisOutcome::Grounded {
             raw_answer:
-                "First choice: Example Air 100 for quiet operation. Also consider Example Kitchen."
+                "Example Air 100 is made by Example Brand. First choice: Example Air 100 for quiet operation. Also consider Example Kitchen."
                     .into(),
             citations: vec!["https://example.org/product".into()],
             audit: json!({
                 "refs": [{"path": "/messages/0/content", "role": "answer_source"}],
-                "prompt_version": "geo.observation.extract.v4",
+                "prompt_version": "geo.observation.extract.v5",
                 "recommendations": recommendations
             }),
         };
@@ -2269,6 +2274,11 @@ mod tests {
             panic!("grounded result was not preserved");
         };
         assert_eq!(audit["recommendations"], recommendations);
+        assert_eq!(
+            audit["recommendations"]["items"][0]["brand_attribution"]["name"],
+            "Example Brand"
+        );
+        assert!(audit["recommendations"]["items"][1]["brand_attribution"].is_null());
         assert!(audit["recommendations"]["items"][1]["rank"].is_null());
     }
 

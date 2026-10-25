@@ -1,4 +1,7 @@
-import { isMeasurementFocus } from "../api/measurementFocus";
+import {
+  isMeasurementFocus,
+  summarizeBrandRecommendations,
+} from "../api/measurementFocus";
 import type { MeasurementTarget } from "../api/projects";
 import type { RecommendationItem } from "../api/recommendations";
 import type { RecommendationTrendSample } from "./RecommendationTrend";
@@ -64,5 +67,9 @@ export function recommendationFrequency(
     ambiguous,
     ranks,
     ranked: recommended - unranked - ambiguous,
+    brandSummary: summarizeBrandRecommendations(
+      entries.map(({ items }) => items),
+      target,
+    ),
   };
 }

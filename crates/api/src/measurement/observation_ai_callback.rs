@@ -145,7 +145,7 @@ async fn extract(
         .prompt_version
         .as_deref()
         .ok_or(StatusCode::BAD_REQUEST)?;
-    if version != "geo.observation.extract.v4" {
+    if version != "geo.observation.extract.v5" {
         return Err(StatusCode::BAD_REQUEST);
     }
     let intent = service
@@ -226,8 +226,8 @@ mod tests {
             parser_version: &str,
         ) -> Result<crate::PreparedObservationPrompt, AppError> {
             assert_eq!(geo_domain::sha256_hex(source.as_bytes()), digest);
-            assert_eq!(prompt_version, "geo.observation.extract.v4");
-            assert_eq!(parser_version, "geo.observation.extract.v6");
+            assert_eq!(prompt_version, "geo.observation.extract.v5");
+            assert_eq!(parser_version, "geo.observation.extract.v7");
             Ok(crate::PreparedObservationPrompt {
                 prompt: "synthetic prepared observation prompt\n".into(),
                 source_sha256: digest.into(),
@@ -421,7 +421,7 @@ mod tests {
         );
         let dispatcher = crate::spawn_observation_extraction_dispatcher(extraction.clone());
         let service = ObservationAiCallbackService::new(capture, settings, extraction.clone());
-        let body = serde_json::json!({"schema_version":1,"capture_ticket":ticket,"source_capture_id":receipt.capture_id,"source_sha256":geo_domain::sha256_hex(source.as_bytes()),"prompt_version":"geo.observation.extract.v4"});
+        let body = serde_json::json!({"schema_version":1,"capture_ticket":ticket,"source_capture_id":receipt.capture_id,"source_sha256":geo_domain::sha256_hex(source.as_bytes()),"prompt_version":"geo.observation.extract.v5"});
         for path in [POLICY_PATH, EXTRACT_PATH] {
             for bearer in [None, Some("wrong")] {
                 assert_eq!(

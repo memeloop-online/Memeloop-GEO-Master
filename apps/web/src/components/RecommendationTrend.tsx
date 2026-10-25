@@ -12,7 +12,10 @@ import {
 } from "@fluentui/react-components";
 import { useTranslation } from "react-i18next";
 import type { ChannelTargetInput } from "../api/channelJobs";
-import { isMeasurementFocus } from "../api/measurementFocus";
+import {
+  classifyBrandRecommendation,
+  isMeasurementFocus,
+} from "../api/measurementFocus";
 import type { MeasurementTarget } from "../api/projects";
 import {
   decodeVerifiedRecommendations,
@@ -24,6 +27,11 @@ import {
 } from "./recommendationComparison";
 import "../i18n/recommendationTrend";
 import "./RecommendationTrend.css";
+import {
+  RecommendationBrandAttribution,
+  RecommendationBrandSummary,
+} from "./RecommendationBrandAttribution";
+import "../i18n/measurementFocus";
 
 type FullMeasurementInput = Extract<ChannelTargetInput, { kind: "measure" }>;
 type MeasurementInput = Omit<
@@ -63,7 +71,15 @@ function entityState(entry: TrendEntry, target: MeasurementTarget) {
   const matches = entry.items.filter((item) =>
     isMeasurementFocus(item, [target]),
   );
-  if (!matches.length) return { label: "absent" };
+  if (!matches.length)
+    return {
+      label:
+        classifyBrandRecommendation(entry.items, target) === "positive"
+          ? "affiliateOnly"
+          : target.kind === "brand"
+            ? "directBrandAbsent"
+            : "absent",
+    };
   if (new Set(matches.map((item) => item.rank)).size > 1)
     return { label: "ambiguous" };
   return matches[0].rank === null
@@ -82,6 +98,7 @@ export function RecommendationTrend({
   embedded?: boolean;
 }) {
   const { t, i18n } = useTranslation("recommendationTrend");
+  const { t: focusT } = useTranslation("measurementFocus");
   const number = new Intl.NumberFormat(i18n.resolvedLanguage || i18n.language);
   const percent = new Intl.NumberFormat(
     i18n.resolvedLanguage || i18n.language,
@@ -197,6 +214,9 @@ export function RecommendationTrend({
                             {entity.name}
                             {entity.kind && ` · ${t(`kind_${entity.kind}`)}`}
                           </Text>
+                          {entity.kind === "brand" && (
+                            <Text>{focusT("brandDirect")}</Text>
+                          )}
                           <Text>
                             {frequency.valid === 0
                               ? t("noValidSamples")
@@ -210,6 +230,9 @@ export function RecommendationTrend({
                                   ),
                                 })}
                           </Text>
+                          <RecommendationBrandSummary
+                            summary={frequency.brandSummary}
+                          />
                           <Text
                             size={200}
                             className="recommendation-trend-secondary"
@@ -543,6 +566,9 @@ export function RecommendationTrend({
                                                 {item.evidence_quote}
                                               </blockquote>
                                             </details>
+                                            <RecommendationBrandAttribution
+                                              item={item}
+                                            />
                                           </div>
                                         ))}
                                 </TableCell>

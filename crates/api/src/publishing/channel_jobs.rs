@@ -785,7 +785,7 @@ impl AiBrowserSearchEvent {
             && self.request_question_sha256 == question_sha256
             && extraction_sha256(&self.request_question_sha256)
             && extraction_label(&self.extraction_model)
-            && self.extraction_prompt_version == "geo.observation.extract.v4"
+            && self.extraction_prompt_version == "geo.observation.extract.v5"
             && extraction_sha256(&self.source_sha256))
         .then_some(self.observed_at)
     }

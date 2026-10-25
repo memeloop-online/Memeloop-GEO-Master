@@ -6,6 +6,19 @@ export interface RecommendationItem {
   reason: string | null;
   evidence_quote: string;
   citation_urls: string[];
+  brand_attribution: { name: string; evidence_quote: string } | null;
+}
+
+function validBrandAttribution(value: unknown, kind: unknown): boolean {
+  if (value === null) return true;
+  if (kind !== "product" || !value || typeof value !== "object") return false;
+  const attribution = value as Record<string, unknown>;
+  return (
+    typeof attribution.name === "string" &&
+    attribution.name.trim().length > 0 &&
+    typeof attribution.evidence_quote === "string" &&
+    attribution.evidence_quote.trim().length > 0
+  );
 }
 
 /** Decode the current verified extraction; null is unavailable, [] is verified empty. */
@@ -15,7 +28,7 @@ export function decodeVerifiedRecommendations(
   if (!value || typeof value !== "object") return null;
   const result = value as Record<string, unknown>;
   if (
-    result.version !== "geo.recommendations.v1" ||
+    result.version !== "geo.recommendations.v2" ||
     result.status !== "verified" ||
     !Array.isArray(result.items)
   )
@@ -24,6 +37,7 @@ export function decodeVerifiedRecommendations(
     if (!value || typeof value !== "object") return false;
     const item = value as Record<string, unknown>;
     return (
+      validBrandAttribution(item.brand_attribution, item.kind) &&
       typeof item.name === "string" &&
       item.name.trim().length > 0 &&
       ["product", "restaurant", "brand", "service", "other"].includes(

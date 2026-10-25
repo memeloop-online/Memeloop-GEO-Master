@@ -189,12 +189,12 @@ async fn complete_live_search(
             "observed_at":observed_at,"source":"browser_response_ai","provenance":"live",
             "search_used":"yes","request_model":model,
             "request_question_sha256":sha256_hex(question.as_bytes()),
-            "extraction_model":"synthetic-extractor","extraction_prompt_version":"geo.observation.extract.v4",
+            "extraction_model":"synthetic-extractor","extraction_prompt_version":"geo.observation.extract.v5",
             "source_sha256":source_sha256
         }
     });
     let audit = json!({"kind":"observation_extraction","method":"llm_grounded",
-    "model":"synthetic-extractor","prompt_version":"geo.observation.extract.v4",
+    "model":"synthetic-extractor","prompt_version":"geo.observation.extract.v5",
     "source_json":source_json,"source_sha256":source_sha256,"surface":"model_api",
     "refs":[
         {"role":"answer_segment","path":"/messages/0/text","quote":"Example answer"},
@@ -407,8 +407,8 @@ async fn saved_analysis_projects_once_without_changing_measurement_or_requiring_
             source: ObservationAnalysisSource::AttemptEvidence { evidence_index: 0 },
             source_sha256: source_sha256.clone(),
             observed_at: at,
-            prompt_version: "geo.observation.extract.v4".into(),
-            parser_version: "geo.observation.extract.v6".into(),
+            prompt_version: "geo.observation.extract.v5".into(),
+            parser_version: "geo.observation.extract.v7".into(),
         };
         let admitted = extraction
             .admit_manual(
@@ -456,7 +456,7 @@ async fn saved_analysis_projects_once_without_changing_measurement_or_requiring_
                 audit: json!({
                     "kind":"observation_extraction","method":"llm_grounded",
                     "model":"analysis-model","surface":"model_api",
-                    "prompt_version":"geo.observation.extract.v4","source_sha256":source_sha256,
+                    "prompt_version":"geo.observation.extract.v5","source_sha256":source_sha256,
                     "protocol":{
                         "provider":"provider-a","model":"model-a","surface":"consumer_web",
                         "search_mode":"web_search","protocol_version":"v1","market":"generic","language":"en"
@@ -700,8 +700,8 @@ async fn capture_projection_requires_source_availability_and_excludes_explicit_f
                 source: ObservationAnalysisSource::Capture { capture_id },
                 source_sha256: source_sha256.clone(),
                 observed_at,
-                prompt_version: "geo.observation.extract.v4".into(),
-                parser_version: "geo.observation.extract.v6".into(),
+                prompt_version: "geo.observation.extract.v5".into(),
+                parser_version: "geo.observation.extract.v7".into(),
             },
             analyzed_at,
         )
@@ -746,7 +746,7 @@ async fn capture_projection_requires_source_availability_and_excludes_explicit_f
                     audit: json!({
                         "kind":"observation_extraction","method":"llm_grounded",
                         "model":"analysis-model","surface":"model_api",
-                        "prompt_version":"geo.observation.extract.v4","source_sha256":source_sha256,
+                        "prompt_version":"geo.observation.extract.v5","source_sha256":source_sha256,
                         "protocol":{
                             "provider":"provider-a","model":"model-a","surface":"consumer_web",
                             "search_mode":"web_search","protocol_version":"v1","market":"generic","language":"en"

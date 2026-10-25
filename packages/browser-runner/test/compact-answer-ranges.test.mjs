@@ -29,8 +29,8 @@ const saved = (
   document,
   proposal,
   versions = {
-    prompt_version: "geo.observation.extract.v4",
-    parser_version: "geo.observation.extract.v6",
+    prompt_version: "geo.observation.extract.v5",
+    parser_version: "geo.observation.extract.v7",
   },
 ) => {
   const source_json = JSON.stringify(document);
@@ -71,7 +71,7 @@ test("800 AI-selected fragments around interruptions retain every concrete audit
   assert.equal(result.candidate_json, JSON.stringify(proposal));
   assert.equal(
     result.outcome.audit.prompt_version,
-    "geo.observation.extract.v4",
+    "geo.observation.extract.v5",
   );
   assert.deepEqual(result.outcome.audit.refs, grounded.audit.refs);
   assert.equal(
@@ -195,7 +195,7 @@ test("saved ranges require explicit current versions and reject historical versi
     {},
     {
       prompt_version: "geo.observation.extract.v2",
-      parser_version: "geo.observation.extract.v4",
+      parser_version: "geo.observation.extract.v5",
     },
     {
       prompt_version: "geo.observation.extract.v3",
@@ -206,7 +206,7 @@ test("saved ranges require explicit current versions and reject historical versi
     { prompt_version: null, parser_version: null },
     {
       prompt_version: "geo.observation.extract.v3",
-      parser_version: "geo.observation.extract.v4",
+      parser_version: "geo.observation.extract.v5",
     },
     { prompt_version: "future", parser_version: "geo.observation.extract.v5" },
   ])

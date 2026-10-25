@@ -113,8 +113,8 @@ async fn cycle_free_reports_freeze_concurrent_create_correction_and_restart() {
         }),
     });
     interpreted.recommendations = Some(serde_json::json!({
-        "version":"geo.recommendations.v1","status":"verified",
-        "items":[{"name":"Synthetic product","mention_order":1,"rank":1,"citation_urls":["https://example.test/source"]}]
+        "version":"geo.recommendations.v2","status":"verified",
+        "items":[{"name":"Synthetic product","brand_attribution":null,"mention_order":1,"rank":1,"citation_urls":["https://example.test/source"]}]
     }));
     let proposed = freeze_measurement_period(
         &scope,

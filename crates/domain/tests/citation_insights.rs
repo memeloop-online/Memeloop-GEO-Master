@@ -38,8 +38,8 @@ fn analysis(
             source: ObservationAnalysisSource::AttemptEvidence { evidence_index: 0 },
             source_sha256: source_sha256.clone(),
             observed_at: view.attempts[0].outcome.as_ref().unwrap().occurred_at,
-            prompt_version: "geo.observation.extract.v4".into(),
-            parser_version: "geo.observation.extract.v6".into(),
+            prompt_version: "geo.observation.extract.v5".into(),
+            parser_version: "geo.observation.extract.v7".into(),
         },
         request_digest: "b".repeat(64),
         state: ObservationAnalysisState::Completed,
@@ -56,7 +56,7 @@ fn analysis(
                 citations: vec![url.into(), url.into()],
                 audit: json!({
                     "kind":"observation_extraction", "method":"llm_grounded",
-                    "prompt_version":"geo.observation.extract.v4", "source_sha256":source_sha256,
+                    "prompt_version":"geo.observation.extract.v5", "source_sha256":source_sha256,
                     "source_json":source,
                     "protocol":{"provider":provider,"model":model,"surface":surface,"search_mode":search_mode,
                         "protocol_version":protocol_version,"market":market,"language":language},
@@ -314,12 +314,12 @@ fn completed(
             "observed_at":observed_at,"source":"browser_response_ai","provenance":"live",
             "search_used":"yes","request_model":model,
             "request_question_sha256":sha256_hex(question.as_bytes()),
-            "extraction_model":"synthetic-extractor","extraction_prompt_version":"geo.observation.extract.v4",
+            "extraction_model":"synthetic-extractor","extraction_prompt_version":"geo.observation.extract.v5",
             "source_sha256":source_sha256
         }
     });
     let mut audit = json!({"kind":"observation_extraction","method":"llm_grounded",
-    "model":"synthetic-extractor","prompt_version":"geo.observation.extract.v4",
+    "model":"synthetic-extractor","prompt_version":"geo.observation.extract.v5",
     "source_json":source_json,"source_sha256":source_sha256,"surface":"model_api",
     "refs":[
         {"role":"answer_segment","path":"/messages/0/text","quote":"Answer."},

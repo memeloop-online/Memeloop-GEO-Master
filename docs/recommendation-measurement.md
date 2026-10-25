@@ -32,9 +32,16 @@
 
 ## 当前接口协作
 
-- Rust 仅接受当前提取 prompt `geo.observation.extract.v4`、parser `geo.observation.extract.v6`，不保留旧格式重放。
-- 执行器输出 `outcome.audit.recommendations`，结构为 `version: geo.recommendations.v1`、`status: verified|unverified` 与 `items`；条目包含 `name`、`kind`、`mention_order`、可空 `rank`／`reason`、`evidence_quote`、`citation_urls`。推荐字段不可用不能丢掉有效答案与引用。
+- 品牌归属候选已实现，通过本地定向验证、四组隔离 GET 夹具浏览器检查及两轮独立审查；最新完整前端运行仍有一项长文 PDF 超时，完整 CI、最终文案浏览器复验及部署后浏览器／供应商验收待完成，尚未合并或部署。唯一最新契约为提取 prompt `geo.observation.extract.v5`、parser `geo.observation.extract.v7`、推荐结果 `geo.recommendations.v2`；跨执行器、Rust 版本检查和 Web 读取同步更新，不保留旧格式重放或自动补字段兼容。
+- 执行器输出 `outcome.audit.recommendations`，结构为 `version`、`status: verified|unverified` 与 `items`；条目保留 `name`、`kind`、`mention_order`、可空 `rank`／`reason`、`evidence_quote`、`citation_urls`，新增必填且可空的 `brand_attribution: {name, evidence_quote} | null`。仅产品可以非空；缺字段或伪造证据使推荐结果不可验证，不能静默补空。推荐字段不可用不能丢掉有效答案与引用，旧快照原件不改写。
 - 当前执行器在推荐证据使审计超限时先降级推荐字段，保留答案、引用和有界来源；仅基础审计仍超限时拒绝。已有对应边界回归，不再列为未修复问题。
+
+## 品牌归属与独立计数
+
+- 归属由同次 AI 提取根据回答内明确证据判断，不新增推理或测量请求。归属名称使用回答原样品牌名，引文为包含完整产品名与品牌名的连续原文；名称前缀、外部常识、引用域名或模糊同现均不构成归属。证据不足返回 `null`，表示未知，不表示没有品牌。
+- 直接品牌推荐继续按类型及名称／显式别名精确匹配，沿用原推荐率、排名和首位率。旗下产品另外分类，每品牌每份有效回答最多计一次；产品排名始终属于产品，不提升为品牌排名，也不将两类推荐相加。
+- 有效回答数为 V；存在匹配归属的回答为正例 P。无匹配且存在未知产品归属记 U；所有产品均明确归属其他品牌、没有产品或验证空集合记明确非正例 N。已有匹配归属时，即使另有未知产品也只记 P；缺失或不可验证结果不计 V。
+- 可判定数 K＝P＋N＝V－U，展示 P／K／U／V 原始计数，不新增归属推荐百分比，不把 U 当负例。结果、同条件趋势、跨平台对照及 CSV／PDF 共用口径，并保留逐产品归属原文、当前筛选与点击语言；不同问题、平台与条件不混算。
 
 ## 独立关注对象配置
 

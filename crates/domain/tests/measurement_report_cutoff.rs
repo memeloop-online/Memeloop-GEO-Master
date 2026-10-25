@@ -168,7 +168,7 @@ fn fixture() -> (
                 sample_ordinal: 0,
             },
             recommendations: Some(
-                serde_json::json!({"version":"geo.recommendations.v1","status":"verified","items":[{"name":"Synthetic product","rank":1}]}),
+                serde_json::json!({"version":"geo.recommendations.v2","status":"verified","items":[{"name":"Synthetic product","brand_attribution":null,"rank":1}]}),
             ),
             question_binding: None,
             scheduled_at: observed_at,

@@ -610,7 +610,7 @@ fn semantic_search_projection_valid(proof: &serde_json::Value, outcome: &Channel
     };
     if event["source"] != "browser_response_ai"
         || event["search_used"] != "yes"
-        || event["extraction_prompt_version"] != "geo.observation.extract.v4"
+        || event["extraction_prompt_version"] != "geo.observation.extract.v5"
         || event["request_model"] != proof["model"]
         || !label(&event["request_model"])
         || event["request_question_sha256"] != proof["question_sha256"]
@@ -3115,7 +3115,7 @@ mod tests {
                     "search_used":"yes","request_model":model,
                     "request_question_sha256":sha256_hex(question.as_bytes()),
                     "extraction_model":"synthetic-extractor",
-                    "extraction_prompt_version":"geo.observation.extract.v4",
+                    "extraction_prompt_version":"geo.observation.extract.v5",
                     "source_sha256":sha256_hex(br#"{"messages":[]}"#)
                 },
                 "nested_canary":"HELDOUT_NESTED_EVIDENCE_CANARY"
@@ -3150,7 +3150,7 @@ mod tests {
                             serde_json::json!({
                                 "kind":"observation_extraction","method":"llm_grounded",
                                 "model":"synthetic-extractor",
-                                "prompt_version":"geo.observation.extract.v4",
+                                "prompt_version":"geo.observation.extract.v5",
                                 "source_sha256":sha256_hex(br#"{"messages":[]}"#),
                                 "source_json":r#"{"messages":[]}"#,
                                 "surface":"model_api",
@@ -3201,14 +3201,14 @@ mod tests {
                 "request_model":proof["model"],
                 "request_question_sha256":proof["question_sha256"],
                 "extraction_model":"synthetic-extractor",
-                "extraction_prompt_version":"geo.observation.extract.v4",
+                "extraction_prompt_version":"geo.observation.extract.v5",
                 "source_sha256":digest
             });
             outcome.runner_evidence[1] = serde_json::json!({
                 "kind":"observation_extraction",
                 "method":"llm_grounded",
                 "model":"synthetic-extractor",
-                "prompt_version":"geo.observation.extract.v4",
+                "prompt_version":"geo.observation.extract.v5",
                 "source_sha256":digest,
                 "source_json":source,
                 "surface":"model_api",

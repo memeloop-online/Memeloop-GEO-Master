@@ -29,6 +29,7 @@ const item = (
   reason: "Target has quiet operation.",
   evidence_quote: "Third choice: Example target for quiet operation.",
   citation_urls: ["https://example.test/review"],
+  brand_attribution: null,
   ...overrides,
 });
 

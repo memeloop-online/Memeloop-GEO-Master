@@ -32,8 +32,8 @@ use crate::{
     RequestContext, api_error,
 };
 
-const PROMPT_VERSION: &str = "geo.observation.extract.v4";
-const PARSER_VERSION: &str = "geo.observation.extract.v6";
+const PROMPT_VERSION: &str = "geo.observation.extract.v5";
+const PARSER_VERSION: &str = "geo.observation.extract.v7";
 const AUTOMATIC_KEY_PREFIX: &str = "automatic:observation-extraction:";
 
 #[derive(Debug, Deserialize)]
@@ -790,7 +790,7 @@ impl ObservationAnalysisService {
 fn supported_versions(prompt: &str, parser: &str) -> bool {
     matches!(
         (prompt, parser),
-        ("geo.observation.extract.v4", "geo.observation.extract.v6")
+        ("geo.observation.extract.v5", "geo.observation.extract.v7")
     )
 }
 
@@ -1333,7 +1333,7 @@ mod tests {
             assert_eq!(protocol["model"], "measured-model");
             assert!(matches!(
                 (prompt_version, parser_version),
-                ("geo.observation.extract.v4", "geo.observation.extract.v6")
+                ("geo.observation.extract.v5", "geo.observation.extract.v7")
             ));
             if self.unavailable {
                 return Err(AppError::capability_missing("unavailable"));
@@ -2223,7 +2223,7 @@ mod tests {
             match field {
                 "digest" => invalid.request.source_sha256 = "0".repeat(64),
                 "capture" => invalid.request.source_capture_id = Some(Uuid::new_v4()),
-                "version" => invalid.request.parser_version = "geo.observation.extract.v4".into(),
+                "version" => invalid.request.parser_version = "geo.observation.extract.v5".into(),
                 "model" => invalid.response.as_mut().unwrap().actual_model.clear(),
                 "config" => invalid.response.as_mut().unwrap().config_revision = Some(-1),
                 _ => unreachable!(),
