@@ -36,6 +36,6 @@ export const consumerWebProviders = Object.freeze({
     origin: "https://yuanbao.tencent.com",
     entry: "https://yuanbao.tencent.com/",
     loginEntryAvailable: true,
-    loginSupported: false,
+    loginSupported: true,
   }),
 });

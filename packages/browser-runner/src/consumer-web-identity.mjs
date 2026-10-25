@@ -3,6 +3,11 @@ import { consumerWebProviders } from "./consumer-web-providers.mjs";
 // Public consumer client request contracts inspected 2026-10-10. These are
 // read-only account probes, not inference, token-refresh or login protocols.
 const probes = Object.freeze({
+  yuanbao: {
+    path: "/api/getuserinfo",
+    headers: {},
+    credential: "session",
+  },
   qianwen: {
     // Official web SDK's read-only membership/profile request. This is the
     // sole cross-origin exception; neither origin nor endpoint is overridable.
@@ -84,11 +89,23 @@ export function qianwenIdentity(data) {
   return identity(data.data?.userId, data.data?.userNick, true);
 }
 
+// The current web client reads userId/nickName and rejects anonUser.isAnon.
+export function yuanbaoIdentity(data) {
+  if (
+    typeof data?.userId !== "string" ||
+    data.userId.startsWith("a_") ||
+    (data.anonUser?.isAnon !== undefined && data.anonUser.isAnon !== false)
+  )
+    return null;
+  return identity(data.userId, data.nickName, true);
+}
+
 const identities = {
   glm: glmIdentity,
   deepseek: deepseekIdentity,
   doubao: doubaoIdentity,
   qianwen: qianwenIdentity,
+  yuanbao: yuanbaoIdentity,
 };
 
 async function probeAccount(page, provider, trustedOrigin) {
@@ -187,6 +204,12 @@ async function probeAccount(page, provider, trustedOrigin) {
               : null;
         // Only explicit identity fields leave the page. Do not transfer tokens,
         // email, mobile, response diagnostics, or unrelated profile fields.
+        if (provider === "yuanbao")
+          return {
+            userId: scalar(body?.userId),
+            nickName: scalar(body?.nickName),
+            anonUser: { isAnon: scalar(body?.anonUser?.isAnon) },
+          };
         if (provider === "qianwen")
           return {
             success: scalar(body?.success),
@@ -253,3 +276,5 @@ export const probeDoubaoAccount = (
 // Deliberately no origin/endpoint override: test via browser routing instead.
 export const probeQianwenAccount = (page) =>
   probeAccount(page, "qianwen", consumerWebProviders.qianwen.origin);
+export const probeYuanbaoAccount = (page) =>
+  probeAccount(page, "yuanbao", consumerWebProviders.yuanbao.origin);
