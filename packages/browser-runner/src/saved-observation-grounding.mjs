@@ -15,8 +15,8 @@ const MAX_CANDIDATE_BYTES = 150_000;
 const MAX_PROTOCOL_BYTES = 8192;
 const MAX_AUDIT_BYTES = 512_000;
 const MAX_PROMPT_BYTES = 1_500_000;
-const PROMPT_VERSION = "geo.observation.extract.v4";
-const PARSER_VERSION = "geo.observation.extract.v6";
+const PROMPT_VERSION = "geo.observation.extract.v5";
+const PARSER_VERSION = "geo.observation.extract.v7";
 const object = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
@@ -156,14 +156,12 @@ export function groundSavedObservation(input) {
   }
   try {
     const grounded = validateAiObservation(document, candidate, {
-      semanticOnly: true,
       allowRanges: true,
       allowRecommendations: true,
     });
     if (!grounded)
       return rejected(
         observationRejectionReason(document, candidate, {
-          semanticOnly: true,
           allowRanges: true,
           allowRecommendations: true,
         }),
@@ -190,7 +188,7 @@ export function groundSavedObservation(input) {
       MAX_AUDIT_BYTES
     ) {
       result.outcome.audit.recommendations = {
-        version: "geo.recommendations.v1",
+        version: "geo.recommendations.v2",
         status: "unverified",
         items: [],
       };

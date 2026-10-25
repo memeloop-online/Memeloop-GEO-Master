@@ -815,7 +815,7 @@ export function createRunner(options = {}) {
                   const result = await observationAi.extract(
                     {
                       schema_version: 1,
-                      prompt_version: "geo.observation.extract.v4",
+                      prompt_version: "geo.observation.extract.v5",
                       capture_ticket: input.source_capture_ticket,
                       source_capture_id: sourceReceipt.capture_id,
                       source_sha256: sourceDigest,

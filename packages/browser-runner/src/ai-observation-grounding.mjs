@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 
-const ID = /^[A-Za-z0-9_-]{1,128}$/u;
 const MAX_ANSWER_BYTES = 100_000;
 const MAX_AUDIT_BYTES = 512;
 const MAX_SEGMENTS = 32_768;
@@ -112,7 +111,7 @@ function auditValue(value) {
 
 function groundRecommendations(value, answer, citations) {
   const unverified = {
-    version: "geo.recommendations.v1",
+    version: "geo.recommendations.v2",
     status: "unverified",
     items: [],
   };
@@ -127,6 +126,7 @@ function groundRecommendations(value, answer, citations) {
     "reason",
     "evidence_quote",
     "citation_urls",
+    "brand_attribution",
   ];
   for (const item of value) {
     if (
@@ -149,6 +149,24 @@ function groundRecommendations(value, answer, citations) {
       item.evidence_quote.length > 8000 ||
       !item.evidence_quote.includes(item.name) ||
       !answer.includes(item.evidence_quote) ||
+      !(
+        item.brand_attribution === null ||
+        (item.kind === "product" &&
+          object(item.brand_attribution) &&
+          Object.keys(item.brand_attribution).length === 2 &&
+          Object.hasOwn(item.brand_attribution, "name") &&
+          Object.hasOwn(item.brand_attribution, "evidence_quote") &&
+          typeof item.brand_attribution.name === "string" &&
+          item.brand_attribution.name.trim().length > 0 &&
+          item.brand_attribution.name.length <= 500 &&
+          typeof item.brand_attribution.evidence_quote === "string" &&
+          item.brand_attribution.evidence_quote.length <= 8000 &&
+          item.brand_attribution.evidence_quote.includes(item.name) &&
+          item.brand_attribution.evidence_quote.includes(
+            item.brand_attribution.name,
+          ) &&
+          answer.includes(item.brand_attribution.evidence_quote))
+      ) ||
       !(
         item.reason === null ||
         (typeof item.reason === "string" &&
@@ -200,57 +218,44 @@ function validateObservation(
   document,
   extracted,
   reject,
-  {
-    semanticOnly = false,
-    allowRanges = true,
-    allowRecommendations = false,
-  } = {},
+  { allowRanges = true, allowRecommendations = false } = {},
 ) {
-  // Historical v3 replay remains available, but live interpretation explicitly
-  // requires the semantic schema and cannot accept the old identifier contract.
-  const semantic = semanticOnly || !Object.hasOwn(extracted ?? {}, "decision");
-  if (!semantic && extracted?.decision === "unverified")
-    return reject("model_unverified");
   if (
     !object(document) ||
     !Array.isArray(document.messages) ||
     !object(extracted) ||
-    (!semantic && extracted.decision !== "searched_answer") ||
     !Array.isArray(extracted.answer_segments) ||
-    (!semantic && extracted.answer_segments.length < 1) ||
     extracted.answer_segments.length > MAX_SEGMENTS ||
     !Array.isArray(extracted.citations) ||
     extracted.citations.length > MAX_CITATIONS
   )
     return reject("shape_rejected");
-  if (semantic) {
-    const keys = new Set([
-      "completion",
-      "completion_evidence",
-      "search_used",
-      "search_evidence",
-      "answer_segments",
-      "citations",
-      ...(allowRecommendations ? ["recommendations"] : []),
-    ]);
-    if (
-      Object.keys(extracted).some((key) => !keys.has(key)) ||
-      !["complete", "incomplete", "unknown"].includes(extracted.completion) ||
-      !["yes", "no", "unknown"].includes(extracted.search_used) ||
-      !Array.isArray(extracted.completion_evidence) ||
-      !Array.isArray(extracted.search_evidence) ||
-      extracted.completion_evidence.length > 256 ||
-      extracted.search_evidence.length > 256
-    )
-      return reject("shape_rejected");
-    if (extracted.completion !== "complete" || extracted.search_used !== "yes")
-      return reject("model_unverified");
-    if (
-      !extracted.completion_evidence.length ||
-      !extracted.search_evidence.length
-    )
-      return reject("evidence_empty");
-  }
+  const keys = new Set([
+    "completion",
+    "completion_evidence",
+    "search_used",
+    "search_evidence",
+    "answer_segments",
+    "citations",
+    ...(allowRecommendations ? ["recommendations"] : []),
+  ]);
+  if (
+    Object.keys(extracted).some((key) => !keys.has(key)) ||
+    !["complete", "incomplete", "unknown"].includes(extracted.completion) ||
+    !["yes", "no", "unknown"].includes(extracted.search_used) ||
+    !Array.isArray(extracted.completion_evidence) ||
+    !Array.isArray(extracted.search_evidence) ||
+    extracted.completion_evidence.length > 256 ||
+    extracted.search_evidence.length > 256
+  )
+    return reject("shape_rejected");
+  if (extracted.completion !== "complete" || extracted.search_used !== "yes")
+    return reject("model_unverified");
+  if (
+    !extracted.completion_evidence.length ||
+    !extracted.search_evidence.length
+  )
+    return reject("evidence_empty");
 
   const refs = [];
   // Scalars including false/0 can be exact evidence; interpreting their meaning
@@ -270,10 +275,7 @@ function validateObservation(
   ) => {
     if (!object(candidate) || typeof candidate.path !== "string")
       return reject("path_rejected");
-    if (
-      semantic &&
-      Object.keys(candidate).some((key) => !["path", "quote"].includes(key))
-    )
+    if (Object.keys(candidate).some((key) => !["path", "quote"].includes(key)))
       return reject("shape_rejected");
     const found = pointer(document, candidate.path);
     if (!found) return reject("path_rejected");
@@ -305,42 +307,18 @@ function validateObservation(
     });
     return selected;
   };
-  let chatId, messageId, blockId;
-  if (semantic) {
-    for (const [entries, role] of [
-      [extracted.completion_evidence, "completion"],
-      [extracted.search_evidence, "search_activity"],
-    ]) {
-      for (const entry of entries)
-        if (resolve(entry, role, selectedEvidence, true) === null) return null;
-    }
-  } else {
-    const validId = (value) => typeof value === "string" && ID.test(value);
-    const resolveId = (candidate, role) =>
-      resolve(candidate, role, validId, false, "identifier_rejected");
-    chatId = resolveId(extracted.chat_id, "chat_id");
-    messageId = resolveId(extracted.message_id, "message_id");
-    const answerOwner = resolveId(extracted.answer_owner, "answer_owner");
-    const searchOwner = resolveId(extracted.search_owner, "search_owner");
-    blockId = resolveId(extracted.search_block_id, "search_block_id");
-    if (
-      !chatId ||
-      !messageId ||
-      !blockId ||
-      blockId === messageId ||
-      answerOwner !== messageId ||
-      searchOwner !== messageId ||
-      resolve(extracted.completion, "completion") === null ||
-      resolve(extracted.search_activity, "search_activity") === null
-    )
-      return reject("owner_rejected");
+  for (const [entries, role] of [
+    [extracted.completion_evidence, "completion"],
+    [extracted.search_evidence, "search_activity"],
+  ]) {
+    for (const entry of entries)
+      if (resolve(entry, role, selectedEvidence, true) === null) return null;
   }
 
   const expanded = [];
   for (const segment of extracted.answer_segments) {
     if (object(segment) && Object.hasOwn(segment, "array_path")) {
       if (
-        !semantic ||
         !allowRanges ||
         Object.keys(segment).length !== 4 ||
         !["array_path", "start_index", "end_index", "item_path"].every((key) =>
@@ -391,9 +369,6 @@ function validateObservation(
     );
     if (source === null) return null;
     const hasQuote = Object.hasOwn(segment, "quote");
-    const hasOffset =
-      Object.hasOwn(segment, "start") || Object.hasOwn(segment, "end");
-    if (hasQuote && hasOffset) return reject("answer_bounds_rejected");
     let start = 0;
     let end = source.length;
     if (hasQuote) {
@@ -403,17 +378,6 @@ function validateObservation(
       if (start < 0 || source.lastIndexOf(segment.quote) !== start)
         return reject("quote_rejected");
       end = start + segment.quote.length;
-    } else if (hasOffset) {
-      if (
-        !Number.isSafeInteger(segment.start) ||
-        !Number.isSafeInteger(segment.end) ||
-        segment.start < 0 ||
-        segment.end > source.length ||
-        segment.start >= segment.end
-      )
-        return reject("answer_bounds_rejected");
-      start = segment.start;
-      end = segment.end;
     }
     const exact = source.slice(start, end);
     if (
@@ -442,10 +406,7 @@ function validateObservation(
   const citations = [];
   for (const citation of extracted.citations) {
     if (!object(citation)) return reject("shape_rejected");
-    if (
-      semantic &&
-      Object.keys(citation).some((key) => !["url", "usage"].includes(key))
-    )
+    if (Object.keys(citation).some((key) => !["url", "usage"].includes(key)))
       return reject("shape_rejected");
     const url = resolve(
       citation.url,
@@ -457,8 +418,8 @@ function validateObservation(
     const usage = resolve(
       citation.usage,
       "citation_usage",
-      semantic ? selectedEvidence : nonempty,
-      semantic,
+      selectedEvidence,
+      true,
     );
     if (!url || usage === null) return null;
     if (!citations.includes(url)) citations.push(url);
@@ -466,9 +427,8 @@ function validateObservation(
   return {
     raw_answer: rawAnswer,
     citations,
-    ...(semantic
-      ? { completion: "complete", search_used: "yes" }
-      : { chat_id: chatId, message_id: messageId, block_id: blockId }),
+    completion: "complete",
+    search_used: "yes",
     audit: {
       method: "llm_grounded",
       refs,

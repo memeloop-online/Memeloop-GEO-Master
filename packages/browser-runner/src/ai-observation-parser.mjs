@@ -8,7 +8,7 @@ import {
   validateAiObservation,
 } from "./ai-observation-grounding.mjs";
 
-const PROMPT_VERSION = "geo.observation.extract.v4";
+const PROMPT_VERSION = "geo.observation.extract.v5";
 const MAX_INPUT_BYTES = 750_000;
 const MAX_OUTPUT_BYTES = 150_000;
 const MAX_CANDIDATE_BYTES = 150_000;
@@ -619,7 +619,6 @@ export async function interpretObservation(
     try {
       grounded = result
         ? validateAiObservation(document, result.extracted, {
-            semanticOnly: true,
             allowRecommendations: true,
           })
         : null;
@@ -635,7 +634,6 @@ export async function interpretObservation(
     if (grounded) groundingReason = "grounded";
     else if (result)
       groundingReason = observationRejectionReason(document, result.extracted, {
-        semanticOnly: true,
         allowRecommendations: true,
       });
     if (result) {
