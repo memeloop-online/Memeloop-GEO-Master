@@ -1975,3 +1975,13 @@
 - 新增 `scripts/fetch-v8-artifact.ps1`：校验 target 与每个 archive 的 SHA-256 后，仅复制到 `CARGO_HOME\.rusty_v8`。README 已记录 `gh run download` → 校验恢复 → `cargo check` 的本地开发流程。
 - 本机已验证当前锁定 `v8 150.4.0` 的 Windows archive 已落在 `I:\cargo\.rusty_v8`（约 39 MB）；本地 Cargo 可直接复用该缓存。完整 CI artifact 下载链路待下一次 GitHub Actions 成功运行后复核。
 - 加强 V8 artifact 恢复：README 现在按当前 commit 选择成功的 CI run；恢复脚本要求完整 target/V8/rustc 元数据，拒绝空清单、重复或带路径分隔符的 archive，并保留 URL 转义后的 Cargo cache 键。新增 PowerShell 回归覆盖正常恢复、Linux target、哈希篡改和路径穿越拒绝；Windows CI 在上传前从干净 Cargo home 复跑恢复脚本。当前本地 fixture 测试通过，真实 GitHub Actions 下载链路仍需成功 run 后复核。
+
+# 2026-10-26
+
+- **`packages/browser-runner` 按适配器/策略模式拆分**。`src/adapters.mjs` 原为 1,372 行的单一模块，同时承载共享结果构造器、九个平台实现与注册表字面量，新增一个平台要在一个文件里穿行 400 行以上。现改为：`src/providers/contract.mjs`（`CONNECTOR_VERSION`、`unsupported`/`unknown`/`ownIdentity`/`probeOwnAccount`/`digest`/`normalized`/`contentPayload`/`validMeasurementPayload`/`completedMeasurement` 与 `defineProvider`/`defineRegistry`）、每个平台一个 `src/providers/<provider>.mjs`、`src/providers/registry.mjs` 作为冻结映射的唯一来源；`src/adapters.mjs` 收敛为纯 re-export 门面（23 个导出名不变）。
+- 拆分按"只搬移、不改函数体"执行：九个平台的注册表键序、`Object.keys()` 顺序、`operations` 数组与冻结层级保持原样，`defineProvider` 只校验与冻结、不重建字面量。`completedZhihuReadback` 留在 zhihu 模块——它发出的是 `public_readback`/`publication_candidate` 信封，与 `completedMeasurement` 的 `official_search_observation` 属不同 schema，不应进 core。
+- **补齐该包缺失的编译检查**：新增 `scripts/check-syntax.mjs`，对 `src|test|smoke|scripts` 下全部 `.mjs` 跑 `node --check`，再在独立子进程里导入 `adapters.mjs`/`runner.mjs`/`server.mjs`，让整张模块图真正加载一次（`node --check` 看不见 import 解析，也看不见循环依赖造成的 TDZ）。接入 `pnpm check`（根脚本递归）、`pnpm --filter @memeloop-geo/browser-runner verify` 与 CI。
+- 顺带修复 `.github/workflows/interactive-desktop.yml` 指向不存在文件的两个路径过滤器（`interactive-desktop-runtime.test.mjs` → `interactive-desktop.test.mjs`），以及两处已删除的 `Dockerfile.interactive.dockerignore` 条目。
+- **新增特征测试** `test/adapter-registry-shape.test.mjs`：锁死九个平台的注册表键序、每类平台的键序与 `operations`、`Object.isFrozen` 三层、`"executeRich" in adapter === false`、`inspectMeasurementOptions` 仅 kimi/deepseek 具备、门面导出集合等于 23 个名字。此测试是后续每个搬移 PR"行为未变"的证据。
+- 验证：`pnpm --filter @memeloop-geo/browser-runner check` 通过（99 个模块 + 3 个入口）；包级 `node --test` **578/578 通过**（拆分前基线 571，新增 7 项特征测试）；另用一次性脚本把 28 个搬移函数在 `origin/main` 与拆分后的模块间逐字比对，除新增的 `export` 关键字外完全一致。`cargo check -p geo-app` 与 `cargo clippy -p geo-app` 通过；`cargo build -p geo-app` 因本地工作区正在运行、`target/debug/geo-app.exe` 被占用而无法链接，属环境占用而非代码问题。
+- 明确未做：不改任何 schema 版本、不动 `migrations/`（63 个迁移均已应用，`sqlx::migrate!` 按 SHA-384 校验和比对，删文件会让启动直接失败）、不删 `observation-extraction-prompt-v2.txt`（仍被 `crates/api/src/observation_ai_callback.rs` 的 `include_str!` 引用）、不合并三套账号探测实现、不移动 `src/deepseek-*.mjs` 那 12 个文件。
