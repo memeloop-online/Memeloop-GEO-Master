@@ -1,10 +1,14 @@
 import { Badge, Button, Card, tokens } from "@fluentui/react-components";
 import { useTranslation } from "react-i18next";
-import { isMeasurementFocus } from "../api/measurementFocus";
+import {
+  classifyBrandRecommendation,
+  isMeasurementFocus,
+} from "../api/measurementFocus";
 import type { MeasurementTarget } from "../api/projects";
 import type { RecommendationItem } from "../api/recommendations";
 import { safeOriginalPublicUrl } from "../pages/PublicationLookupPanel";
 import "../i18n/recommendationFocusComparison";
+import { RecommendationBrandAttribution } from "./RecommendationBrandAttribution";
 
 function RecommendationCard({
   item,
@@ -46,6 +50,7 @@ function RecommendationCard({
         </span>
       </div>
       <p style={{ margin: 0 }}>{item.reason || t("reasonMissing")}</p>
+      <RecommendationBrandAttribution item={item} />
       <details>
         <summary style={{ cursor: "pointer" }}>{t("evidence")}</summary>
         <blockquote
@@ -92,12 +97,18 @@ export function RecommendationFocusComparison({
   analysisPending?: boolean;
 }) {
   const { t } = useTranslation("recommendationFocusComparison");
+  const { t: focusT } = useTranslation("measurementFocus");
   const focusGroups = focusTargets
     .map((target) => ({
       target,
       matches: items.filter((item) => isMeasurementFocus(item, [target])),
+      affiliates: items.filter(
+        (item) => classifyBrandRecommendation([item], target) === "positive",
+      ),
     }))
-    .filter(({ matches }) => matches.length > 0);
+    .filter(
+      ({ matches, affiliates }) => matches.length > 0 || affiliates.length > 0,
+    );
   if (!focusTargets.length || !items.length) return null;
   if (!focusGroups.length) {
     return (
@@ -129,10 +140,10 @@ export function RecommendationFocusComparison({
     >
       <h5 style={{ margin: 0 }}>{t("title")}</h5>
       <p style={{ margin: 0 }}>{t("scope")}</p>
-      {focusGroups.map(({ target: focus, matches }) => {
+      {focusGroups.map(({ target: focus, matches, affiliates }) => {
         const key = JSON.stringify([focus.kind, focus.name]);
         const ambiguous = new Set(matches.map((item) => item.rank)).size > 1;
-        const rank = matches[0].rank;
+        const rank = matches[0]?.rank ?? null;
         const ahead =
           !ambiguous && rank !== null
             ? items
@@ -160,6 +171,8 @@ export function RecommendationFocusComparison({
                 kind: t(`kind_${focus.kind}`),
               })}
             </h6>
+            {focus.kind === "brand" && <strong>{focusT("brandDirect")}</strong>}
+            {!matches.length && <p>{focusT("brandDirectAbsent")}</p>}
             {matches.map((item, index) => (
               <RecommendationCard
                 key={index}
@@ -169,7 +182,7 @@ export function RecommendationFocusComparison({
                 analysisPending={analysisPending}
               />
             ))}
-            {ambiguous ? (
+            {matches.length === 0 ? null : ambiguous ? (
               <p style={{ margin: 0 }}>{t("ambiguous")}</p>
             ) : rank === null ? (
               <p style={{ margin: 0 }}>{t("cannotCompare")}</p>
@@ -189,6 +202,25 @@ export function RecommendationFocusComparison({
               </>
             ) : (
               <p style={{ margin: 0 }}>{t("noneAhead")}</p>
+            )}
+            {affiliates.length > 0 && (
+              <section
+                aria-label={focusT("brandAffiliateTitle")}
+                style={{ display: "grid", gap: 8 }}
+              >
+                <h6 style={{ margin: 0, fontSize: "inherit" }}>
+                  {focusT("brandAffiliateTitle")}
+                </h6>
+                {affiliates.map((item, index) => (
+                  <RecommendationCard
+                    key={index}
+                    item={item}
+                    showKind
+                    onAnalyze={onAnalyze}
+                    analysisPending={analysisPending}
+                  />
+                ))}
+              </section>
             )}
           </section>
         );

@@ -22,9 +22,10 @@ const item: RecommendationItem = {
   reason: "Portable",
   evidence_quote: "A portable lamp.",
   citation_urls: [],
+  brand_attribution: null,
 };
 const recommendations = (items: RecommendationItem[], status = "verified") => ({
-  version: "geo.recommendations.v1",
+  version: "geo.recommendations.v2",
   status,
   items,
 });

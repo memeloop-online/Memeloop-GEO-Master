@@ -96,7 +96,7 @@ function sample(
       },
     },
     recommendations: {
-      version: "geo.recommendations.v1",
+      version: "geo.recommendations.v2",
       status: "verified",
       items: [
         {
@@ -107,6 +107,7 @@ function sample(
           reason: null,
           evidence_quote: "Sample lamp is a useful camping choice.",
           citation_urls: [],
+          brand_attribution: null,
         },
       ],
     },

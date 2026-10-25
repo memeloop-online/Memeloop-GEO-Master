@@ -34,10 +34,11 @@ const item = {
   reason: "Quiet operation",
   evidence_quote: "Second choice: Sample purifier for quiet operation.",
   citation_urls: [],
+  brand_attribution: null,
 };
 
 const recommendations = (items: unknown[], status = "verified") => ({
-  version: "geo.recommendations.v1",
+  version: "geo.recommendations.v2",
   status,
   items,
 });
@@ -522,7 +523,7 @@ describe("recommendation rank history", () => {
     ).toHaveTextContent("未出现在推荐结果中");
     expect(
       summary.getByRole("region", { name: `${item.name} · 品牌` }),
-    ).toHaveTextContent("未出现在推荐结果中");
+    ).toHaveTextContent("未直接推荐品牌");
     expect(
       summary.queryByText(/排名上升|排名下降|排名持平/),
     ).not.toBeInTheDocument();

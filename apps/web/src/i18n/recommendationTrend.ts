@@ -43,6 +43,8 @@ const translations = {
     order: "出现顺序：{{value}}",
     unranked: "未明确排名",
     absent: "未出现在推荐结果中",
+    affiliateOnly: "推荐了旗下产品，未直接推荐品牌",
+    directBrandAbsent: "未直接推荐品牌",
     notAnalyzed: "推荐结果尚未分析",
     unverified: "推荐结果暂不可用",
     noEntities: "可用结果中未发现具体推荐对象。",
@@ -106,6 +108,9 @@ const translations = {
     order: "Mention order: {{value}}",
     unranked: "No explicit rank",
     absent: "Absent from the recommendation results",
+    affiliateOnly:
+      "Affiliated products recommended; no direct brand recommendation",
+    directBrandAbsent: "No direct brand recommendation",
     notAnalyzed: "Recommendations not analyzed yet",
     unverified: "Recommendation results unavailable",
     noEntities: "No specific recommendations found in available results.",

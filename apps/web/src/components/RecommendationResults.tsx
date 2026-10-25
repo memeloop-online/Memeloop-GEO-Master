@@ -10,12 +10,20 @@ import {
 import { useTranslation } from "react-i18next";
 import type { ReactNode } from "react";
 import { decodeVerifiedRecommendations } from "../api/recommendations";
-import { isMeasurementFocus } from "../api/measurementFocus";
+import {
+  classifyBrandRecommendation,
+  isMeasurementFocus,
+  summarizeBrandRecommendations,
+} from "../api/measurementFocus";
 import type { MeasurementTarget } from "../api/projects";
 import { safeOriginalPublicUrl } from "../pages/PublicationLookupPanel";
 import "../i18n/observationAnalysis";
 import "../i18n/measurementFocus";
 import { RecommendationFocusComparison } from "./RecommendationFocusComparison";
+import {
+  RecommendationBrandAttribution,
+  RecommendationBrandSummary,
+} from "./RecommendationBrandAttribution";
 
 function FullRecommendationList({
   collapsed,
@@ -53,14 +61,39 @@ export function RecommendationResults({
   const noFocusMatch =
     focusTargets.length > 0 &&
     items.length > 0 &&
-    !items.some((item) => isMeasurementFocus(item, focusTargets));
+    !items.some((item) => isMeasurementFocus(item, focusTargets)) &&
+    !focusTargets.some(
+      (target) => classifyBrandRecommendation(items, target) === "positive",
+    );
   return (
     <section aria-label={t("recommendationsTitle")}>
       <h5>{t("recommendationsTitle")}</h5>
       {decoded !== null &&
         focusTargets
+          .filter((target) => target.kind === "brand")
+          .map((target) => (
+            <div key={JSON.stringify([target.kind, target.name])}>
+              <strong>{focusT("resultTitle", { name: target.name })}</strong>
+              <p>{focusT("brandDirect")}</p>
+              {!items.some((item) => isMeasurementFocus(item, [target])) && (
+                <p>
+                  {focusT(
+                    classifyBrandRecommendation(items, target) === "positive"
+                      ? "brandAffiliatePresent"
+                      : "brandDirectAbsent",
+                  )}
+                </p>
+              )}
+              <RecommendationBrandSummary
+                summary={summarizeBrandRecommendations([items], target)}
+              />
+            </div>
+          ))}
+      {decoded !== null &&
+        focusTargets
           .filter(
             (target) =>
+              target.kind !== "brand" &&
               !items.some((item) => isMeasurementFocus(item, [target])),
           )
           .map((target) => (
@@ -121,6 +154,7 @@ export function RecommendationResults({
                     <TableCell>{item.mention_order}</TableCell>
                     <TableCell>
                       <p>{item.reason || t("recommendationReasonMissing")}</p>
+                      <RecommendationBrandAttribution item={item} />
                       <details>
                         <summary>{t("recommendationEvidence")}</summary>
                         <blockquote style={{ whiteSpace: "pre-wrap" }}>

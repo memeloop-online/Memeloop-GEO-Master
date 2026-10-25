@@ -26,9 +26,10 @@ const item = {
   reason: "Quiet operation",
   evidence_quote: "Second choice: Sample purifier for quiet operation.",
   citation_urls: ["https://example.test/review"],
+  brand_attribution: null,
 };
 const result = (items: unknown[], status = "verified") => ({
-  version: "geo.recommendations.v1",
+  version: "geo.recommendations.v2",
   status,
   items,
 });

@@ -661,7 +661,7 @@ describe("cycle-free measurement report", () => {
         target_id: targetId,
         attempt_id: attemptId,
         recommendations: {
-          version: "geo.recommendations.v1",
+          version: "geo.recommendations.v2",
           status: "verified",
           items: [
             {
@@ -672,6 +672,7 @@ describe("cycle-free measurement report", () => {
               reason,
               evidence_quote: reason,
               citation_urls: ["https://example.test/source"],
+              brand_attribution: null,
             },
           ],
         },
@@ -792,6 +793,7 @@ describe("cycle-free measurement report", () => {
         reason: "Saved recommendation reason.",
         evidence_quote: "Saved excerpt.",
         citation_urls: [],
+        brand_attribution: null,
       };
       const input = {
         ...preview,
@@ -800,7 +802,7 @@ describe("cycle-free measurement report", () => {
             ...preview.samples[0],
             target_id: selectedTargetId,
             recommendations: {
-              version: "geo.recommendations.v1",
+              version: "geo.recommendations.v2",
               status: "verified",
               items: [item],
             },
@@ -817,7 +819,7 @@ describe("cycle-free measurement report", () => {
                 {
                   ...input.samples[0],
                   recommendations: {
-                    version: "geo.recommendations.v1",
+                    version: "geo.recommendations.v2",
                     status: "verified",
                     items:
                       state === "renamed"
@@ -847,7 +849,7 @@ describe("cycle-free measurement report", () => {
           ...preview.samples[0],
           target_id: selectedTargetId,
           recommendations: {
-            version: "geo.recommendations.v1",
+            version: "geo.recommendations.v2",
             status: "verified",
             items: [
               {
@@ -858,6 +860,7 @@ describe("cycle-free measurement report", () => {
                 reason: "Saved alternative reason.",
                 evidence_quote: "Saved alternative excerpt.",
                 citation_urls: [],
+                brand_attribution: null,
               },
             ],
           },
@@ -1203,7 +1206,7 @@ describe("cycle-free measurement report", () => {
         {
           ...preview.samples[0],
           recommendations: {
-            version: "geo.recommendations.v1",
+            version: "geo.recommendations.v2",
             status: "verified",
             items: [
               {
@@ -1214,6 +1217,7 @@ describe("cycle-free measurement report", () => {
                 reason: "Compact enough for a backpack",
                 evidence_quote: "Trail light is compact.",
                 citation_urls: [],
+                brand_attribution: null,
               },
             ],
           },
@@ -1450,7 +1454,7 @@ describe("cycle-free measurement report", () => {
         {
           ...preview.samples[0],
           recommendations: {
-            version: "geo.recommendations.v1",
+            version: "geo.recommendations.v2",
             status: "verified",
             items: [
               {
@@ -1464,6 +1468,7 @@ describe("cycle-free measurement report", () => {
                   "https://example.org/review",
                   "javascript:alert(1)",
                 ],
+                brand_attribution: null,
               },
             ],
           },
@@ -1536,7 +1541,7 @@ describe("cycle-free measurement report", () => {
         {
           ...preview.samples[0],
           recommendations: {
-            version: "geo.recommendations.v1",
+            version: "geo.recommendations.v2",
             status: "pending",
             items: [{ name: "Unverified product" }],
           },
@@ -2089,7 +2094,7 @@ describe("platform comparison report integration", () => {
     async (alreadySaved) => {
       focus.name = "Example lamp";
       const recommendation = {
-        version: "geo.recommendations.v1",
+        version: "geo.recommendations.v2",
         status: "verified",
         items: [
           {
@@ -2100,6 +2105,7 @@ describe("platform comparison report integration", () => {
             reason: "Portable",
             evidence_quote: "Portable lamp",
             citation_urls: [],
+            brand_attribution: null,
           },
         ],
       };

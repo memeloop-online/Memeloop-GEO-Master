@@ -33,6 +33,17 @@ const translations = {
     conflict: "项目信息已更新，请重新打开修改。",
     comparison: "对比对象：{{names}}",
     focused: "关注对象",
+    brandAffiliateTitle: "旗下产品获推荐",
+    brandCounts:
+      "旗下产品获推荐 {{positive}} 份回答 · 可判定 {{known}} 份 · 归属不确定 {{unknown}} 份 · 有效回答 {{valid}} 份",
+    brandCountsBasis:
+      "每份有效回答计一次。推荐了旗下产品即可判定；没有产品推荐也可判定为未推荐旗下产品。产品排名不计为品牌排名。",
+    brandAttribution: "所属品牌：{{name}}",
+    brandAttributionEvidence: "查看品牌归属原文",
+    brandAttributionUnknown: "产品所属品牌不确定",
+    brandDirect: "品牌直接推荐",
+    brandDirectAbsent: "本次没有品牌直接推荐",
+    brandAffiliatePresent: "本次推荐了旗下产品，未直接推荐品牌",
     resultTitle: "{{name}}的推荐表现",
     ranked: "推荐第 {{rank}} 位",
     unranked: "已推荐，未明确排名",
@@ -71,6 +82,18 @@ const translations = {
     conflict: "Project details have changed. Reopen the editor to continue.",
     comparison: "Compare with: {{names}}",
     focused: "Your target",
+    brandAffiliateTitle: "Affiliated products recommended",
+    brandCounts:
+      "Answers recommending affiliated products: {{positive}} · Can be determined: {{known}} · Uncertain attribution: {{unknown}} · Valid answers: {{valid}}",
+    brandCountsBasis:
+      "Each valid answer counts once. An affiliated product makes the answer determinate; answers without products count as no affiliated recommendation. Product ranks are not brand ranks.",
+    brandAttribution: "Brand: {{name}}",
+    brandAttributionEvidence: "View brand attribution excerpt",
+    brandAttributionUnknown: "Product brand attribution is unknown",
+    brandDirect: "Direct brand recommendations",
+    brandDirectAbsent: "No direct brand recommendation in this answer",
+    brandAffiliatePresent:
+      "Affiliated products recommended; no direct brand recommendation",
     resultTitle: "Recommendations for {{name}}",
     ranked: "Recommended at #{{rank}}",
     unranked: "Recommended without an explicit rank",

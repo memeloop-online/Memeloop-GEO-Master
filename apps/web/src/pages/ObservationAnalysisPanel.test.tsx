@@ -302,7 +302,7 @@ describe("saved response analysis", () => {
             citations: [],
             audit: {
               recommendations: {
-                version: "geo.recommendations.v1",
+                version: "geo.recommendations.v2",
                 status: "verified",
                 items: [
                   {
@@ -313,6 +313,7 @@ describe("saved response analysis", () => {
                     reason: null,
                     evidence_quote: "Try Sample restaurant for lunch.",
                     citation_urls: [],
+                    brand_attribution: null,
                   },
                 ],
               },

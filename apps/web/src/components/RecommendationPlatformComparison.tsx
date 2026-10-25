@@ -10,6 +10,8 @@ import {
 } from "./recommendationComparison";
 import "../i18n/recommendationPlatformComparison";
 import "./RecommendationPlatformComparison.css";
+import { RecommendationBrandSummary } from "./RecommendationBrandAttribution";
+import "../i18n/measurementFocus";
 
 /** Read-only comparison of the report's selected evidence and current viewing target. */
 export function RecommendationPlatformComparison({
@@ -28,6 +30,7 @@ export function RecommendationPlatformComparison({
   timezone?: string;
 }) {
   const { t, i18n } = useTranslation("recommendationPlatformComparison");
+  const { t: focusT } = useTranslation("measurementFocus");
   const targetKey = (target: MeasurementTarget) =>
     JSON.stringify([target.kind, target.name.trim()]);
   const locale = i18n.resolvedLanguage || i18n.language;
@@ -134,7 +137,14 @@ export function RecommendationPlatformComparison({
                     <thead>
                       <tr>
                         <th scope="col">{t("conditions")}</th>
-                        <th scope="col">{t("recommendationRate")}</th>
+                        <th scope="col">
+                          {target.kind === "brand"
+                            ? focusT("brandDirect")
+                            : t("recommendationRate")}
+                        </th>
+                        {target.kind === "brand" && (
+                          <th scope="col">{focusT("brandAffiliateTitle")}</th>
+                        )}
                         <th scope="col">{t("firstPlace")}</th>
                         <th scope="col">{t("distribution")}</th>
                         <th scope="col">{t("observedTimes")}</th>
@@ -204,6 +214,13 @@ export function RecommendationPlatformComparison({
                                 })}
                               </p>
                             </td>
+                            {target.kind === "brand" && (
+                              <td>
+                                <RecommendationBrandSummary
+                                  summary={frequency.brandSummary}
+                                />
+                              </td>
+                            )}
                             <td>
                               {frequency.ranked
                                 ? rate(
