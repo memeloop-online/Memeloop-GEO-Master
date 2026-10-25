@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { chromium } from "playwright";
-import { adapters as defaultAdapters } from "./adapters.mjs";
+import { adapters as defaultAdapters } from "./providers/registry.mjs";
 import { parseExtractionJson } from "./ai-observation-parser.mjs";
 import { createLinuxDesktopRuntime } from "./interactive-desktop.mjs";
 import { cleanupDiagnostic } from "./provider-conversation-cleanup.mjs";

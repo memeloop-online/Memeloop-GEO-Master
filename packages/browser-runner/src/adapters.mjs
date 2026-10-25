@@ -1,18 +1,9 @@
-// Adapter facade and registry.
+// Adapter facade.
 //
 // Every provider lives in ./providers/<provider>.mjs beside the shared
-// ./providers/contract.mjs. This module keeps the historical export surface
-// and the frozen `adapters` map so existing callers and tests stay unchanged.
-import { baiduCreatorAdapter } from "./providers/baidu-creator.mjs";
-import { deepseekAdapter } from "./providers/deepseek.mjs";
-import { doubaoAdapter } from "./providers/doubao.mjs";
-import { glmAdapter } from "./providers/glm.mjs";
-import { kimiAdapter } from "./providers/kimi.mjs";
-import { qianwenAdapter } from "./providers/qianwen.mjs";
-import { xiaohongshuAdapter } from "./providers/xiaohongshu.mjs";
-import { yuanbaoAdapter } from "./providers/yuanbao.mjs";
-import { zhihuAdapter } from "./providers/zhihu.mjs";
-
+// ./providers/contract.mjs, and the frozen provider map lives in
+// ./providers/registry.mjs. This module only re-exports, so existing callers
+// and tests keep working without importing provider internals.
 export {
   glmIdentity,
   deepseekIdentity,
@@ -24,6 +15,7 @@ export {
   probeQianwenAccount,
 } from "./consumer-web-identity.mjs";
 export { CONNECTOR_VERSION, probeOwnAccount } from "./providers/contract.mjs";
+export { adapters } from "./providers/registry.mjs";
 export { baiduIdentity, publishBaidu } from "./providers/baidu-creator.mjs";
 export { measureDeepseek } from "./providers/deepseek.mjs";
 export {
@@ -39,15 +31,3 @@ export {
   readbackZhihu,
   zhihuIdentity,
 } from "./providers/zhihu.mjs";
-
-export const adapters = Object.freeze({
-  zhihu: zhihuAdapter,
-  baidu_creator: baiduCreatorAdapter,
-  xiaohongshu: xiaohongshuAdapter,
-  kimi: kimiAdapter,
-  glm: glmAdapter,
-  deepseek: deepseekAdapter,
-  doubao: doubaoAdapter,
-  qianwen: qianwenAdapter,
-  yuanbao: yuanbaoAdapter,
-});
