@@ -118,6 +118,54 @@ impl BrowserBridge {
         Self::response(response).await
     }
 
+    /// Subset the fixed report font without creating a browser session.
+    /// Unicode scalar validation belongs to the font utility at the runner.
+    pub(crate) async fn font_subset(
+        &self,
+        codepoints: Vec<serde_json::Number>,
+    ) -> Result<Vec<u8>, AppError> {
+        let unavailable =
+            || AppError::new(ErrorCode::DependencyUnavailable, "PDF font unavailable");
+        let mut response = self
+            .client
+            .post(format!("{}/v1/font-subset", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "codepoints": codepoints }))
+            .send()
+            .await
+            .map_err(|_| unavailable())?;
+        if response.status() == StatusCode::BAD_REQUEST {
+            return Err(AppError::invalid_request("invalid PDF font codepoints"));
+        }
+        if !response.status().is_success()
+            || response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                != Some("font/otf")
+        {
+            return Err(unavailable());
+        }
+        const MAX_FONT_BYTES: usize = 32 * 1024 * 1024;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_FONT_BYTES as u64)
+        {
+            return Err(unavailable());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| unavailable())? {
+            if bytes.len().saturating_add(chunk.len()) > MAX_FONT_BYTES {
+                return Err(unavailable());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.is_empty() {
+            return Err(unavailable());
+        }
+        Ok(bytes)
+    }
+
     pub fn new(base_url: String, token: String) -> Result<Self, AppError> {
         let url = reqwest::Url::parse(&base_url)
             .map_err(|_| AppError::invalid_request("invalid browser runner configuration"))?;

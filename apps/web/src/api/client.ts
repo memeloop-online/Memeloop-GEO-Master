@@ -217,18 +217,29 @@ export async function apiFetchBlob(
     projectId,
     signal,
     accept = "image/png, image/jpeg, image/webp",
+    method = "GET",
+    body,
   }: Pick<ApiRequestOptions, "tenantId" | "projectId" | "signal"> & {
     accept?: string;
+    /** Read-only binary transformations accept JSON with the session CSRF token. */
+    method?: "GET" | "POST";
+    body?: unknown;
   } = {},
 ): Promise<Blob> {
   const generation = getAuthGeneration();
+  const headers: Record<string, string> = { Accept: accept };
+  if (method === "POST") {
+    headers["Content-Type"] = "application/json";
+    if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
+  }
   let response: Response;
   try {
     response = await fetch(apiRequestUrl(path, { tenantId, projectId }), {
-      method: "GET",
-      headers: { Accept: accept },
+      method,
+      headers,
       credentials: "same-origin",
       signal,
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
   } catch (error) {
     throw new ApiError(

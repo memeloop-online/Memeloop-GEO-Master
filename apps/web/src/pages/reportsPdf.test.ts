@@ -1,14 +1,16 @@
-import { readFileSync } from "node:fs";
 import fontkit from "@pdf-lib/fontkit";
 import { PDFDocument, PDFPage } from "pdf-lib";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReportSnapshot } from "../api/reports";
+import { setCsrfToken } from "../api/client";
 import { buildReportPdf, downloadReportPdf, wrapPdfText } from "./reportsPdf";
 import { reportSnapshotCsv } from "./reportsCsv";
 
-const fontBytes = new Uint8Array(
-  readFileSync("src/assets/fonts/NotoSansCJKsc-Regular.otf"),
-);
+import {
+  fullFontBytes as fontBytes,
+  subsetFontResponse,
+  NodeBlob,
+} from "./pdfFontSubsetTestHelper";
 
 function snapshot(): ReportSnapshot {
   const unavailable = {
@@ -79,7 +81,12 @@ function snapshot(): ReportSnapshot {
 }
 
 describe("report PDF", () => {
+  beforeEach(() => {
+    vi.stubGlobal("Blob", NodeBlob);
+    vi.stubGlobal("fetch", vi.fn(subsetFontResponse));
+  });
   afterEach(() => {
+    setCsrfToken(undefined);
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -140,7 +147,6 @@ describe("report PDF", () => {
     expect(actual).toEqual(canonical);
   });
 
-  // Real 16 MiB font embedding needs a longer limit when the full suite runs in parallel.
   it("embeds a Chinese-capable font into valid multipage A4 PDF with snapshot metadata", async () => {
     const report = snapshot();
     const drawn = vi.spyOn(PDFPage.prototype, "drawText");
@@ -187,7 +193,7 @@ describe("report PDF", () => {
         },
       },
     ];
-    const bytes = await buildReportPdf(report, fontBytes);
+    const bytes = await buildReportPdf(report);
     const text = drawn.mock.calls.map(([value]) => value).join("\n");
     expect(text).toContain("问题用途：优化");
     expect(text).toContain("问题用途：冻结评估（不进入优化）");
@@ -214,19 +220,19 @@ describe("report PDF", () => {
   }, 15_000);
 
   it("fails safely if font bytes are missing", async () => {
-    await expect(buildReportPdf(snapshot(), new Uint8Array())).rejects.toThrow(
-      "中文字库不可用",
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(new Uint8Array())),
     );
+    await expect(buildReportPdf(snapshot())).rejects.toThrow("中文字库不可用");
   });
 
   it("downloads only the selected snapshot's PDF and revokes its object URL", async () => {
+    setCsrfToken("synthetic-csrf-token");
     const objectUrl = "blob:report-test";
     const created = vi.fn((_blob: Blob) => objectUrl);
     const revoked = vi.fn();
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response(fontBytes, { status: 200 })),
-    );
+    vi.stubGlobal("fetch", vi.fn(subsetFontResponse));
     vi.stubGlobal(
       "URL",
       Object.assign(URL, {
@@ -241,15 +247,22 @@ describe("report PDF", () => {
         expect(this.href).toBe(objectUrl);
       });
     await downloadReportPdf(snapshot());
+    expect(fetch).toHaveBeenCalledOnce();
     expect(fetch).toHaveBeenCalledWith(
-      new URL("../assets/fonts/NotoSansCJKsc-Regular.otf", import.meta.url)
-        .href,
-      {
+      "/api/v1/pdf/font-subset",
+      expect.objectContaining({
+        method: "POST",
         credentials: "same-origin",
-        signal: undefined,
-      },
+        body: expect.any(String),
+      }),
     );
     expect(created).toHaveBeenCalledOnce();
+    const [, request] = vi.mocked(fetch).mock.calls[0];
+    const headers = new Headers(request?.headers);
+    expect(headers.get("Accept")).toBe("font/otf");
+    expect(headers.get("Content-Type")).toBe("application/json");
+    expect(headers.get("X-CSRF-Token")).toBe("synthetic-csrf-token");
+    expect(headers.has("Idempotency-Key")).toBe(false);
     expect(created.mock.calls[0][0]).toMatchObject({ type: "application/pdf" });
     expect(click).toHaveBeenCalledOnce();
     expect(revoked).toHaveBeenCalledWith(objectUrl);
@@ -263,6 +276,47 @@ describe("report PDF", () => {
       downloadReportPdf(snapshot(), { signal: controller.signal }),
     ).rejects.toMatchObject({ name: "AbortError" });
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("captures the selected snapshot and filename before the subset response arrives", async () => {
+    let release!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url, init) => {
+        await ready;
+        return subsetFontResponse(url, init);
+      }),
+    );
+    vi.stubGlobal(
+      "URL",
+      Object.assign(URL, {
+        createObjectURL: vi.fn(() => "blob:captured-report"),
+        revokeObjectURL: vi.fn(),
+      }),
+    );
+    const drawn = vi.spyOn(PDFPage.prototype, "drawText");
+    const filenames: string[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      filenames.push(this.download);
+    });
+    const selected = snapshot();
+    const pending = downloadReportPdf(selected);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    selected.report_id = "mutated-report";
+    selected.revision = 99;
+    selected.evidence[0].summary = "MUTATED_AFTER_CAPTURE";
+    release();
+    await pending;
+    const text = drawn.mock.calls.map(([value]) => value).join("\n");
+    expect(text).toContain("不可变周报 · 修订 2");
+    expect(text).toContain("来源证据：原始文档缺失。");
+    expect(text).not.toContain("MUTATED_AFTER_CAPTURE");
+    expect(filenames).toEqual(["report-report-1-r2.pdf"]);
   });
 
   it("does not download if selection changes during the font request", async () => {
@@ -281,6 +335,7 @@ describe("report PDF", () => {
     const pending = downloadReportPdf(snapshot(), {
       signal: controller.signal,
     });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
     controller.abort();
     resolveFetch(new Response(fontBytes, { status: 200 }));
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
