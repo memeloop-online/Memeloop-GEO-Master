@@ -331,7 +331,10 @@ test("completion recovery rejects changed IDs, later/incomplete history and acco
 
 test("completion recovery validates canonical scope before any provider read", async () => {
   assert.equal(providerCompletionRecoveryAdapter("__proto__"), null);
-  assert.equal(providerCompletionRecoveryAdapter("kimi"), null);
+  assert.equal(
+    typeof providerCompletionRecoveryAdapter("kimi")?.read,
+    "function",
+  );
   await fixture(async ({ runner, calls }) => {
     for (const patch of [
       { request_message_id: "01" },
@@ -368,7 +371,7 @@ test("unsupported recovery capability is retained through the authenticated HTTP
       try {
         const request = {
           ...input(),
-          expected_identity: { provider: "kimi", platform_account_id: account },
+          expected_identity: { provider: "glm", platform_account_id: account },
         };
         const response = await fetch(
           `http://127.0.0.1:${server.address().port}/v1/sessions/session/recover-conversation-completion`,
@@ -399,7 +402,7 @@ test("unsupported recovery capability is retained through the authenticated HTTP
         await new Promise((resolve) => server.close(resolve));
       }
     },
-    { platform: "kimi" },
+    { platform: "glm" },
   );
 });
 

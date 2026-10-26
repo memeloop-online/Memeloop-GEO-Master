@@ -111,3 +111,95 @@ export function capturedConversationCompletion(exchange) {
       }
     : null;
 }
+
+// Recovery reads the exact first task captured on a newly created chat. The
+// saved transport supplies every message identity; history cannot invent an
+// owner or include a later user turn in that task's deletion inventory.
+export function kimiRecoveryBinding(source, conversationId) {
+  if (capturedNewConversationId(source) !== conversationId) return null;
+  const messages = new Map();
+  let precedingChat = null;
+  for (const envelope of source.messages) {
+    if (envelope.chat != null) precedingChat = envelope.chat.id;
+    if (envelope.message == null) continue;
+    const message = envelope.message;
+    if (
+      precedingChat !== conversationId ||
+      typeof message !== "object" ||
+      Array.isArray(message) ||
+      typeof message.id !== "string" ||
+      !CHAT_ID.test(message.id)
+    )
+      return null;
+    let role = messages.get(message.id);
+    if (Object.hasOwn(message, "role")) {
+      const observed = ["assistant", 3].includes(message.role)
+        ? "assistant"
+        : ["user", 2].includes(message.role)
+          ? "user"
+          : message.role === "system"
+            ? "system"
+            : null;
+      if (!observed || (role && role !== observed)) return null;
+      role = observed;
+    }
+    messages.set(message.id, role);
+  }
+  const inventory = [...messages].sort(([left], [right]) =>
+    left < right ? -1 : left > right ? 1 : 0,
+  );
+  return inventory.length <= 256 &&
+    inventory.every(([, role]) => role) &&
+    inventory.filter(([, role]) => role === "user").length === 1 &&
+    inventory.some(([, role]) => role === "assistant")
+    ? { message_inventory: inventory }
+    : null;
+}
+
+export function recoveredKimiCompletion(binding, history, conversationId) {
+  if (
+    !binding ||
+    history?.status !== "recovered" ||
+    history.external_conversation_id !== conversationId ||
+    history.chat?.chat?.id !== conversationId ||
+    !Array.isArray(history.message_pages) ||
+    history.message_pages.length === 0
+  )
+    return null;
+  const expected = new Map(binding.message_inventory);
+  const seen = new Set();
+  for (const page of history.message_pages) {
+    if (!Array.isArray(page?.messages)) return null;
+    for (const message of page.messages) {
+      const role = ["assistant", 3].includes(message?.role)
+        ? "assistant"
+        : ["user", 2].includes(message?.role)
+          ? "user"
+          : message?.role === "system"
+            ? "system"
+            : null;
+      if (
+        !role ||
+        seen.has(message.id) ||
+        expected.get(message.id) !== role ||
+        (message.chat_id !== undefined && message.chat_id !== conversationId) ||
+        (role === "assistant" &&
+          !["COMPLETED", "MESSAGE_STATUS_COMPLETED", 2].includes(
+            message.status,
+          )) ||
+        (role === "system" &&
+          ![
+            "COMPLETED",
+            "MESSAGE_STATUS_COMPLETED",
+            2,
+            "MESSAGE_STATUS_UNSPECIFIED",
+          ].includes(message.status))
+      )
+        return null;
+      seen.add(message.id);
+    }
+  }
+  return seen.size === expected.size
+    ? { outcome: "complete", message_inventory: binding.message_inventory }
+    : null;
+}

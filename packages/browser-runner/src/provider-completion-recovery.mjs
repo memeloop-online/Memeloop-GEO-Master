@@ -3,6 +3,11 @@ import {
   deepSeekRecoveryBinding,
   recoveredDeepSeekCompletion,
 } from "./deepseek-conversation-evidence.mjs";
+import { recoverKimiConversation } from "./provider-conversation-cleanup.mjs";
+import {
+  kimiRecoveryBinding,
+  recoveredKimiCompletion,
+} from "./kimi-conversation-evidence.mjs";
 
 function savedDeepSeekSource(input) {
   try {
@@ -38,6 +43,54 @@ function savedDeepSeekSource(input) {
 }
 
 const providers = Object.freeze({
+  kimi: Object.freeze({
+    async read(page, input, options = {}) {
+      let source;
+      try {
+        source = JSON.parse(input.source_json);
+      } catch {
+        options.onFailureReason?.("source_ineligible");
+        return null;
+      }
+      const binding = kimiRecoveryBinding(
+        source,
+        input.external_conversation_id,
+      );
+      if (!binding) {
+        options.onFailureReason?.("source_ineligible");
+        return null;
+      }
+      const history = await recoverKimiConversation(page, {
+        expectedUserId: input.expected_identity.platform_account_id,
+        chatId: input.external_conversation_id,
+        timeoutMs: options.timeoutMs,
+      });
+      const completion = recoveredKimiCompletion(
+        binding,
+        history,
+        input.external_conversation_id,
+      );
+      if (!completion) {
+        options.onFailureReason?.(
+          history.reason === "transport_unknown"
+            ? "transport_unavailable"
+            : "inventory_unverified",
+        );
+        return null;
+      }
+      const observed_at = new Date().toISOString();
+      return {
+        completion,
+        observed_at,
+        history_json: JSON.stringify({
+          source: "browser_observed_history",
+          observed_at,
+          chat: history.chat,
+          message_pages: history.message_pages,
+        }),
+      };
+    },
+  }),
   deepseek: Object.freeze({
     async read(page, input, options = {}) {
       const source = savedDeepSeekSource(input);

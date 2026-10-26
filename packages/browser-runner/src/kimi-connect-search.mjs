@@ -408,7 +408,6 @@ export async function observeKimiConnectSearch(
     trustedOrigin = ORIGIN,
     timeoutMs = 30_000,
     deadlineAt,
-    sourceDeadlineAt,
     signal,
     interpret = interpretObservation,
     apiExtract,
@@ -461,7 +460,11 @@ export async function observeKimiConnectSearch(
     const composer = page.locator(
       '[role="textbox"][contenteditable="true"].chat-input-editor',
     );
-    const captureDeadlineAt = sourceDeadlineAt ?? deadlineAt;
+    // Capture can use the task's remaining time; the receipt reserve already
+    // bounds interpretation and persistence. Do not cut an active answer at
+    // the earlier source-phase estimate.
+    const captureDeadlineAt =
+      deadlineAt === undefined ? undefined : deadlineAt - 10_000;
     const readinessRemaining =
       captureDeadlineAt === undefined
         ? timeoutMs
@@ -527,7 +530,7 @@ export async function observeKimiConnectSearch(
       const remaining = captureDeadlineAt - performance.now();
       if (!Number.isFinite(remaining) || remaining <= 0)
         return unverified("budget_exhausted");
-      timeoutMs = Math.min(120_000, Math.max(1, Math.floor(remaining)));
+      timeoutMs = Math.max(1, Math.floor(remaining));
     }
     if (signal?.aborted) return unverified();
     stage = "capture";
