@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { getEventListeners } from "node:events";
+import { EventEmitter, getEventListeners } from "node:events";
+import { setImmediate } from "node:timers/promises";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import { chromium } from "playwright";
@@ -231,7 +232,7 @@ test("unknown adapter evidence keeps safe stage diagnostics without successful o
   );
 });
 
-test("a source budget consumed by configuration cannot fill the composer", async () => {
+test("task capture time consumed by configuration cannot fill the composer", async () => {
   const page = configurationPage();
   let fills = 0;
   page.locator = () => ({
@@ -257,8 +258,7 @@ test("a source budget consumed by configuration cannot fill the composer", async
   const diagnostics = [];
   assert.equal(
     await observeKimiConnectSearch(page, frozen, {
-      sourceDeadlineAt: performance.now() + 50,
-      deadlineAt: performance.now() + 10_000,
+      deadlineAt: performance.now() + 10_050,
       onDiagnostic: (entry) => diagnostics.push(entry),
     }),
     null,
@@ -336,6 +336,61 @@ const exchange = {
   started_at: "2026-01-01T00:00:00.000Z",
   received_at: "2026-01-01T00:00:01.000Z",
 };
+
+test("active capture can finish beyond the source estimate within the task deadline", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  const page = Object.assign(new EventEmitter(), configurationPage());
+  const origin = "http://127.0.0.1:12345";
+  page.url = () => origin;
+  page.locator = (selector) =>
+    selector === ".send-button-container"
+      ? {
+          getAttribute: async () => "",
+          click: async () => {
+            setTimeout(
+              () =>
+                page.emit("response", {
+                  url: () =>
+                    origin + "/apiv2/kimi.gateway.chat.v1.ChatService/Chat",
+                  status: () => 200,
+                  headers: () => ({
+                    "content-type": "application/connect+json",
+                  }),
+                  request: () => ({
+                    method: () => "POST",
+                    headers: () => ({
+                      "content-type": "application/connect+json",
+                    }),
+                    postDataBuffer: () => frame(0, request),
+                  }),
+                  body: async () =>
+                    Buffer.concat([
+                      ...messages.map((value) => frame(0, value)),
+                      frame(2, {}),
+                    ]),
+                }),
+              130_000,
+            );
+          },
+        }
+      : {
+          waitFor: async () => {},
+          isVisible: async () => true,
+          fill: async () => {},
+        };
+  const result = observeKimiConnectSearch(page, frozen, {
+    trustedOrigin: origin,
+    deadlineAt: 240_000,
+    timeoutMs: 120_000,
+  });
+  await setImmediate();
+  now = 130_000;
+  t.mock.timers.tick(130_000);
+  await setImmediate();
+  assert.equal((await result)?.raw_answer, "An answer.");
+});
 
 test("reduces one searched completed assistant message and cited chunks only", () => {
   const found = reduceKimiConnectExchange(exchange, {
@@ -662,14 +717,13 @@ test("loading-shell readiness is bounded and never fills or sends after timeout 
       assert.equal(sends, 0);
     };
     await t.test(
-      "source deadline expires while the shell stays unready",
+      "task capture deadline expires while the shell stays unready",
       async () => {
         const diagnostics = [];
         assert.equal(
           await observeKimiConnectSearch(page, frozen, {
             trustedOrigin,
-            sourceDeadlineAt: performance.now() + 250,
-            deadlineAt: performance.now() + 10_000,
+            deadlineAt: performance.now() + 10_250,
             onDiagnostic: (entry) => diagnostics.push(entry),
           }),
           null,
@@ -705,7 +759,7 @@ test("loading-shell readiness is bounded and never fills or sends after timeout 
         const listeners = getEventListeners(controller.signal, "abort").length;
         const observing = observeKimiConnectSearch(page, frozen, {
           trustedOrigin,
-          deadlineAt: performance.now() + 10_000,
+          deadlineAt: performance.now() + 20_000,
           signal: controller.signal,
           onDiagnostic: (entry) => diagnostics.push(entry),
         });
@@ -737,7 +791,6 @@ test("loading-shell readiness is bounded and never fills or sends after timeout 
         readinessDelayMs = 5_200;
         const observed = await observeKimiConnectSearch(page, frozen, {
           trustedOrigin,
-          sourceDeadlineAt: performance.now() + 12_000,
         });
         assert.equal(observed?.raw_answer, "An answer.");
         assert.equal(sends, 1);
@@ -995,7 +1048,7 @@ test("browser UI submits exactly once and its captured framed request creates v2
     const afterDefaultCapture = await observeKimiConnectSearch(page, frozen, {
       trustedOrigin: origin,
       timeoutMs: 10,
-      deadlineAt: performance.now() + 6_000,
+      deadlineAt: performance.now() + 16_000,
     });
     assert.equal(afterDefaultCapture?.raw_answer, "An answer.");
     assert.equal(sends, 3, "the runner's remaining budget bounds capture");
@@ -1037,7 +1090,7 @@ test("browser UI submits exactly once and its captured framed request creates v2
     assert.equal(
       await observeKimiConnectSearch(page, frozen, {
         trustedOrigin: origin,
-        deadlineAt: performance.now() + 1_000,
+        deadlineAt: performance.now() + 11_000,
         onDiagnostic: (entry) => captureDiagnostics.push(entry),
         onEvidence: async (record) => partialEvidence.push(record),
         onConversationCaptured: async (receipt) => {
@@ -1070,7 +1123,7 @@ test("browser UI submits exactly once and its captured framed request creates v2
     assert.equal(
       await observeKimiConnectSearch(page, frozen, {
         trustedOrigin: origin,
-        deadlineAt: performance.now() + 6_000,
+        deadlineAt: performance.now() + 16_000,
         signal: abortOnRequest.signal,
       }),
       null,
