@@ -162,6 +162,9 @@ importers:
       eventsource-parser:
         specifier: 3.1.1
         version: 3.1.1
+      harfbuzzjs:
+        specifier: 1.6.4
+        version: 1.6.4
       playwright:
         specifier: 1.63.0
         version: 1.63.0
@@ -169,6 +172,9 @@ importers:
         specifier: 8.21.3
         version: 8.21.3
     devDependencies:
+      '@pdf-lib/fontkit':
+        specifier: 1.1.1
+        version: 1.1.1
       esbuild:
         specifier: 0.25.12
         version: 0.25.12
@@ -2737,6 +2743,9 @@ packages:
   get-nonce@1.0.1:
     resolution: {integrity: sha512-FJhYRoDaiatfEkUK8HKlicmu/3SGFD51q3itKDGoSTysQJBnfOcxU5GxnhE1E6soB76MbT0MBtnKJuXyAx+96Q==}
     engines: {node: '>=6'}
+
+  harfbuzzjs@1.6.4:
+    resolution: {integrity: sha512-T/PyfhVt1gGR2Tkf5KJUj1DQFkVBXHw552lS1iLEEDhV1Lukb3eq1pk2ov85kgbT2YUiZtJBTak9w+M7YgzUEQ==}
 
   hasown@2.0.4:
     resolution: {integrity: sha512-T2UbfbBEF32wiepXIsMlTW9+dDYC6wMh/t/vYA4tuOMKqWz/n3vr1NFSxQiyP+zk2mXsoMA/i/7qV6LKut1t1A==}
@@ -6863,6 +6872,8 @@ snapshots:
   gensync@1.0.0-beta.2: {}
 
   get-nonce@1.0.1: {}
+
+  harfbuzzjs@1.6.4: {}
 
   hasown@2.0.4:
     dependencies:
