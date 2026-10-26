@@ -8,6 +8,7 @@ pub(crate) mod observation_capture_callback;
 pub(crate) mod observation_completion_recovery;
 pub(crate) mod observation_evidence;
 pub(crate) mod observation_extraction;
+pub(crate) mod pdf_font;
 pub(crate) mod project_serp_settings;
 pub(crate) mod questions;
 pub(crate) mod questions_tools;

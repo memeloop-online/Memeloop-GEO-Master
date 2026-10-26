@@ -1,9 +1,14 @@
 import { createServer } from "node:http";
 import { timingSafeEqual } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import WebSocket, { WebSocketServer } from "ws";
 import { createRunner, RunnerError } from "./runner.mjs";
 import { readRichMultipart } from "./rich-transport.mjs";
+import {
+  createPdfFontSubsetter,
+  PdfFontSubsetInputError,
+} from "./pdf-font-subset.mjs";
 import {
   groundSavedObservation,
   prepareSavedObservation,
@@ -13,6 +18,8 @@ import {
 const CALLBACK_PATH = "/internal/v1/publication-send/authorize";
 const CAPTURE_PATH = "/internal/v1/observation-captures";
 const CLEANUP_PATH = "/internal/v1/provider-conversation-cleanup/authorize";
+const FONT_SUBSET_BODY_BYTES = 8 * 1024 * 1024;
+let configuredFontSubsetter;
 
 function serviceCallback(
   origin,
@@ -112,7 +119,7 @@ function authorized(header, token) {
 async function readJson(request, maxBytes = 1024 * 1024) {
   const chunks = [];
   let size = 0;
-  for await (const chunk of request) {
+  for await (const chunk of request.iterator({ destroyOnReturn: false })) {
     size += chunk.length;
     if (size > maxBytes) throw new RunnerError(413, "payload_too_large");
     chunks.push(chunk);
@@ -142,9 +149,20 @@ export function createRunnerServer({
     callbackOrigin,
   captureToken = process.env.GEO_BROWSER_RUNNER_CAPTURE_TOKEN ?? callbackToken,
   onPolicyTiming = (entry) => console.info(JSON.stringify(entry)),
+  subsetPdfFont,
 } = {}) {
   if (!token || typeof token !== "string")
     throw new Error("GEO_BROWSER_RUNNER_TOKEN_required");
+  // Load one approved, packaged font at service startup. Font paths and bytes
+  // are not request fields; a failed initialization makes this route unavailable.
+  const fontSubsetter =
+    subsetPdfFont === undefined
+      ? (configuredFontSubsetter ??= readFile(
+          new URL("../assets/fonts/NotoSansCJKsc-Regular.otf", import.meta.url),
+        )
+          .then((fontBytes) => createPdfFontSubsetter({ fontBytes }))
+          .catch(() => null))
+      : Promise.resolve(subsetPdfFont);
   const authorizeRich = serviceCallback(
     callbackOrigin,
     callbackToken,
@@ -190,7 +208,39 @@ export function createRunnerServer({
       }
       const path = new URL(request.url, "http://localhost").pathname;
       const parts = path.split("/").filter(Boolean);
-      if (request.method === "GET" && path === "/v1/capabilities") {
+      if (request.method === "POST" && path === "/v1/font-subset") {
+        const controller = new AbortController();
+        const abort = () => controller.abort();
+        response.once("close", abort);
+        try {
+          const body = await readJson(request, FONT_SUBSET_BODY_BYTES);
+          const subset = await fontSubsetter;
+          if (!subset) throw new Error("font_subset_unavailable");
+          const bytes = await subset({
+            codepoints: body?.codepoints,
+            signal: controller.signal,
+          });
+          if (controller.signal.aborted) return;
+          response.writeHead(200, {
+            "content-type": "font/otf",
+            "content-length": bytes.byteLength,
+            "cache-control": "no-store",
+            "x-content-type-options": "nosniff",
+          });
+          response.end(bytes);
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          if (error instanceof PdfFontSubsetInputError) {
+            send(response, 400, { error: "invalid_codepoints" });
+          } else if (error instanceof RunnerError) {
+            send(response, error.status, { error: error.code });
+          } else {
+            send(response, 503, { error: "font_subset_unavailable" });
+          }
+        } finally {
+          response.off("close", abort);
+        }
+      } else if (request.method === "GET" && path === "/v1/capabilities") {
         send(response, 200, runner.capabilities());
       } else if (request.method === "GET" && path === "/v1/lifecycle") {
         send(response, 200, runner.lifecycle());

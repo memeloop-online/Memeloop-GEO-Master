@@ -1,5 +1,78 @@
 import fontkit from "@pdf-lib/fontkit";
 import { PDFDocument, rgb, type PDFFont, type PDFPage } from "pdf-lib";
+import { apiFetchBlob } from "../api/client";
+
+type PdfTextOptions = {
+  size?: number;
+  indent?: number;
+  gap?: number;
+  muted?: boolean;
+};
+
+type PdfTextOperation =
+  | { kind: "text"; value: string; options: PdfTextOptions }
+  | { kind: "heading"; value: string };
+
+/** Capture formatted text once, before asking for only its required glyphs. */
+export class PdfTextPlan {
+  private readonly operations: PdfTextOperation[] = [];
+
+  constructor(
+    private readonly footer: (page: number, total: number) => string,
+    private readonly signal?: AbortSignal,
+    private readonly preferWordBoundaries = false,
+  ) {}
+
+  text(value: string, options: PdfTextOptions = {}): void {
+    this.signal?.throwIfAborted();
+    this.operations.push({ kind: "text", value, options: { ...options } });
+  }
+
+  heading(value: string): void {
+    this.signal?.throwIfAborted();
+    this.operations.push({ kind: "heading", value });
+  }
+
+  codepoints(): number[] {
+    // Include fontkit's synthesized dotted circle, printable fallback notation
+    // and every footer digit, grouping character and actual revision.
+    const characters = new Set<number>();
+    for (const value of [
+      "[U+0123456789ABCDEF]中\u25CC",
+      this.footer(1234567890, 1234567890),
+      ...this.operations.map((operation) => operation.value),
+    ]) {
+      // Fontkit composes characters such as Hangul algorithmically. Keep both
+      // forms' glyphs while replaying the original evidence string unchanged.
+      for (const form of [value, value.normalize("NFC")]) {
+        for (const character of form) {
+          const codepoint = character.codePointAt(0)!;
+          // Malformed source strings still use printable's U+ fallback in PDF.
+          if (codepoint < 0xd800 || codepoint > 0xdfff)
+            characters.add(codepoint);
+        }
+      }
+    }
+    return [...characters].sort((a, b) => a - b);
+  }
+
+  async replay(document: PDFDocument, font: PDFFont): Promise<void> {
+    const layout = new PdfLayout(
+      document,
+      font,
+      this.footer,
+      this.signal,
+      this.preferWordBoundaries,
+    );
+    for (const [index, operation] of this.operations.entries()) {
+      await yieldToBrowser(index, this.signal);
+      if (operation.kind === "heading") layout.heading(operation.value);
+      else layout.text(operation.value, operation.options);
+    }
+    this.signal?.throwIfAborted();
+    layout.finish();
+  }
+}
 
 const PAGE_WIDTH = 595.28; // A4 in PDF points
 const PAGE_HEIGHT = 841.89;
@@ -104,15 +177,7 @@ export class PdfLayout {
     });
   }
 
-  text(
-    value: string,
-    options: {
-      size?: number;
-      indent?: number;
-      gap?: number;
-      muted?: boolean;
-    } = {},
-  ): void {
+  text(value: string, options: PdfTextOptions = {}): void {
     this.signal?.throwIfAborted();
     const size = options.size ?? 9;
     const indent = options.indent ?? 0;
@@ -193,7 +258,7 @@ export type PdfFontErrors = {
   incomplete: string;
 };
 
-/** Both report families embed the same full CJK font and preserve ASCII IDs. */
+/** Embed a library-generated CJK subset while preserving ASCII evidence IDs. */
 export async function createPdfDocument(
   fontBytes: Uint8Array,
   errors: PdfFontErrors,
@@ -202,8 +267,8 @@ export async function createPdfDocument(
   const document = await PDFDocument.create();
   document.registerFontkit(fontkit);
   try {
-    // CFF subsetting loses Chinese outlines in PDFBox; localized digits lose
-    // searchable ASCII IDs in pdf-lib's ToUnicode table.
+    // HarfBuzz has already subset the CFF font. pdf-lib's own CFF subsetting
+    // loses Chinese outlines; locl loses searchable ASCII evidence IDs.
     const font = await document.embedFont(fontBytes, {
       subset: false,
       features: { locl: false },
@@ -218,21 +283,19 @@ export async function createPdfDocument(
 }
 
 export async function loadPdfFont(
+  codepoints: number[],
   errors: PdfFontErrors,
   signal?: AbortSignal,
 ): Promise<Uint8Array> {
   signal?.throwIfAborted();
-  let response: Response;
+  let blob: Blob;
   try {
-    response = await fetch(
-      new URL("../assets/fonts/NotoSansCJKsc-Regular.otf", import.meta.url)
-        .href,
-      {
-        credentials: "same-origin",
-        signal,
-      },
-    );
-    if (!response.ok) throw new Error("Font unavailable");
+    blob = await apiFetchBlob("/pdf/font-subset", {
+      method: "POST",
+      body: { codepoints },
+      accept: "font/otf",
+      signal,
+    });
   } catch (error) {
     signal?.throwIfAborted();
     if (error instanceof DOMException && error.name === "AbortError")
@@ -241,7 +304,7 @@ export async function loadPdfFont(
   }
   signal?.throwIfAborted();
   try {
-    const bytes = new Uint8Array(await response.arrayBuffer());
+    const bytes = new Uint8Array(await blob.arrayBuffer());
     signal?.throwIfAborted();
     return bytes;
   } catch {

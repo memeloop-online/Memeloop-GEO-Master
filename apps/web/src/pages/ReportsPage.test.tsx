@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -238,6 +246,11 @@ function renderPage(
     </FluentProvider>,
   );
 }
+
+beforeAll(async () => {
+  // Load the real lazy route before timing report availability assertions.
+  await import("./ReportsPage");
+});
 
 beforeEach(async () => {
   await i18n.changeLanguage("zh-CN");

@@ -12,7 +12,7 @@ import {
   type MeasurementReportExportInput,
 } from "./measurementReportExport";
 import {
-  PdfLayout,
+  PdfTextPlan,
   createPdfDocument,
   loadPdfFont,
   downloadPdfBytes,
@@ -47,26 +47,11 @@ export async function buildMeasurementReportPdf(
     download: t("fontDownload"),
     incomplete: t("fontIncomplete"),
   };
-  const fontBytes = await loadPdfFont(errors, signal);
-  signal?.throwIfAborted();
-  const { document, font } = await createPdfDocument(fontBytes, errors);
-  signal?.throwIfAborted();
   const saved = report.kind === "measurement_period";
   const identity = saved
     ? `${report.report_id} · ${number.format(report.revision)}`
     : t("unsaved_preview");
-  document.setTitle(`${t("title")} · ${identity}`);
-  document.setSubject(t("scope"));
-  document.setCreator("GEO");
-  document.setProducer("GEO PDF export");
-  const generated = new Date(report.generated_at);
-  if (Number.isFinite(generated.getTime())) {
-    document.setCreationDate(generated);
-    document.setModificationDate(generated);
-  }
-  const layout = new PdfLayout(
-    document,
-    font,
+  const layout = new PdfTextPlan(
     (page, total) =>
       t(saved ? "footerSaved" : "footerPreview", {
         page: number.format(page),
@@ -461,7 +446,20 @@ export async function buildMeasurementReportPdf(
   stored("coverage", report.coverage);
   stored("question", view.question);
   stored("target", view.target);
-  layout.finish();
+  const fontBytes = await loadPdfFont(layout.codepoints(), errors, signal);
+  signal?.throwIfAborted();
+  const { document, font } = await createPdfDocument(fontBytes, errors);
+  signal?.throwIfAborted();
+  document.setTitle(`${t("title")} · ${identity}`);
+  document.setSubject(t("scope"));
+  document.setCreator("GEO");
+  document.setProducer("GEO PDF export");
+  const generated = new Date(report.generated_at);
+  if (Number.isFinite(generated.getTime())) {
+    document.setCreationDate(generated);
+    document.setModificationDate(generated);
+  }
+  await layout.replay(document, font);
   try {
     signal?.throwIfAborted();
     const bytes = await document.save();

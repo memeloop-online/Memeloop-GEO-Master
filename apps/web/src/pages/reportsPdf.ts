@@ -1,6 +1,5 @@
-import type { PDFDocument, PDFFont } from "pdf-lib";
 import {
-  PdfLayout,
+  PdfTextPlan,
   createPdfDocument,
   loadPdfFont,
   downloadPdfBytes,
@@ -43,16 +42,9 @@ const fontErrors = {
   incomplete: "报告中文字库下载不完整，请检查网络后重试。",
 };
 
-class Layout extends PdfLayout {
-  constructor(
-    document: PDFDocument,
-    font: PDFFont,
-    snapshot: ReportSnapshot,
-    signal?: AbortSignal,
-  ) {
+class Layout extends PdfTextPlan {
+  constructor(snapshot: ReportSnapshot, signal?: AbortSignal) {
     super(
-      document,
-      font,
       (page, total) =>
         `不可变周报 · 修订 ${snapshot.revision} · ${page} / ${total}`,
       signal,
@@ -80,25 +72,15 @@ class Layout extends PdfLayout {
   }
 }
 
-/** Build solely from the selected immutable snapshot; no API calls or writes. */
+/** Format the selected immutable snapshot; only font glyphs use a read-only API. */
 export async function buildReportPdf(
-  snapshot: ReportSnapshot,
-  fontBytes: Uint8Array,
-  signal?: AbortSignal,
+  input: ReportSnapshot,
+  options: { signal?: AbortSignal } = {},
 ): Promise<Uint8Array> {
+  const { signal } = options;
   signal?.throwIfAborted();
-  const { document, font } = await createPdfDocument(fontBytes, fontErrors);
-  document.setTitle(`周报 ${snapshot.report_id} 修订 ${snapshot.revision}`);
-  document.setSubject("不可变报告快照；无商业费用和下一轮动作数据");
-  document.setCreator("GEO");
-  document.setProducer("GEO PDF export");
-  const generated = new Date(snapshot.generated_at);
-  if (!Number.isNaN(generated.getTime())) {
-    document.setCreationDate(generated);
-    document.setModificationDate(generated);
-  }
-
-  const layout = new Layout(document, font, snapshot, signal);
+  const snapshot = structuredClone(input);
+  const layout = new Layout(snapshot, signal);
   const at = (value: string | null) =>
     localTime(value, snapshot.report_timezone);
   layout.text("每周报告 · 不可变快照", { size: 19, gap: 12 });
@@ -262,7 +244,20 @@ export async function buildReportPdf(
     layout.field("摘要", item.summary);
     layout.text("", { gap: 5 });
   }
-  layout.finish();
+  const fontBytes = await loadPdfFont(layout.codepoints(), fontErrors, signal);
+  signal?.throwIfAborted();
+  const { document, font } = await createPdfDocument(fontBytes, fontErrors);
+  document.setTitle(`周报 ${snapshot.report_id} 修订 ${snapshot.revision}`);
+  document.setSubject("不可变报告快照；无商业费用和下一轮动作数据");
+  document.setCreator("GEO");
+  document.setProducer("GEO PDF export");
+  const generated = new Date(snapshot.generated_at);
+  if (!Number.isNaN(generated.getTime())) {
+    document.setCreationDate(generated);
+    document.setModificationDate(generated);
+  }
+
+  await layout.replay(document, font);
   try {
     signal?.throwIfAborted();
     const bytes = await document.save();
@@ -280,11 +275,11 @@ export async function downloadReportPdf(
   options: { signal?: AbortSignal } = {},
 ): Promise<void> {
   options.signal?.throwIfAborted();
-  const fontBytes = await loadPdfFont(fontErrors, options.signal);
-  const bytes = await buildReportPdf(snapshot, fontBytes, options.signal);
+  const captured = structuredClone(snapshot);
+  const bytes = await buildReportPdf(captured, options);
   downloadPdfBytes(
     bytes,
-    `report-${snapshot.report_id}-r${snapshot.revision}.pdf`,
+    `report-${captured.report_id}-r${captured.revision}.pdf`,
     options.signal,
   );
 }

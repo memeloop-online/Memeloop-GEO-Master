@@ -24,6 +24,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
 COPY src ./src
+COPY assets ./assets
 COPY smoke ./smoke
 COPY THIRD_PARTY_NOTICES.md ./THIRD_PARTY_NOTICES.md
 COPY RICH_EDITOR_NOTICES.md ./RICH_EDITOR_NOTICES.md

@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { PDFDocument, PDFPage } from "pdf-lib";
 import Papa from "papaparse";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -18,9 +17,11 @@ import {
   downloadMeasurementReportPdf,
 } from "./measurementReportsPdf";
 
-const fontBytes = new Uint8Array(
-  readFileSync("src/assets/fonts/NotoSansCJKsc-Regular.otf"),
-);
+import {
+  fullFontBytes as fontBytes,
+  subsetFontResponse,
+  NodeBlob,
+} from "./pdfFontSubsetTestHelper";
 const item = (
   rank: number | null = 1,
   patch: Partial<RecommendationItem> = {},
@@ -116,12 +117,10 @@ const input = (
   locale: "en",
 });
 
-beforeEach(() =>
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async () => new Response(fontBytes, { status: 200 })),
-  ),
-);
+beforeEach(() => {
+  vi.stubGlobal("Blob", NodeBlob);
+  vi.stubGlobal("fetch", vi.fn(subsetFontResponse));
+});
 afterEach(async () => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -245,14 +244,15 @@ describe("independent measurement PDF", () => {
       expect(JSON.stringify(request)).toBe(before);
       expect(fetch).toHaveBeenCalledTimes(1);
       expect(fetch).toHaveBeenCalledWith(
-        new URL("../assets/fonts/NotoSansCJKsc-Regular.otf", import.meta.url)
-          .href,
-        {
+        "/api/v1/pdf/font-subset",
+        expect.objectContaining({
+          method: "POST",
           credentials: "same-origin",
-          signal: undefined,
-        },
+          body: expect.any(String),
+        }),
       );
       expect(bytes.byteLength).toBeGreaterThan(10_000);
+      expect(bytes.byteLength).toBeLessThan(500_000);
     },
     20_000,
   );
@@ -387,7 +387,7 @@ describe("independent measurement PDF", () => {
           {
             observation: {
               ...report.samples[0].observation!,
-              raw_answer: `${"中文长原文，".repeat(1200)}${"opaque-key".repeat(180)}\nEND_OF_LAST_EVIDENCE_4960\u{1F9EA}`,
+              raw_answer: `${"中文长原文，".repeat(1200)}${"opaque-key".repeat(180)}\nEND_OF_LAST_EVIDENCE_4960\u{1F9EA}\uD800`,
               provenance: {
                 revision_id: "synthetic-analysis",
                 source: { kind: "capture", capture_id: "synthetic-capture" },
@@ -418,7 +418,20 @@ describe("independent measurement PDF", () => {
       );
       expect(text).toContain("Original brand relationship 品牌原句");
       expect(text).toContain(labels.brand_attribution_not_recorded);
-      expect(text).toContain("END_OF_LAST_EVIDENCE_4960[U+1F9EA]");
+      expect(text).toContain("END_OF_LAST_EVIDENCE_4960[U+1F9EA][U+D800]");
+      const [, fontRequest] = vi.mocked(fetch).mock.calls[0];
+      const { codepoints } = JSON.parse(String(fontRequest?.body)) as {
+        codepoints: number[];
+      };
+      expect(codepoints).not.toContain(0xd800);
+      expect(
+        [...text].every(
+          (character) =>
+            character === "\n" ||
+            codepoints.includes(character.codePointAt(0)!),
+        ),
+      ).toBe(true);
+      expect(bytes.byteLength).toBeLessThan(500_000);
       expect(text).toContain("synthetic-analysis-model");
       expect(text).toContain("2025-12-01T00:00:00Z");
       const pdf = await PDFDocument.load(bytes);
@@ -458,7 +471,9 @@ describe("independent measurement PDF", () => {
     request.locale = "zh-CN";
     request.report.samples[0].observation!.raw_answer = "MUTATED_AFTER_CAPTURE";
     await i18n.changeLanguage("zh-CN");
-    resolve(new Response(fontBytes, { status: 200 }));
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    const [url, init] = vi.mocked(fetch).mock.calls[0];
+    resolve(await subsetFontResponse(url, init));
     await pending;
     const text = drawn.mock.calls.map(([value]) => value).join("\n");
     expect(text).toContain("Results at a glance");
@@ -666,7 +681,12 @@ describe("independent measurement PDF", () => {
   it("reports font failures in the captured locale without creating a download", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => new Response("unavailable", { status: 404 })),
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ message: "unavailable" }), {
+            status: 404,
+          }),
+      ),
     );
     await expect(buildMeasurementReportPdf(input())).rejects.toThrow(
       "The report font could not be downloaded",

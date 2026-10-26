@@ -2594,6 +2594,15 @@ pub fn router(state: AppState) -> Router {
         .merge(auth_session_routes)
         .layer(middleware::from_fn(no_store_middleware));
 
+    // Font generation is transient and also serves unsaved reports and read-only
+    // members. Session identity and CSRF suffice; no business write scope applies.
+    let pdf_font_routes: Router<AppState> = Router::new()
+        .route("/pdf/font-subset", post(measurement::pdf_font::subset))
+        .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
+        .layer(middleware::from_fn(csrf_origin_from_request))
+        .layer(middleware::from_fn(session_auth_from_request))
+        .layer(middleware::from_fn(no_store_middleware));
+
     let publication_callback =
         publication_send_callback::routes(state.publication_send_callback.clone());
     let observation_callback =
@@ -2611,6 +2620,7 @@ pub fn router(state: AppState) -> Router {
                 .route("/openapi.json", get(openapi_json))
                 .merge(appearance::routes())
                 .merge(auth_routes)
+                .merge(pdf_font_routes)
                 .merge(estimate_routes)
                 .merge(start_routes)
                 .merge(report_routes)
