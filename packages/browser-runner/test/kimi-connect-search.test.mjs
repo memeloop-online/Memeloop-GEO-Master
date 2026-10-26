@@ -409,7 +409,7 @@ function frame(flag, data) {
   return Buffer.concat([header, bytes]);
 }
 
-test("framed UI request must preserve frozen question, model, fresh chat and explicit search tool", () => {
+test("framed UI request binds the frozen task independently of provider tool configuration", () => {
   const clientRequest = (body) => ({
     postDataBuffer: () => frame(0, body),
     headers: () => ({ "content-type": "application/connect+json" }),
@@ -423,15 +423,17 @@ test("framed UI request must preserve frozen question, model, fresh chat and exp
     ...request,
     tools: [
       { type: "TOOL_TYPE_SEARCH", search: { force: false } },
-      { type: "TOOL_TYPE_CRON_JOB" },
+      { type: "TOOL_TYPE_ASK_USER" },
     ],
   };
   assert.equal(
     matchesKimiChatRequest(clientRequest(currentClient), QUESTION, MODEL),
     true,
-    "the observed current UI includes a scheduling tool beside explicit search",
+    "tool settings do not establish whether the response used search",
   );
   for (const tools of [
+    undefined,
+    [],
     [{ type: "TOOL_TYPE_SEARCH", search: {} }],
     [
       { type: "TOOL_TYPE_SEARCH", search: { force: true } },
@@ -456,14 +458,24 @@ test("framed UI request must preserve frozen question, model, fresh chat and exp
         QUESTION,
         MODEL,
       ),
-      false,
-      "unobserved or unsafe tool combinations remain unverified",
+      true,
+      "tool settings do not alter ownership of the exact frozen task",
     );
   }
   for (const wrong of [
     { ...request, chat_id: "existing-chat" },
-    { ...request, tools: [] },
-    { ...request, tools: [{ type: "SEARCH", search: { force: true } }] },
+    {
+      ...request,
+      options: { model: MODEL },
+      message: { role: "assistant", blocks: request.message.blocks },
+    },
+    {
+      ...request,
+      message: {
+        ...request.message,
+        blocks: [{ text: { content: QUESTION + " changed" } }],
+      },
+    },
     { ...request, options: { model: "other" } },
     {
       ...request,
@@ -834,6 +846,65 @@ test("search configuration selects exact bilingual title prefixes with descripti
     }
   } finally {
     await browser.close();
+  }
+});
+
+test("agent UI requests capture the exact task with optional provider tools", async () => {
+  let tools;
+  let sends = 0;
+  const server = createServer((incoming, reply) => {
+    if (incoming.url === "/") {
+      reply.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      reply.end(
+        pageHtml
+          .replace(
+            'data-model-family="plain-chat"',
+            'data-model-family="agent"',
+          )
+          .replace(
+            'enabled ? [{ type: "SEARCH", search: {} }] : []',
+            JSON.stringify(tools) ?? "undefined",
+          ),
+      );
+    } else if (
+      incoming.method === "POST" &&
+      incoming.url === "/apiv2/kimi.gateway.chat.v1.ChatService/Chat"
+    ) {
+      sends += 1;
+      reply.writeHead(200, { "content-type": "application/connect+json" });
+      for (const message of messages) reply.write(frame(0, message));
+      reply.end(frame(2, {}));
+    } else reply.writeHead(404).end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      executablePath: process.env.GEO_TEST_CHROMIUM_PATH,
+    });
+    const page = await browser.newPage();
+    for (tools of [
+      undefined,
+      [
+        { type: "TOOL_TYPE_SEARCH", search: { force: false } },
+        { type: "TOOL_TYPE_ASK_USER" },
+      ],
+    ]) {
+      const result = await observeKimiConnectSearch(page, frozen, {
+        trustedOrigin: `http://127.0.0.1:${server.address().port}`,
+        timeoutMs: 5_000,
+      });
+      assert.equal(result?.raw_answer, "An answer.");
+    }
+    assert.equal(
+      sends,
+      2,
+      "each independent local fixture submits exactly once",
+    );
+  } finally {
+    await browser?.close();
+    await new Promise((resolve) => server.close(resolve));
   }
 });
 

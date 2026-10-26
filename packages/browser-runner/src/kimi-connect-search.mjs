@@ -43,18 +43,8 @@ function requestBody(request, question, model) {
     const body = JSON.parse(
       new TextDecoder("utf-8", { fatal: true }).decode(post.subarray(5)),
     );
-    // The current client includes its scheduling tool alongside the search
-    // tool. This is still only request intent: the response must independently
-    // prove an actual search, answer ownership, completion and citations.
-    const search =
-      body?.tools?.length === 1 && body.tools[0]?.type === "SEARCH"
-        ? body.tools[0].search
-        : body?.tools?.length === 2 &&
-            body.tools[0]?.type === "TOOL_TYPE_SEARCH" &&
-            body.tools[1]?.type === "TOOL_TYPE_CRON_JOB" &&
-            !Object.hasOwn(body.tools[1], "search")
-          ? body.tools[0].search
-          : null;
+    // Correlate this browser-owned task, not the provider's changing tool
+    // configuration. Actual search use is established from the response.
     if (
       !object(body) ||
       body.options?.model !== model ||
@@ -62,9 +52,6 @@ function requestBody(request, question, model) {
       body.message.blocks.length !== 1 ||
       !["user", 2].includes(body.message.role) ||
       body.message.blocks[0]?.text?.content !== question ||
-      !Array.isArray(body.tools) ||
-      !object(search) ||
-      (search.force !== undefined && search.force !== false) ||
       (body.chat_id !== undefined && body.chat_id !== "")
     ) {
       return null;
