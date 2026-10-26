@@ -1,0 +1,21 @@
+{
+  "sourceFontSha256": "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b",
+  "generatedBy": "fontTools 4.62.0: reverse best cmap for encoded outputs of reachable default GSUB lookups, including contextual lookup references",
+  "featureTags": ["ccmp", "liga", "calt", "rlig", "clig"],
+  "reachableLookupIndices": [2, 3, 4, 5, 30, 32, 50, 51],
+  "aliasCount": 129,
+  "codepointRanges": [
+    [4442, 4446],
+    [4515, 4519],
+    [4588, 4588],
+    [4591, 4591],
+    [4593, 4593],
+    [4602, 4607],
+    [11834, 11835],
+    [12337, 12338],
+    [43360, 43388],
+    [55216, 55238],
+    [55243, 55291],
+    [64256, 64260]
+  ]
+}
