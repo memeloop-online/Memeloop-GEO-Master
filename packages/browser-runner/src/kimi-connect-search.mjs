@@ -366,7 +366,17 @@ export async function configureKimiSearch(
       chosen = option;
     }
     if (!chosen) return "requested_model_unavailable";
-    await chosen.click({ timeout: 5_000 });
+    const family = await chosen.getAttribute("data-model-family");
+    if ((await chosen.getAttribute("aria-checked")) !== "true")
+      await chosen.click({ timeout: 5_000 });
+    if (family === "agent") {
+      // Agent models choose when to search and expose no search switch. This
+      // permits automatic search; the captured answer must still prove usage.
+      // Browser extraction cannot promise search is disabled for this family.
+      await page.keyboard.press("Escape");
+      return searchEnabled;
+    }
+    if (family !== "plain-chat") return false;
     stage = "config_toolkit";
     const toolkit = page.getByTestId("toolkit-trigger-btn");
     await toolkit.click({ timeout: 5_000 });
