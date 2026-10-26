@@ -83,7 +83,11 @@ async function pipeline(t, { preferBrowser = false, holdSource } = {}) {
       ? {
           first: () => ({ waitFor: async () => {} }),
           all: async () => [
-            { getAttribute: async () => MODEL, click: async () => {} },
+            {
+              getAttribute: async (name) =>
+                name === "data-model-family" ? "plain-chat" : MODEL,
+              click: async () => {},
+            },
           ],
         }
       : { click: async () => {} };

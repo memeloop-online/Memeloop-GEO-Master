@@ -38,7 +38,11 @@ const frozen = {
   sample_ordinal: 0,
 };
 
-function configurationPage(failedStage, error, { failReadback = false } = {}) {
+function configurationPage(
+  failedStage,
+  error,
+  { failReadback = false, family = "plain-chat", selected = false } = {},
+) {
   let reads = 0;
   const click = (stage) => async (options) => {
     assert.equal(options.timeout, 5_000);
@@ -63,7 +67,12 @@ function configurationPage(failedStage, error, { failReadback = false } = {}) {
         }),
         all: async () => [
           {
-            getAttribute: async () => MODEL,
+            getAttribute: async (name) =>
+              name === "data-model-family"
+                ? family
+                : name === "aria-checked"
+                  ? String(selected)
+                  : MODEL,
             click: click("config_model_selection"),
           },
         ],
@@ -120,6 +129,41 @@ test("configuration errors retain only fixed menu stage and error class", async 
       ]);
     }
   }
+});
+
+test("agent models permit automatic search without opening a missing switch", async () => {
+  for (const searchEnabled of [true, false]) {
+    const page = configurationPage(
+      "config_toolkit",
+      new Error("UnexpectedToolkit"),
+      {
+        family: "agent",
+      },
+    );
+    assert.equal(
+      await configureKimiSearch(page, MODEL, searchEnabled),
+      searchEnabled,
+    );
+  }
+});
+
+test("selected agent models do not click an already active option", async () => {
+  const page = configurationPage(
+    "config_model_selection",
+    new Error("UnexpectedSelection"),
+    {
+      family: "agent",
+      selected: true,
+    },
+  );
+  assert.equal(await configureKimiSearch(page, MODEL), true);
+});
+
+test("unknown model families do not claim a configured search setting", async () => {
+  const page = configurationPage(undefined, undefined, {
+    family: "unrecognized",
+  });
+  assert.equal(await configureKimiSearch(page, MODEL), false);
 });
 
 test("configuration readback retains false return and emits safe timeout diagnostic", async () => {
@@ -519,7 +563,7 @@ test("multiple search rounds are valid only when every block belongs to the same
 
 const pageHtml = `<!doctype html><html><body>
 <button data-testid="model-select-trigger">Model</button>
-<button data-testid="model-option" data-moon-key="example-model">Example</button>
+<button data-testid="model-option" data-moon-key="example-model" data-model-family="plain-chat">Example</button>
 <button data-testid="toolkit-trigger-btn">Tools</button>
 <button role="menuitem">联网搜索</button>
 <button role="menuitemradio" aria-checked="false">自动搜索</button>
@@ -696,6 +740,45 @@ test("loading-shell readiness is bounded and never fills or sends after timeout 
   }
 });
 
+test("agent model UI preserves the requested selection without plain-chat search controls", async () => {
+  const browser = await chromium.launch({
+    headless: true,
+    executablePath: process.env.GEO_TEST_CHROMIUM_PATH,
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`<!doctype html><html><body>
+      <button data-testid="model-select-trigger">Model</button>
+      <button data-testid="model-option" data-moon-key="other-model" data-model-family="plain-chat" aria-checked="true">Other</button>
+      <button data-testid="model-option" data-moon-key="example-model" data-model-family="agent" aria-checked="false">Example</button>
+      <button data-testid="toolkit-trigger-btn">Tools</button>
+      <script>
+        window.actions = [];
+        document.querySelector('[data-testid="toolkit-trigger-btn"]').onclick = () => window.actions.push("toolkit");
+        document.querySelectorAll('[data-testid="model-option"]').forEach(option => {
+          option.onclick = () => {
+            window.actions.push(option.dataset.moonKey);
+            document.querySelectorAll('[data-testid="model-option"]').forEach(other => {
+              other.setAttribute("aria-checked", String(other === option));
+            });
+          };
+        });
+      </script></body></html>`);
+    assert.equal(await configureKimiSearch(page, MODEL), true);
+    assert.equal(await configureKimiSearch(page, MODEL), true);
+    assert.equal(await configureKimiSearch(page, MODEL, false), false);
+    assert.deepEqual(await page.evaluate(() => window.actions), [MODEL]);
+    assert.equal(
+      await page
+        .locator('[data-testid="model-option"][aria-checked="true"]')
+        .getAttribute("data-moon-key"),
+      MODEL,
+    );
+  } finally {
+    await browser.close();
+  }
+});
+
 test("search configuration selects exact bilingual title prefixes with descriptions, never other tools", async () => {
   const browser = await chromium.launch({
     headless: true,
@@ -714,7 +797,7 @@ test("search configuration selects exact bilingual title prefixes with descripti
     ]) {
       await page.setContent(`<!doctype html><html><body>
         <button data-testid="model-select-trigger">Model</button>
-        <button data-testid="model-option" data-moon-key="example-model">Example</button>
+        <button data-testid="model-option" data-moon-key="example-model" data-model-family="plain-chat">Example</button>
         <button data-testid="toolkit-trigger-btn">Tools</button>
         <button role="menuitem" data-wrong>Search</button>
         <button role="menuitem" data-wrong>Swarm Search</button>
