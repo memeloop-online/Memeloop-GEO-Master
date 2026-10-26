@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import http from "node:http";
 import https from "node:https";
 import { createRequire } from "node:module";
@@ -77,8 +76,8 @@ for (const asset of assets) {
   );
 }
 
-// Follow the built lazy module graph: the PDF font must be content addressed,
-// even though visiting the application does not request it.
+// Follow the built lazy module graph: fonts are produced by the authenticated
+// subset API and must never be shipped as full static browser assets.
 const pending = [...modules.keys()];
 const fonts = new Set();
 for (const path of pending) {
@@ -100,39 +99,10 @@ for (const path of pending) {
     pending.push(dependency);
   }
 }
-assert.equal(
-  fonts.size,
-  1,
-  "Both PDF exporters must use one hashed font asset",
-);
-const fontPath = [...fonts][0];
-const fontSource = await readFile(
-  new URL(
-    "../apps/web/src/assets/fonts/NotoSansCJKsc-Regular.otf",
-    import.meta.url,
-  ),
-);
-const fontIdentity = await get(fontPath, { "Accept-Encoding": "identity" });
-const fontCompressed = await get(fontPath, {
-  "Accept-Encoding": "gzip",
-  Via: "1.1 image-smoke",
-});
-for (const response of [fontIdentity, fontCompressed]) {
-  assert.equal(response.status, 200);
-  assert.equal(response.headers["content-type"], "font/otf");
-  assert.equal(
-    response.headers["cache-control"],
-    "public, max-age=31536000, immutable",
-  );
-}
-assert.equal(fontIdentity.headers["content-encoding"], undefined);
-assert.equal(fontCompressed.headers["content-encoding"], "gzip");
-assert.match(fontCompressed.headers.vary, /(?:^|,\s*)Accept-Encoding(?:,|$)/i);
-assert.deepEqual(fontIdentity.body, fontSource);
-assert.deepEqual(gunzipSync(fontCompressed.body), fontSource);
-assert.ok(fontCompressed.body.length < fontSource.length);
-console.log(
-  `PDF font: ${fontSource.length} bytes identity, ${fontCompressed.body.length} bytes gzip; SHA-256 ${createHash("sha256").update(fontSource).digest("hex")}.`,
+assert.equal(fonts.size, 0, "PDF exporters must not bundle the full font");
+assert.ok(
+  [...modules.values()].some((source) => source.includes("/pdf/font-subset")),
+  "PDF exporters must use the font subset API",
 );
 const missingFont = await get("/assets/NotoSansCJKsc-Regular-missing.otf");
 assert.equal(missingFont.status, 404);
@@ -145,8 +115,7 @@ assert.equal(
 );
 assert.doesNotMatch(missing.headers["cache-control"] ?? "", /immutable/);
 
-// A normal persistent profile exercises the disk HTTP cache, including fonts
-// larger than Chromium's incognito in-memory cache entry limit.
+// Exercise the actual production module graph with a persistent browser profile.
 const profile = await mkdtemp(join(tmpdir(), "geo-web-image-"));
 const browser = await chromium.launchPersistentContext(profile, {
   headless: true,
@@ -178,43 +147,6 @@ try {
     false,
     "Opening the application must not download the PDF font",
   );
-  async function fetchFont() {
-    return page.evaluate(async (path) => {
-      performance.clearResourceTimings();
-      const started = performance.now();
-      const response = await fetch(path, { credentials: "same-origin" });
-      const bytes = await response.arrayBuffer();
-      const timing = performance
-        .getEntriesByName(new URL(path, location.href).href)
-        .at(-1);
-      return {
-        status: response.status,
-        bytes: bytes.byteLength,
-        milliseconds: Math.round(performance.now() - started),
-        transferredBytes: timing?.transferSize,
-        encodedBytes: timing?.encodedBodySize,
-      };
-    }, fontPath);
-  }
-  const cold = await fetchFont();
-  // A page reload drops application memory; the warm fetch must use HTTP cache.
-  await page.reload();
-  const warm = await fetchFont();
-  assert.equal(cold.status, 200);
-  assert.equal(warm.status, 200);
-  assert.equal(cold.bytes, fontSource.length);
-  assert.equal(warm.bytes, fontSource.length);
-  assert.ok(cold.transferredBytes > 0, "Cold font fetch must transfer bytes");
-  assert.ok(
-    cold.encodedBytes < fontSource.length,
-    "Browser must receive compressed font",
-  );
-  assert.equal(
-    warm.transferredBytes,
-    0,
-    "Warm font fetch must avoid network transfer",
-  );
-  console.log(`PDF font browser delivery: ${JSON.stringify({ cold, warm })}`);
   console.log("Production web image renders without uncaught module errors.");
 } finally {
   await browser.close();

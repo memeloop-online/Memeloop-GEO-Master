@@ -1,6 +1,7 @@
 // End-to-end synthetic PDF acceptance: the shipped exporter/font and real PDFBox text extraction.
 // GEO_REPORT_PDF_OUTPUT_DIR and GEO_REPORT_PDF_PARSER_JAR must be absolute paths.
 import { spawn } from "node:child_process";
+import { createPdfFontSubsetter } from "../packages/browser-runner/src/pdf-font-subset.mjs";
 import { createRequire } from "node:module";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -25,7 +26,17 @@ const isInside = (parent, child) => {
 
 async function childProcess(command, args) {
   const safeEnv = Object.fromEntries(
-    ["PATH", "Path", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "JAVA_HOME"]
+    [
+      "PATH",
+      "Path",
+      "SystemRoot",
+      "WINDIR",
+      "COMSPEC",
+      "PATHEXT",
+      "JAVA_HOME",
+      "TMP",
+      "TEMP",
+    ]
       .filter((key) => process.env[key] !== undefined)
       .map((key) => [key, process.env[key]]),
   );
@@ -184,6 +195,7 @@ async function main() {
     "PDF artifacts must be outside the repository",
   );
   const requireWeb = createRequire(join(webRoot, "package.json"));
+  const { PDFDocument } = requireWeb("pdf-lib");
   const requireVite = createRequire(requireWeb.resolve("vite"));
   const { build } = requireVite("esbuild");
   const scratch = await mkdtemp(join(tmpdir(), "geo-report-pdf-"));
@@ -197,19 +209,50 @@ async function main() {
       format: "esm",
       target: "node22",
       logLevel: "silent",
+      define: {
+        "import.meta.env.VITE_API_BASE_URL": JSON.stringify("/api/v1"),
+      },
     });
     const { buildReportPdf } = await import(pathToFileURL(modulePath).href);
     const fontBytes = new Uint8Array(
       await readFile(
-        join(webRoot, "src", "assets", "fonts", "NotoSansCJKsc-Regular.otf"),
+        join(
+          repository,
+          "packages",
+          "browser-runner",
+          "assets",
+          "fonts",
+          "NotoSansCJKsc-Regular.otf",
+        ),
       ),
     );
+    const subsetFont = await createPdfFontSubsetter({ fontBytes });
+    globalThis.fetch = async (url, init) => {
+      check(url === "/api/v1/pdf/font-subset", "Unexpected exporter request");
+      check(init.method === "POST", "Subset requests must use POST");
+      const { codepoints } = JSON.parse(init.body);
+      const subset = await subsetFont({ codepoints, signal: init.signal });
+      check(
+        subset.length < 1_000_000,
+        "Font subset unexpectedly contains the full font",
+      );
+      return new Response(subset, { headers: { "Content-Type": "font/otf" } });
+    };
     await mkdir(outputDir, { recursive: true });
     for (const kind of ["small", "large"]) {
-      const bytes = await buildReportPdf(snapshot(kind === "large"), fontBytes);
+      const bytes = await buildReportPdf(snapshot(kind === "large"));
       check(
         Buffer.from(bytes.subarray(0, 5)).toString("ascii") === "%PDF-",
         "Exporter did not generate a PDF",
+      );
+      check(
+        bytes.length < 1_000_000,
+        "PDF must embed only the requested font subset",
+      );
+      const parsed = await PDFDocument.load(bytes);
+      check(
+        parsed.getPageCount() === (kind === "small" ? 3 : 14),
+        "Font subsetting changed the original report pagination",
       );
       const pdf = join(outputDir, `report-${kind}-synthetic.pdf`);
       await writeFile(pdf, bytes);
