@@ -71,14 +71,6 @@ export function RecommendationPlatformComparison({
       aria-label={t("title")}
     >
       <h3>{t("title")}</h3>
-      <p>{t("scope")}</p>
-      <p>
-        {t("planWindow", {
-          start: at(planWindow.start),
-          end: at(planWindow.end),
-          timezone,
-        })}
-      </p>
       {target ? (
         <Field label={t("target")}>
           <Select
@@ -104,8 +96,6 @@ export function RecommendationPlatformComparison({
       {target && !samples.length && <p>{t("empty")}</p>}
       {target && samples.length > 0 && (
         <>
-          <p>{t("currentTarget")}</p>
-          <p>{t("firstPlaceBasis")}</p>
           {[...questions].map(([questionKey, groups], questionIndex) => {
             const first = groups.values().next().value?.[0];
             if (!first) return null;
@@ -114,13 +104,18 @@ export function RecommendationPlatformComparison({
                 key={questionKey}
                 className="recommendation-platform-question"
               >
-                <h4>{first.measurement.question}</h4>
-                <p>
-                  {t("questionGroup", {
-                    number: number.format(questionIndex + 1),
-                    version: first.measurement.question_set_version,
-                  })}
-                </p>
+                <details className="measurement-result-question">
+                  <summary>
+                    <h4>{first.measurement.question}</h4>
+                    <span>{t("questionDetails")}</span>
+                  </summary>
+                  <p>
+                    {t("questionGroup", {
+                      number: number.format(questionIndex + 1),
+                      version: first.measurement.question_set_version,
+                    })}
+                  </p>
+                </details>
                 <div
                   className="recommendation-platform-scroll"
                   role="region"
@@ -146,8 +141,6 @@ export function RecommendationPlatformComparison({
                           <th scope="col">{focusT("brandAffiliateTitle")}</th>
                         )}
                         <th scope="col">{t("firstPlace")}</th>
-                        <th scope="col">{t("distribution")}</th>
-                        <th scope="col">{t("observedTimes")}</th>
                         <th scope="col">{t("evidence")}</th>
                       </tr>
                     </thead>
@@ -181,47 +174,28 @@ export function RecommendationPlatformComparison({
                           <tr key={key}>
                             <th scope="row">
                               <strong>{input.provider}</strong>
-                              <dl>
-                                {(
-                                  [
-                                    "model",
-                                    "surface",
-                                    "search_mode",
-                                    "protocol_version",
-                                    "market",
-                                    "language",
-                                  ] as const
-                                ).map((field) => (
-                                  <div key={field}>
-                                    <dt>{t(field)}</dt>
-                                    <dd>{input[field]}</dd>
-                                  </div>
-                                ))}
-                              </dl>
                             </th>
-                            <td>
+                            <td
+                              data-label={
+                                target.kind === "brand"
+                                  ? focusT("brandDirect")
+                                  : t("recommendationRate")
+                              }
+                            >
                               <p>
                                 {frequency.valid
                                   ? rate(frequency.recommended, frequency.valid)
                                   : t("noValid")}
                               </p>
-                              <p>
-                                {t("sampleCounts", {
-                                  valid: number.format(frequency.valid),
-                                  unavailable: number.format(
-                                    group.length - frequency.valid,
-                                  ),
-                                })}
-                              </p>
                             </td>
                             {target.kind === "brand" && (
-                              <td>
+                              <td data-label={focusT("brandAffiliateTitle")}>
                                 <RecommendationBrandSummary
                                   summary={frequency.brandSummary}
                                 />
                               </td>
                             )}
-                            <td>
+                            <td data-label={t("firstPlace")}>
                               {frequency.ranked
                                 ? rate(
                                     frequency.ranks.get(1) ?? 0,
@@ -229,52 +203,77 @@ export function RecommendationPlatformComparison({
                                   )
                                 : t("noRanked")}
                             </td>
-                            <td>
-                              {[...frequency.ranks]
-                                .sort(([a], [b]) => a - b)
-                                .map(([rank, count]) => (
-                                  <p key={rank}>
-                                    {t("rankCount", {
-                                      rank: number.format(rank),
-                                      value: number.format(count),
-                                    })}
-                                  </p>
-                                ))}
-                              <p>
-                                {t("unrankedCount", {
-                                  value: number.format(frequency.unranked),
-                                })}
-                              </p>
-                              <p>
-                                {t("conflictCount", {
-                                  value: number.format(frequency.ambiguous),
-                                })}
-                              </p>
-                            </td>
-                            <td>
-                              <p>
-                                {actualTimes.length
-                                  ? t("dateRange", {
-                                      start: date.format(firstTime),
-                                      end: date.format(lastTime),
-                                    })
-                                  : t("unknownTime")}
-                              </p>
-                              <p>
-                                {t("unknownCount", {
-                                  value: number.format(
-                                    group.length - actualTimes.length,
-                                  ),
-                                })}
-                              </p>
-                            </td>
-                            <td>
+                            <td className="recommendation-platform-evidence">
                               <details>
                                 <summary>
                                   {t("sampleEvidence", {
                                     value: number.format(group.length),
                                   })}
                                 </summary>
+                                <dl>
+                                  {(
+                                    [
+                                      "model",
+                                      "surface",
+                                      "search_mode",
+                                      "protocol_version",
+                                      "market",
+                                      "language",
+                                    ] as const
+                                  ).map((field) => (
+                                    <div key={field}>
+                                      <dt>{t(field)}</dt>
+                                      <dd>{input[field]}</dd>
+                                    </div>
+                                  ))}
+                                </dl>
+                                <p>
+                                  {t("sampleCounts", {
+                                    valid: number.format(frequency.valid),
+                                    unavailable: number.format(
+                                      group.length - frequency.valid,
+                                    ),
+                                  })}
+                                </p>
+                                <h5>{t("distribution")}</h5>
+
+                                {[...frequency.ranks]
+                                  .sort(([a], [b]) => a - b)
+                                  .map(([rank, count]) => (
+                                    <p key={rank}>
+                                      {t("rankCount", {
+                                        rank: number.format(rank),
+                                        value: number.format(count),
+                                      })}
+                                    </p>
+                                  ))}
+                                <p>
+                                  {t("unrankedCount", {
+                                    value: number.format(frequency.unranked),
+                                  })}
+                                </p>
+                                <p>
+                                  {t("conflictCount", {
+                                    value: number.format(frequency.ambiguous),
+                                  })}
+                                </p>
+                                <h5>{t("observedTimes")}</h5>
+                                <p>
+                                  {actualTimes.length
+                                    ? t("dateRange", {
+                                        start: date.format(firstTime),
+                                        end: date.format(lastTime),
+                                      })
+                                    : t("unknownTime")}
+                                </p>
+                                <p>
+                                  {t("unknownCount", {
+                                    value: number.format(
+                                      group.length - actualTimes.length,
+                                    ),
+                                  })}
+                                </p>
+
                                 <ul>
                                   {group.map((sample, index) => (
                                     <li
@@ -306,6 +305,19 @@ export function RecommendationPlatformComparison({
           })}
         </>
       )}
+      <details>
+        <summary>{t("conditions")}</summary>
+        <p>{t("scope")}</p>
+        <p>
+          {t("planWindow", {
+            start: at(planWindow.start),
+            end: at(planWindow.end),
+            timezone,
+          })}
+        </p>
+        <p>{t("currentTarget")}</p>
+        <p>{t("firstPlaceBasis")}</p>
+      </details>
     </section>
   );
 }

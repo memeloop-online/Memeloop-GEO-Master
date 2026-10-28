@@ -872,7 +872,7 @@ describe("cycle-free measurement report", () => {
     const card = await screen.findByRole("article", {
       name: "Example alternative",
     });
-    expect(screen.getByText(/并不解释关注对象为何未被推荐/)).toBeVisible();
+    await userEvent.click(within(card).getByText("查看原文依据与引用"));
     await userEvent.click(
       within(card).getByRole("button", { name: "分析改进方向" }),
     );
@@ -1143,7 +1143,7 @@ describe("cycle-free measurement report", () => {
     },
   );
   it.each(["zh-CN", "en"])(
-    "shows focus and rankings before collapsed report management and single-question filtering in %s",
+    "shows answers before collapsed rank history and report management in %s",
     async (language) => {
       await i18n.changeLanguage(language);
       focus.name = "Trail light";
@@ -1165,16 +1165,16 @@ describe("cycle-free measurement report", () => {
         })
         .find((heading) => heading.closest(".measurement-report-sample"))!;
       for (const [before, after] of [
-        [focusPanel, trend],
+        [focusPanel, sample],
+        [sample, trend],
         [trend, details],
-        [details, sample],
       ])
         expect(
           before.compareDocumentPosition(after) &
             Node.DOCUMENT_POSITION_FOLLOWING,
         ).toBeTruthy();
-      expect(trend).toBeVisible();
-      expect(trend.closest("details")).toBeNull();
+      expect(trend).not.toBeVisible();
+      expect(trend.closest("details")).not.toHaveAttribute("open");
       expect(details).not.toHaveAttribute("open");
       expect(
         screen.getByText(
@@ -1199,7 +1199,7 @@ describe("cycle-free measurement report", () => {
     },
   );
 
-  it("keeps the full recommendation table visible without a focus", async () => {
+  it("shows recommendation entries immediately without a focus", async () => {
     setup({
       ...preview,
       samples: [
@@ -1224,12 +1224,11 @@ describe("cycle-free measurement report", () => {
         },
       ],
     });
-    const table = await screen.findByRole("table", { name: "AI 推荐了什么" });
-    expect(table).toBeVisible();
-    expect(table.closest("details")).toBeNull();
-    expect(within(table).getByText("Trail light")).toBeVisible();
+    const card = await screen.findByRole("article", { name: "Trail light" });
+    expect(card).toBeVisible();
+    expect(card.closest("details")).toBeNull();
     expect(
-      within(table).getByText("Compact enough for a backpack"),
+      within(card).getByText("Compact enough for a backpack"),
     ).toBeVisible();
     expect(screen.queryByText(/全部推荐对象/)).not.toBeInTheDocument();
   });
@@ -1366,6 +1365,7 @@ describe("cycle-free measurement report", () => {
     await openReportDetails();
     expect(screen.getByText(/当前问题 · 测量样本 2 项/)).toBeVisible();
     const trend = screen.getByRole("region", { name: "推荐排名变化" });
+    await userEvent.click(trend.closest("details")!.querySelector("summary")!);
     expect(
       within(trend).queryByText("Which desk suits a small room?"),
     ).not.toBeInTheDocument();
@@ -1475,61 +1475,34 @@ describe("cycle-free measurement report", () => {
         },
       ],
     });
-    const allEntities = await screen.findByText("全部推荐对象（1）");
-    const disclosure = allEntities.closest("details")!;
-    expect(allEntities.tagName).toBe("SUMMARY");
-    expect(disclosure).not.toHaveAttribute("open");
+    const card = await screen.findByRole("article", { name: "Trail light" });
     expect(
-      within(disclosure).getByRole("table", { hidden: true }),
+      within(card).getByText("Compact enough for a backpack"),
+    ).toBeVisible();
+    expect(within(card).getByText("已推荐，未明确排名")).toBeVisible();
+    expect(within(card).getByText("引用 1 条")).toBeVisible();
+    expect(within(card).getByText("Trail light is compact.")).not.toBeVisible();
+    expect(
+      within(card).getByRole("button", { name: "分析改进方向" }),
     ).not.toBeVisible();
-    const focusComparison = screen.getByRole("region", {
-      name: "关注对象与同类推荐",
-    });
-    expect(focusComparison).toBeVisible();
-    expect(
-      within(focusComparison).getByText("Compact enough for a backpack"),
-    ).toBeVisible();
-    await userEvent.click(
-      within(focusComparison).getByText("查看原文依据与引用"),
-    );
-    expect(
-      within(focusComparison).getByText("Trail light is compact."),
-    ).toBeVisible();
-    expect(within(focusComparison).getByRole("link")).toHaveAttribute(
-      "href",
-      "https://example.org/review",
-    );
-    expect(disclosure).not.toHaveAttribute("open");
-    expect(screen.getByText("已推荐，未明确排名")).toBeVisible();
-    await userEvent.click(allEntities);
-    const table = screen.getByRole("table", { name: "AI 推荐了什么" });
-    expect(within(table).getByText("Trail light").closest("tr")).toHaveClass(
-      "measurement-report-focus-row",
-    );
-    expect(within(table).getByText("Trail light")).toBeVisible();
-    expect(
-      within(table).getByText("Compact enough for a backpack"),
-    ).toBeVisible();
-    expect(within(table).getByText("未明确排名")).toBeVisible();
-    expect(within(table).queryByText("第 1 名")).not.toBeInTheDocument();
-    expect(
-      within(table).getByText("Trail light is compact."),
-    ).not.toBeVisible();
-    expect(screen.getByText("Saved response answer")).not.toBeVisible();
-    await userEvent.click(within(table).getByText("查看原文依据"));
-    expect(within(table).getByText("Trail light is compact.")).toBeVisible();
-    expect(within(table).getByRole("link")).toHaveAttribute(
+    await userEvent.click(within(card).getByText("查看原文依据与引用"));
+    expect(within(card).getByText("Trail light is compact.")).toBeVisible();
+    expect(within(card).getByRole("link")).toHaveAttribute(
       "href",
       "https://example.org/review",
     );
     expect(
-      within(table).queryByText("javascript:alert(1)"),
+      within(card).getByRole("button", { name: "分析改进方向" }),
+    ).toBeVisible();
+    expect(
+      within(card).queryByText("javascript:alert(1)"),
     ).not.toBeInTheDocument();
+    expect(screen.getByText("Saved response answer")).not.toBeVisible();
     const comparison = screen.getByRole("region", { name: "推荐排名变化" });
-    expect(comparison).toBeVisible();
-    expect(comparison.closest("details")).toBeNull();
+    expect(comparison).not.toBeVisible();
+    expect(comparison.closest("details")).not.toHaveAttribute("open");
     expect(
-      comparison.compareDocumentPosition(table) &
+      card.compareDocumentPosition(comparison) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
   });
@@ -1901,11 +1874,16 @@ describe("cycle-free measurement report", () => {
     expect(screen.getByText("Saved response answer")).toBeInTheDocument();
     expect(screen.getByText("analysis-model")).toBeInTheDocument();
     expect(screen.getByText("analysis-revision")).toBeInTheDocument();
-    expect(
-      screen
-        .getAllByRole("heading", { name: "Which lamp suits camping?" })
-        .some((heading) => !heading.closest("details:not([open])")),
-    ).toBe(true);
+    const questionHeadings = screen
+      .getAllByRole("heading", {
+        name: "Which lamp suits camping?",
+      })
+      .filter((heading) => heading.closest(".measurement-result-question"));
+    expect(questionHeadings.length).toBeGreaterThan(0);
+    for (const heading of questionHeadings) {
+      expect(heading).toBeVisible();
+      expect(heading.closest("summary")).not.toBeNull();
+    }
     expect(
       screen.queryByRole("heading", {
         name: preview.samples[0].comparison_key,
@@ -2158,6 +2136,8 @@ describe("platform comparison report integration", () => {
       );
       const table = comparison.getByRole("table");
       expect(within(table).getAllByRole("row")).toHaveLength(3);
+      for (const summary of within(table).getAllByText("查看 1 次样本"))
+        await userEvent.click(summary);
       expect(within(table).getByText("有效 1 次 · 不可用 0 次")).toBeVisible();
       expect(within(table).getByText("有效 0 次 · 不可用 1 次")).toBeVisible();
       expect(within(table).getByText("时间未记录：1 次")).toBeVisible();
@@ -2170,8 +2150,6 @@ describe("platform comparison report integration", () => {
         timeZone: "UTC",
       }).format(new Date("2026-10-11T10:00:00Z"));
       expect(within(table).getByText(`${actual} 至 ${actual}`)).toBeVisible();
-      for (const summary of within(table).getAllByText("查看 1 次样本"))
-        await userEvent.click(summary);
       const links = within(table).getAllByRole("link");
       expect(links[0]).toHaveAttribute(
         "href",
@@ -2187,7 +2165,7 @@ describe("platform comparison report integration", () => {
       expect(detail).toHaveBeenCalledTimes(alreadySaved ? 1 : 0);
       expect(
         screen.getByRole("region", { name: "推荐排名变化" }),
-      ).toBeVisible();
+      ).not.toBeVisible();
     },
   );
 });

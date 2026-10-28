@@ -26,7 +26,7 @@
 
 .recommendation-platform-table {
   width: 100%;
-  min-width: 960px;
+  min-width: 620px;
   border-collapse: collapse;
 }
 
@@ -38,7 +38,7 @@
 
 .recommendation-platform-table th,
 .recommendation-platform-table td {
-  padding: 12px;
+  padding: 8px;
   text-align: left;
   vertical-align: top;
   border-bottom: 1px solid var(--colorNeutralStroke2);
@@ -66,4 +66,103 @@
 .recommendation-platform-table ul {
   margin: 8px 0 0;
   padding-inline-start: 20px;
+}
+
+.measurement-result-question > summary {
+  cursor: pointer;
+  position: relative;
+  list-style: none;
+  padding-inline-start: 16px;
+}
+
+.measurement-result-question > summary::before {
+  content: "▸";
+  position: absolute;
+  inset-inline-start: 0;
+}
+
+.measurement-result-question[open] > summary::before {
+  content: "▾";
+}
+
+.measurement-result-question > summary h4 {
+  display: inline;
+}
+
+.measurement-result-question > summary > span {
+  display: block;
+  margin-top: 4px;
+  color: var(--colorNeutralForeground2);
+  font-size: 12px;
+}
+
+@media (max-width: 600px) {
+  .measurement-period-report .measurement-report-actions {
+    margin-block: 0;
+  }
+
+  .measurement-period-report .measurement-report-actions p {
+    margin: 0;
+  }
+
+  .measurement-period-report > h3 {
+    margin-block: 4px;
+  }
+
+  .measurement-period-report .measurement-report-sample {
+    margin-block: 0;
+  }
+
+  .measurement-result-question:not([open]) > summary h4 {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+  }
+
+  .recommendation-platform-table {
+    min-width: 0;
+  }
+
+  .recommendation-platform-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .recommendation-platform-table tbody,
+  .recommendation-platform-table tr {
+    display: grid;
+    gap: 8px;
+  }
+
+  .recommendation-platform-table tr {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    border-bottom: 1px solid var(--colorNeutralStroke2);
+    padding-block: 8px;
+  }
+
+  .recommendation-platform-table th,
+  .recommendation-platform-table td {
+    display: block;
+    min-width: 0;
+    max-width: none;
+    border-bottom: 0;
+    padding: 0;
+  }
+
+  .recommendation-platform-table th[scope="row"],
+  .recommendation-platform-evidence {
+    grid-column: 1 / -1;
+  }
+
+  .recommendation-platform-table td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 4px;
+    color: var(--colorNeutralForeground2);
+    font-size: 12px;
+  }
 }

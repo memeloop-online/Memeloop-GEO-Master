@@ -31,13 +31,10 @@ import {
 import type { MeasurementRecommendationReference } from "../components/MeasurementReportDraftBridge";
 import "./MeasurementPeriodReportPanel.css";
 import { useProjectQuery, type MeasurementTarget } from "../api/projects";
-import {
-  isMeasurementFocus,
-  measurementFocusTargets,
-} from "../api/measurementFocus";
+import { measurementFocusTargets } from "../api/measurementFocus";
 import { MeasurementFocusPanel } from "../components/MeasurementFocusPanel";
 import { RecommendationFocusComparison } from "../components/RecommendationFocusComparison";
-import { Link, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { captureMeasurementReportExport } from "./measurementReportExport";
 import { downloadMeasurementReportCsv } from "./measurementReportsCsv";
 import "../i18n/measurementReportExport";
@@ -430,6 +427,27 @@ export function MeasurementPeriodReportPanel({
   }
   const reportActions = (
     <div className="measurement-report-actions">
+      {scopedReport && !selected && canWrite && (
+        <Button
+          appearance="primary"
+          disabled={saving}
+          onClick={() => void save(true)}
+        >
+          {t("analyzeReport")}
+        </Button>
+      )}
+      {scopedReport?.kind === "measurement_period" &&
+        canWrite &&
+        (!activeQuestion || questionTargetId) && (
+          <Button
+            appearance="primary"
+            as="a"
+            role="link"
+            href={reportChatHref(scopedReport.report_id, questionTargetId)}
+          >
+            {t("analyzeReport")}
+          </Button>
+        )}
       <Button
         disabled={current.isFetching || saving}
         onClick={() => {
@@ -481,18 +499,8 @@ export function MeasurementPeriodReportPanel({
           <Button disabled={saving} onClick={() => void save()}>
             {t(saving ? "saving" : "save")}
           </Button>
-          <Button disabled={saving} onClick={() => void save(true)}>
-            {t("analyzeReport")}
-          </Button>
         </>
       )}
-      {scopedReport?.kind === "measurement_period" &&
-        canWrite &&
-        (!activeQuestion || questionTargetId) && (
-          <Link to={reportChatHref(scopedReport.report_id, questionTargetId)}>
-            {t("analyzeReport")}
-          </Link>
-        )}
       {saveState && (
         <p role={saveState === "saved" ? "status" : "alert"}>
           {saveState === "recommendationScopeError"
@@ -709,6 +717,7 @@ export function MeasurementPeriodReportPanel({
           <p>{t(questionSet ? "questionSetDescription" : "description")}</p>
         </>
       )}
+      {reportActions}
       <MeasurementFocusPanel
         tenantId={tenantId}
         projectId={projectId}
@@ -740,18 +749,9 @@ export function MeasurementPeriodReportPanel({
               }}
               timezone={report.report_timezone}
             />
-            {recommendations.length > 0 && (
-              <RecommendationTrend
-                samples={recommendations}
-                focusTargets={focusTargets}
-                embedded
-              />
-            )}
           </>
         )
       )}
-      {reportActions}
-      {reportDetails}
       {!current.isPending && !current.isError && scopedReport && (
         <>
           <h3>{t("aiTitle")}</h3>
@@ -761,9 +761,15 @@ export function MeasurementPeriodReportPanel({
               className="report-panel measurement-report-sample"
               key={`${sample.target_id}/${sample.attempt_id ?? ""}`}
             >
-              <h4>{sample.conditions.question}</h4>
+              <details className="measurement-result-question">
+                <summary>
+                  <h4>{sample.conditions.question}</h4>
+                </summary>
+                <p className="report-muted">
+                  {reportMeasurementTitle(sample.comparison_key)}
+                </p>
+              </details>
               <p className="report-muted">
-                {reportMeasurementTitle(sample.comparison_key)} ·{" "}
                 {at(sample.observation?.observed_at ?? sample.scheduled_at)}
               </p>
               <SampleRecommendations
@@ -924,6 +930,18 @@ export function MeasurementPeriodReportPanel({
               </ul>
             </details>
           )}
+          {recommendations.length > 0 && (
+            <details className="measurement-report-evidence">
+              <summary>
+                {t("history", { ns: "recommendationPlatformComparison" })}
+              </summary>
+              <RecommendationTrend
+                samples={recommendations}
+                focusTargets={focusTargets}
+                embedded
+              />
+            </details>
+          )}
           <MeasurementReportSearchSection
             search={scopedReport.search}
             tenantId={tenantId}
@@ -932,6 +950,7 @@ export function MeasurementPeriodReportPanel({
           />
         </>
       )}
+      {reportDetails}
     </section>
   );
 }
@@ -951,101 +970,16 @@ function SampleRecommendations({
   const { t } = useTranslation("measurementReports");
   const items = decodeVerifiedRecommendations(sample.recommendations);
   if (items === null) return <p>{t("recommendationsPending")}</p>;
-  if (!items.length) return <p>{t("recommendationsEmpty")}</p>;
-  const absentTargets = focusTargets.filter(
-    (target) => !items.some((item) => isMeasurementFocus(item, [target])),
-  );
-  const table = (
-    <table className="report-table">
-      <caption>{t("recommendedEntities")}</caption>
-      <thead>
-        <tr>
-          <th scope="col">{t("entity")}</th>
-          <th scope="col">{t("rank")}</th>
-          <th scope="col">{t("reason")}</th>
-        </tr>
-      </thead>
-      <tbody>
-        {[...items]
-          .sort((a, b) => a.mention_order - b.mention_order)
-          .map((item, index) => (
-            <tr
-              key={`${item.kind}/${item.name}/${index}`}
-              className={
-                isMeasurementFocus(item, focusTargets)
-                  ? "measurement-report-focus-row"
-                  : undefined
-              }
-            >
-              <th scope="row">{item.name}</th>
-              <td>
-                {item.rank === null
-                  ? t("unranked")
-                  : t("rankValue", { rank: item.rank })}
-              </td>
-              <td>
-                {item.reason || t("reasonUnavailable")}
-                <details>
-                  <summary>{t("recommendationEvidence")}</summary>
-                  <blockquote>{item.evidence_quote}</blockquote>
-                  {item.citation_urls.map((url, linkIndex) => {
-                    const href = safeOriginalPublicUrl(url);
-                    return href ? (
-                      <a
-                        key={linkIndex}
-                        href={href}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                      >
-                        {url}
-                      </a>
-                    ) : null;
-                  })}
-                </details>
-                {onAnalyze && (
-                  <Button
-                    disabled={analysisPending}
-                    onClick={() => onAnalyze(item)}
-                  >
-                    {t("analyzeImprovements", {
-                      ns: "recommendationFocusComparison",
-                    })}
-                  </Button>
-                )}
-              </td>
-            </tr>
-          ))}
-      </tbody>
-    </table>
-  );
   return (
-    <div className="measurement-report-recommendations">
-      {absentTargets.map((target) => (
-        <p
-          key={JSON.stringify([target.kind, target.name])}
-          className="measurement-report-focus"
-        >
-          <strong>{t("currentFocus", { name: target.name })}</strong>
-          {" · "}
-          {t("focusNotFound")}
-        </p>
-      ))}
+    <>
+      {!items.length && <p>{t("recommendationsEmpty")}</p>}
       <RecommendationFocusComparison
         items={items}
         focusTargets={focusTargets}
         onAnalyze={onAnalyze}
         analysisPending={analysisPending}
+        compact
       />
-      {focusTargets.length > 0 ? (
-        <details className="measurement-report-evidence">
-          <summary>
-            {t("allRecommendedEntities", { count: items.length })}
-          </summary>
-          {table}
-        </details>
-      ) : (
-        table
-      )}
-    </div>
+    </>
   );
 }
