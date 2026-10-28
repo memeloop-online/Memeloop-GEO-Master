@@ -896,6 +896,12 @@ export function createRunner(options = {}) {
                     };
                     sourceReceipt = captureReceipt(await persistCapture(body));
                     sourceDigest = evidence.source_sha256;
+                    return body.owned_conversation
+                      ? {
+                          durable: true,
+                          owned_conversation: body.owned_conversation,
+                        }
+                      : { durable: false };
                   } else if (evidence.phase === "extraction") {
                     if (!sourceReceipt) throw new Error("source_not_persisted");
                     if (

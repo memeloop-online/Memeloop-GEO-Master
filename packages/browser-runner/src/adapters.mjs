@@ -69,6 +69,19 @@ function unknown(reason, stage, evidence = []) {
   };
 }
 
+function acknowledgePersistedOwnership(evidence, acknowledgement) {
+  if (acknowledgement?.durable !== true) return;
+  const owned = acknowledgement.owned_conversation;
+  for (const receipt of evidence) {
+    if (
+      receipt.provider === owned?.provider &&
+      receipt.purpose === owned?.purpose &&
+      receipt.external_conversation_id === owned?.external_conversation_id
+    )
+      receipt.ownership_receipt_status = "persisted";
+  }
+}
+
 function ownIdentity(id, name, avatar) {
   if (
     (typeof id !== "string" && typeof id !== "number") ||
@@ -499,7 +512,10 @@ export async function measureKimi(
       // Supplying this callback is a caller-owned persistence contract. A
       // failed write prevents extraction from proceeding; the final-return
       // evidence alone is not a durable acknowledgement for remote cleanup.
-      await onEvidence?.(record);
+      acknowledgePersistedOwnership(
+        ownershipEvidence,
+        await onEvidence?.(record),
+      );
     },
     onDiagnostic: (entry) => {
       if (diagnostics.length >= 12) return;
@@ -657,7 +673,10 @@ export async function measureDeepseek(
     },
     async onEvidence(record) {
       capturedEvidence.push(record);
-      await onEvidence(record);
+      acknowledgePersistedOwnership(
+        ownershipEvidence,
+        await onEvidence(record),
+      );
     },
     onDiagnostic(entry) {
       if (diagnostics.length >= 12) return;

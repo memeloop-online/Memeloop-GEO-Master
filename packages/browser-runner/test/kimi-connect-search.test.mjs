@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import { test } from "node:test";
 import { chromium } from "playwright";
 import { measureKimi } from "../src/adapters.mjs";
+import { createRunner } from "../src/runner.mjs";
 import {
   matchesKimiChatRequest,
   configureKimiSearch,
@@ -664,6 +665,159 @@ const pageHtml = `<!doctype html><html><body>
     });
   };
 </script></body></html>`;
+
+test("runner ownership diagnostics acknowledge only the persisted source binding", async (t) => {
+  for (const mode of [
+    "persisted",
+    "failed",
+    "invalid_ack",
+    "wrong_provider",
+    "wrong_conversation",
+    "wrong_purpose",
+    "unstaged",
+  ]) {
+    await t.test(mode, async () => {
+      let sends = 0;
+      let extractions = 0;
+      const stored = [];
+      const runner = createRunner({
+        browserType: {
+          async launch() {
+            const browser = await chromium.launch({
+              executablePath: process.env.GEO_TEST_CHROMIUM_PATH,
+            });
+            return {
+              close: () => browser.close(),
+              async newContext(config) {
+                const context = await browser.newContext(config);
+                await context.route("**/*", async (route) => {
+                  const request = route.request();
+                  assert.equal(
+                    new URL(request.url()).origin,
+                    "https://www.kimi.com",
+                  );
+                  if (request.isNavigationRequest())
+                    return route.fulfill({
+                      contentType: "text/html; charset=utf-8",
+                      body: pageHtml,
+                    });
+                  assert.ok(request.url().endsWith("/Chat"));
+                  sends++;
+                  return route.fulfill({
+                    contentType: "application/connect+json",
+                    body: Buffer.concat([
+                      ...messages.map((message) => frame(0, message)),
+                      frame(2, {}),
+                    ]),
+                  });
+                });
+                return context;
+              },
+            };
+          },
+        },
+        platformAdapters: {
+          kimi: {
+            connectorVersion: "fixture.ownership.v1",
+            entry: "https://www.kimi.com",
+            operations: ["measure"],
+            async identify() {
+              return {
+                platform_account_id: "synthetic-account",
+                display_name: "Fixture",
+              };
+            },
+            execute(page, _operation, payload, hooks) {
+              return measureKimi(page, payload, {
+                ...hooks,
+                onConversationCaptured(receipt) {
+                  if (mode === "unstaged") return { durable: false };
+                  return hooks.onConversationCaptured(
+                    mode === "wrong_provider"
+                      ? { ...receipt, provider: "deepseek" }
+                      : mode === "wrong_conversation"
+                        ? { ...receipt, external_conversation_id: "other-chat" }
+                        : mode === "wrong_purpose"
+                          ? { ...receipt, purpose: "extraction" }
+                          : receipt,
+                  );
+                },
+              });
+            },
+          },
+        },
+      });
+      try {
+        await runner.create({
+          session_id: "fixture-session",
+          platform: "kimi",
+          storage_state: { cookies: [], origins: [] },
+        });
+        await runner.complete("fixture-session");
+        const input = {
+          execution_id: "fixture-execution",
+          session_id: "fixture-session",
+          operation: "measure",
+          payload: frozen,
+          source_capture_ticket: "aabb",
+        };
+        const persist = async (body) => {
+          stored.push(body);
+          if (mode === "failed")
+            throw new Error("synthetic persistence failure");
+          return mode === "invalid_ack"
+            ? {}
+            : {
+                schema_version: 1,
+                capture_id: "33333333-3333-4333-8333-333333333333",
+                digest_sha256: body.snapshot.source_sha256,
+                stored_at: "2026-01-01T00:00:00Z",
+              };
+        };
+        const result = await runner.execute(input, persist, {
+          async policy() {
+            return { prefer_connected_account: false, config_version: 1 };
+          },
+          async extract() {
+            extractions++;
+            return {
+              status: "accepted",
+              intent_id: "99999999-9999-4999-8999-999999999999",
+            };
+          },
+        });
+        assert.equal(result.status, "unknown");
+        const ownership = result.evidence.find(
+          (entry) => entry.kind === "provider_conversation_ownership",
+        );
+        assert.ok(ownership, JSON.stringify(result));
+        assert.equal(
+          ownership?.ownership_receipt_status,
+          mode === "persisted" ? "persisted" : "unpersisted",
+        );
+        assert.equal(stored.length, 1);
+        const capture = result.evidence.find(
+          (entry) => entry.kind === "observation_capture",
+        );
+        assert.equal(capture.source_json, stored[0].snapshot.source_json);
+        assert.equal(capture.source_sha256, stored[0].snapshot.source_sha256);
+        assert.equal(
+          stored[0].owned_conversation !== undefined,
+          !["wrong_provider", "wrong_purpose", "unstaged"].includes(mode),
+        );
+        assert.equal(
+          extractions,
+          ["failed", "invalid_ack"].includes(mode) ? 0 : 1,
+        );
+        if (extractions) assert.equal(result.reason, "extraction_pending");
+        await runner.execute(input, persist);
+        assert.equal(sends, 1, "same execution must never send again");
+      } finally {
+        await runner.shutdown();
+      }
+    });
+  }
+});
 
 test("loading-shell readiness is bounded and never fills or sends after timeout or cancellation", async (t) => {
   let sends = 0;

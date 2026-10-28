@@ -46,7 +46,7 @@ async function runCapture(platform, receipts, completion, extraction = {}) {
               durable: false,
             });
           for (const phase of ["source", "extraction"]) {
-            await hooks.onEvidence({
+            const acknowledgement = await hooks.onEvidence({
               kind: "observation_capture",
               schema_version: "geo.observation.capture.v1",
               phase,
@@ -54,7 +54,18 @@ async function runCapture(platform, receipts, completion, extraction = {}) {
               source_sha256: sourceSha256,
               ...(completion ? { completion } : {}),
             });
-            if (phase === "source") await extraction.inspectHooks?.(hooks);
+            if (phase === "source") {
+              assert.deepEqual(
+                acknowledgement,
+                stored[0].owned_conversation
+                  ? {
+                      durable: true,
+                      owned_conversation: stored[0].owned_conversation,
+                    }
+                  : { durable: false },
+              );
+              await extraction.inspectHooks?.(hooks);
+            }
           }
           return { status: "completed", evidence: [] };
         },
