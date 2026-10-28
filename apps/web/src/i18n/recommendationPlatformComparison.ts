@@ -7,13 +7,15 @@ const translations = {
     planWindow:
       "计划采样窗口：{{start}} 至 {{end}}（{{timezone}}，含开始、不含结束）",
     target: "查看关注对象",
-    noTarget: "先设置关注对象，即可查看各平台的推荐表现。",
+    noTarget: "查看下方各次回答的推荐结果，也可添加关注对象比较平台表现。",
+    history: "排名变化与历史",
     empty: "此范围内还没有测量样本。",
     currentTarget:
       "按当前关注对象的名称、别名及类型匹配；保存的报告证据保持原样。",
     firstPlaceBasis:
       "首位比例仅计入该对象被推荐且排名明确、一致的样本；未排序与排名冲突单列。",
     questionGroup: "问题组 {{number}} · 问题版本：{{version}}",
+    questionDetails: "查看完整问题与条件",
     tableRegion: "问题组 {{number}}：{{question}} 的平台对比",
     tableCaption: "{{name}} 的平台推荐表现",
     conditions: "平台与测量条件",
@@ -53,13 +55,16 @@ const translations = {
     planWindow:
       "Plan sampling window: {{start}} to {{end}} ({{timezone}}, start included, end excluded)",
     target: "View tracked item",
-    noTarget: "Set a tracked item to compare platform recommendations.",
+    noTarget:
+      "Explore each answer below, or add a tracked item to compare platform performance.",
+    history: "Rank changes and history",
     empty: "No measurement samples in this range yet.",
     currentTarget:
       "Matches your current names, aliases and item types. Saved report evidence stays as recorded.",
     firstPlaceBasis:
       "First-place share includes only recommendations for this item with a clear, consistent rank. Unranked and conflicting samples are listed separately.",
     questionGroup: "Question group {{number}} · Question version: {{version}}",
+    questionDetails: "View full question and conditions",
     tableRegion:
       "Platform comparison for question group {{number}}: {{question}}",
     tableCaption: "Platform recommendations for {{name}}",

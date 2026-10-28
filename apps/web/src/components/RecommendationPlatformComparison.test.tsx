@@ -1,6 +1,12 @@
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import type { MeasurementTarget } from "../api/projects";
@@ -82,7 +88,10 @@ function setup(
   );
 }
 function table() {
-  return screen.getByRole("table");
+  const element = screen.getByRole("table");
+  for (const details of element.querySelectorAll("details"))
+    if (!details.open) fireEvent.click(details.querySelector("summary")!);
+  return element;
 }
 function row(provider: string) {
   return within(table())
@@ -100,6 +109,44 @@ afterEach(async () => {
 });
 
 describe("platform recommendation comparison", () => {
+  it("keeps recommendation rates visible and reveals complete conditions and times on request", async () => {
+    setup([sample("compact")]);
+    const table = screen.getByRole("table");
+    expect(within(table).getAllByRole("columnheader")).toHaveLength(4);
+    expect(within(table).getAllByText(/1 \/ 1/)).toHaveLength(2);
+    expect(within(table).getByText("model-a")).not.toBeVisible();
+    expect(within(table).getByText("consumer_web")).not.toBeVisible();
+    expect(
+      within(table).getByText("Valid: 1 · Unavailable: 0"),
+    ).not.toBeVisible();
+    const disclosure = within(table).getByText("View 1 samples");
+    expect(disclosure.closest("details")).not.toHaveAttribute("open");
+    await userEvent.click(disclosure);
+    expect(within(table).getByText("model-a")).toBeVisible();
+    expect(within(table).getByText("consumer_web")).toBeVisible();
+    expect(within(table).getByText("Valid: 1 · Unavailable: 0")).toBeVisible();
+    expect(within(table).getByRole("link")).toHaveAttribute(
+      "href",
+      sample("compact").recordHref,
+    );
+  });
+
+  it("keeps the question version collapsed while retaining the complete question", async () => {
+    setup([sample("question")]);
+    const question = screen.getByRole("heading", {
+      name: "Which lamp suits camping?",
+    });
+    const disclosure = question.closest("details")!;
+    expect(disclosure).not.toHaveAttribute("open");
+    expect(
+      within(disclosure).getByText(/Question version: temporary.v1/),
+    ).not.toBeVisible();
+    await userEvent.click(disclosure.querySelector("summary")!);
+    expect(
+      within(disclosure).getByText(/Question version: temporary.v1/),
+    ).toBeVisible();
+  });
+
   it("uses the controlled target and reports selection without overriding the parent", async () => {
     const second: MeasurementTarget = {
       name: "Example tent",
@@ -340,7 +387,7 @@ describe("platform recommendation comparison", () => {
         ),
       ).toBeVisible();
       expect(requests).toEqual([]);
-      expect(screen.getByText(/Matches your current names/)).toBeVisible();
+      expect(screen.getByText(/Matches your current names/)).not.toBeVisible();
       expect(
         screen.getByRole("region", {
           name: /Platform comparison for question group/,
@@ -367,7 +414,7 @@ describe("platform recommendation comparison", () => {
     setup([sample("a")], []);
     expect(
       screen.getByText(
-        "Set a tracked item to compare platform recommendations.",
+        "Explore each answer below, or add a tracked item to compare platform performance.",
       ),
     ).toBeVisible();
     expect(screen.queryByRole("table")).toBeNull();

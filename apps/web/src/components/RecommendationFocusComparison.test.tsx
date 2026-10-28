@@ -423,3 +423,77 @@ describe("tracked recommendation comparison", () => {
     expect(screen.queryByText("Alternative")).not.toBeInTheDocument();
   });
 });
+
+describe("compact answer recommendations", () => {
+  it("keeps answer order and tracked rank visible while expanding later occurrences and exact evidence", () => {
+    const items = [4, 1, 3, 2, 5].map((rank, index) =>
+      item({
+        name: `Example item ${index + 1}`,
+        mention_order: index + 1,
+        rank,
+        citation_urls:
+          index === 3
+            ? [
+                "https://example.test/selected",
+                "https://example.test/selected",
+                "javascript:alert(1)",
+              ]
+            : [],
+      }),
+    );
+    const onAnalyze = vi.fn();
+    const { container } = render(
+      <RecommendationFocusComparison
+        compact
+        items={items}
+        focusTargets={trackedTargets([items[3].name])}
+        onAnalyze={onAnalyze}
+      />,
+    );
+    const cards = screen.getAllByRole("article");
+    expect(cards.map((card) => card.getAttribute("aria-label"))).toEqual(
+      items.map((item) => item.name),
+    );
+    for (const card of cards.slice(0, 3)) expect(card).toBeVisible();
+    for (const card of cards.slice(3)) expect(card).not.toBeVisible();
+    expect(
+      screen
+        .getAllByText("Example item 4")
+        .find((element) => element.closest("p"))!
+        .closest("p"),
+    ).toBeVisible();
+    expect(screen.queryByText(/Top 3|前三名/)).not.toBeInTheDocument();
+    const disclosure = screen.getByText("展开全部 5 项推荐");
+    expect(disclosure.closest("details")).not.toHaveAttribute("open");
+    fireEvent.click(disclosure);
+    expect(
+      screen
+        .getAllByRole("article")
+        .map((card) => card.getAttribute("aria-label")),
+    ).toEqual(items.map((item) => item.name));
+    const card = within(screen.getByRole("article", { name: items[3].name }));
+    expect(card.getByText("引用 1 条")).toBeVisible();
+    expect(card.getByRole("button")).not.toBeVisible();
+    fireEvent.click(card.getByText("查看原文依据与引用"));
+    expect(card.getByRole("link")).toHaveAttribute(
+      "href",
+      "https://example.test/selected",
+    );
+    fireEvent.click(card.getByRole("button", { name: "分析改进方向" }));
+    expect(onAnalyze).toHaveBeenCalledExactlyOnceWith(items[3]);
+    expect(container.querySelector('a[href^="javascript:"]')).toBeNull();
+  });
+
+  it("shows unranked recommendations without a target and never infers mention-order ranks", () => {
+    render(
+      <RecommendationFocusComparison
+        compact
+        items={[item({ rank: null, mention_order: 1 })]}
+        focusTargets={[]}
+      />,
+    );
+    expect(screen.getByRole("article")).toBeVisible();
+    expect(screen.getByText("已推荐，未明确排名")).toBeVisible();
+    expect(screen.queryByText("推荐第 1 位")).not.toBeInTheDocument();
+  });
+});

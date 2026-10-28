@@ -16,12 +16,14 @@ function RecommendationCard({
   showKind = false,
   onAnalyze,
   analysisPending,
+  compact = false,
 }: {
   item: RecommendationItem;
   focused?: boolean;
   showKind?: boolean;
   onAnalyze?: (item: RecommendationItem) => void;
   analysisPending?: boolean;
+  compact?: boolean;
 }) {
   const { t } = useTranslation("recommendationFocusComparison");
   const urls = [
@@ -48,11 +50,13 @@ function RecommendationCard({
             ? t("unranked")
             : t("ranked", { rank: item.rank })}
         </span>
+        {compact && <span>{t("citationCount", { count: urls.length })}</span>}
       </div>
       <p style={{ margin: 0 }}>{item.reason || t("reasonMissing")}</p>
-      <RecommendationBrandAttribution item={item} />
+      {!compact && <RecommendationBrandAttribution item={item} />}
       <details>
         <summary style={{ cursor: "pointer" }}>{t("evidence")}</summary>
+        {compact && <RecommendationBrandAttribution item={item} />}
         <blockquote
           style={{
             margin: "8px 0",
@@ -74,8 +78,13 @@ function RecommendationCard({
             ))}
           </ul>
         )}
+        {compact && onAnalyze && (
+          <Button disabled={analysisPending} onClick={() => onAnalyze(item)}>
+            {t("analyzeImprovements")}
+          </Button>
+        )}
       </details>
-      {onAnalyze && (
+      {!compact && onAnalyze && (
         <Button disabled={analysisPending} onClick={() => onAnalyze(item)}>
           {t("analyzeImprovements")}
         </Button>
@@ -90,14 +99,79 @@ export function RecommendationFocusComparison({
   focusTargets,
   onAnalyze,
   analysisPending,
+  compact = false,
 }: {
   items: RecommendationItem[];
   focusTargets: readonly MeasurementTarget[];
   onAnalyze?: (item: RecommendationItem) => void;
   analysisPending?: boolean;
+  compact?: boolean;
 }) {
   const { t } = useTranslation("recommendationFocusComparison");
   const { t: focusT } = useTranslation("measurementFocus");
+  if (compact) {
+    const ordered = [...items].sort(
+      (a, b) => a.mention_order - b.mention_order,
+    );
+    const card = (item: RecommendationItem, index: number) => (
+      <RecommendationCard
+        key={`${item.kind}/${item.mention_order}/${index}`}
+        item={item}
+        focused={isMeasurementFocus(item, focusTargets)}
+        showKind
+        compact
+        onAnalyze={onAnalyze}
+        analysisPending={analysisPending}
+      />
+    );
+    return (
+      <section
+        aria-label={t("recommendedTitle")}
+        style={{ display: "grid", gap: 8, minWidth: 0 }}
+      >
+        {focusTargets.map((target) => {
+          const matches = items.filter((item) =>
+            isMeasurementFocus(item, [target]),
+          );
+          const ranks = new Set(matches.map((item) => item.rank));
+          const rank = matches[0]?.rank ?? null;
+          return (
+            <p
+              key={JSON.stringify([target.kind, target.name])}
+              style={{ margin: 0 }}
+            >
+              <strong>{target.name}</strong>
+              {" · "}
+              {target.kind === "brand" && (
+                <>
+                  {focusT("brandDirect")}
+                  {" · "}
+                </>
+              )}
+              {!matches.length
+                ? focusT("notFound", { name: target.name })
+                : ranks.size > 1
+                  ? t("ambiguous")
+                  : rank === null
+                    ? t("unranked")
+                    : t("ranked", { rank })}
+            </p>
+          );
+        })}
+        {ordered.slice(0, 3).map(card)}
+        {ordered.length > 3 && (
+          <details>
+            <summary style={{ cursor: "pointer" }}>
+              {t("showAll", { count: ordered.length })}
+            </summary>
+            <div style={{ display: "grid", gap: 8, marginTop: 8 }}>
+              {ordered.slice(3).map(card)}
+            </div>
+          </details>
+        )}
+      </section>
+    );
+  }
   const focusGroups = focusTargets
     .map((target) => ({
       target,

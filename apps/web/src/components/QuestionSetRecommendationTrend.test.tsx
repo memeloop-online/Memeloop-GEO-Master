@@ -179,6 +179,17 @@ function renderTrend(initialEntry = "/?tab=records&record=keep-record") {
 async function open() {
   await userEvent.click(screen.getByRole("button", { name: "排名变化" }));
 }
+async function expandDetails(label: string) {
+  const summary = await screen.findByText(label, { selector: "summary" });
+  expect(summary).toBeVisible();
+  if (!summary.closest("details")!.open) {
+    await userEvent.click(summary);
+  }
+}
+async function openSavedHistory() {
+  await expandDetails("报告详情");
+  await expandDetails("已保存的测量报告");
+}
 beforeEach(async () => {
   vi.clearAllMocks();
   auth.role = "member";
@@ -195,6 +206,8 @@ describe("question set rank reports", () => {
     renderTrend();
     expect(api.getMeasurementReportPreview).not.toHaveBeenCalled();
     await open();
+    expect(await screen.findByText("第 2 位")).not.toBeVisible();
+    await expandDetails("排名变化与历史");
     expect(await screen.findByText("第 2 位")).toBeVisible();
     expect(screen.getByText("第 3 位")).toBeVisible();
     expect(screen.getAllByText("出现顺序：1")).toHaveLength(2);
@@ -234,6 +247,8 @@ describe("question set rank reports", () => {
     await userEvent.click(
       await screen.findByRole("button", { name: "保存此范围的报告" }),
     );
+    await screen.findByText("第 4 位");
+    await expandDetails("排名变化与历史");
     expect(await screen.findByText("第 4 位")).toBeVisible();
     expect(api.saveMeasurementReport).toHaveBeenCalledWith(
       "tenant",
@@ -270,6 +285,7 @@ describe("question set rank reports", () => {
     const address =
       "/?tab=records&set=set-1&version=version-1&rankReport=report-1&record=keep-record";
     const first = renderTrend(address);
+    await expandDetails("排名变化与历史");
     expect(await screen.findByText("第 4 位")).toBeVisible();
     expect(api.getMeasurementReportPreview).not.toHaveBeenCalled();
     expect(api.getMeasurementReport).toHaveBeenCalledWith(
@@ -283,6 +299,7 @@ describe("question set rank reports", () => {
       samples: [sample("target-1", 1)],
     });
     renderTrend(address);
+    await expandDetails("排名变化与历史");
     expect(await screen.findByText("第 4 位")).toBeVisible();
     expect(api.getMeasurementReportPreview).not.toHaveBeenCalled();
     expect(api.getMeasurementReport).toHaveBeenCalledTimes(2);
@@ -290,6 +307,8 @@ describe("question set rank reports", () => {
     await userEvent.click(
       screen.getByRole("button", { name: "返回测量结果预览" }),
     );
+    await screen.findByText("第 1 位");
+    await expandDetails("排名变化与历史");
     expect(await screen.findByText("第 1 位")).toBeVisible();
     expect(screen.getByTestId("location")).toHaveTextContent(
       "set=set-1&version=version-1",
@@ -329,15 +348,21 @@ describe("question set rank reports", () => {
     });
     renderTrend();
     await open();
+    await openSavedHistory();
     await userEvent.click(
       await screen.findByRole("button", { name: /查看版本 1/ }),
     );
+    await screen.findByText("第 4 位");
+    await expandDetails("排名变化与历史");
     expect(await screen.findByText("第 4 位")).toBeVisible();
     await userEvent.click(screen.getByRole("button", { name: "收起排名变化" }));
     await open();
+    await openSavedHistory();
     await userEvent.click(
       await screen.findByRole("button", { name: /查看版本 1/ }),
     );
+    await screen.findByText("第 4 位");
+    await expandDetails("排名变化与历史");
     expect(await screen.findByText("第 4 位")).toBeVisible();
     expect(api.getMeasurementReport).toHaveBeenLastCalledWith(
       "tenant",
@@ -352,6 +377,7 @@ describe("question set rank reports", () => {
     renderTrend();
     await open();
     await screen.findByText("第 2 位");
+    await expandDetails("报告详情");
     await userEvent.click(screen.getByText("选择报告时间范围"));
     fireEvent.change(screen.getByLabelText("开始时间（本地时间）"), {
       target: { value: "2026-09-01T00:00" },
@@ -412,6 +438,7 @@ describe("question set rank reports", () => {
     });
     renderTrend();
     await open();
+    await openSavedHistory();
     await userEvent.click(
       await screen.findByRole("button", { name: /查看版本 1/ }),
     );
@@ -428,6 +455,7 @@ describe("question set rank reports", () => {
     });
     renderTrend();
     await open();
+    await expandDetails("排名变化与历史");
     expect(await screen.findByText("推荐结果尚未分析")).toBeVisible();
     expect(screen.queryByText("未出现在推荐结果中")).not.toBeInTheDocument();
   });
@@ -440,6 +468,7 @@ describe("question set rank reports", () => {
     expect(
       await screen.findByRole("heading", { name: "Question set rank reports" }),
     ).toBeVisible();
+    await expandDetails("Rank changes and history");
     expect(screen.getByText("Rank 2")).toBeVisible();
     expect(
       screen.queryByRole("button", { name: "Save report for this period" }),
