@@ -38,6 +38,14 @@
   margin-top: 16px;
 }
 
+.measurement-focus-settings > summary {
+  color: var(--colorNeutralForeground2);
+}
+
+.measurement-focus-settings[open] > summary {
+  margin-bottom: 12px;
+}
+
 .measurement-prediction summary,
 .question-sets-page details summary {
   cursor: pointer;

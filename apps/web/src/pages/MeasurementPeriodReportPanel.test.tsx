@@ -161,6 +161,7 @@ function setup(
   input: api.MeasurementPeriodPreview = preview,
   reports: api.MeasurementPeriodReportSummary[] = [],
   questionSet?: api.MeasurementReportQuestionSet,
+  layout: { embedded?: boolean; showFocusSettings?: boolean } = {},
 ) {
   const load = vi
     .spyOn(api, "getMeasurementReportPreview")
@@ -181,6 +182,7 @@ function setup(
             tenantId="tenant"
             projectId="project"
             questionSet={questionSet}
+            {...layout}
           />
           <LocationProbe />
         </MemoryRouter>
@@ -209,6 +211,26 @@ afterEach(async () => {
   await i18n.changeLanguage("zh-CN");
 });
 describe("cycle-free measurement report", () => {
+  it.each([undefined, true, false])(
+    "keeps embedded focus settings unless explicitly hidden (%s)",
+    async (showFocusSettings) => {
+      setup(preview, [], undefined, { embedded: true, showFocusSettings });
+      await screen.findByText("报告详情");
+      if (showFocusSettings === false) {
+        expect(screen.queryByLabelText("关注对象")).not.toBeInTheDocument();
+      } else {
+        expect(screen.getAllByLabelText("关注对象")).toHaveLength(1);
+        expect(screen.getByLabelText("关注对象")).toBeVisible();
+        expect(
+          screen.getByRole("button", { name: "设置关注对象" }),
+        ).toBeVisible();
+      }
+      expect(
+        screen.queryByRole("heading", { name: "话题测量报告" }),
+      ).not.toBeInTheDocument();
+    },
+  );
+
   it("captures PDF evidence, question, target aliases and language before loading the renderer", async () => {
     await i18n.changeLanguage("en");
     let releaseImport!: () => void;

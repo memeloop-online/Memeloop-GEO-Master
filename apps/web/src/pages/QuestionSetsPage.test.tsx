@@ -303,6 +303,19 @@ describe("P13 versioned question sets", () => {
         const path = new URL(String(request), "http://localhost").pathname;
         if (path.endsWith("/measurement-plans"))
           return new Promise<Response>(() => {});
+        if (path.endsWith("/projects/project-1"))
+          return Promise.resolve(
+            reply({
+              id: "project-1",
+              revision: 1,
+              settings: {
+                competitors: [],
+                measurement_targets: [
+                  { name: "Example lamp", kind: "product", aliases: [] },
+                ],
+              },
+            }),
+          );
         if (path.endsWith("/measurement-reports"))
           return Promise.resolve(reply({ items: [] }));
         if (path.endsWith("/measurement-reports/report-1"))
@@ -324,12 +337,68 @@ describe("P13 versioned question sets", () => {
               generated_at: "2026-10-01T00:00:00Z",
               input_hash: "hash",
               coverage: {
-                planned: 0,
-                counts: {},
+                planned: 1,
+                counts: { unknown: 1 },
                 observed_live: 0,
-                grounded_saved_analysis: 0,
+                grounded_saved_analysis: 1,
               },
-              samples: [],
+              samples: [
+                {
+                  plan_id: "plan-1",
+                  target_id: "target-1",
+                  attempt_id: "attempt-1",
+                  comparison_key: "provider|model|version-1|US|en",
+                  conditions: {
+                    question: "Which lamp suits camping?",
+                    question_set_version: "version-1",
+                    provider: "provider",
+                    model: "model",
+                    surface: "consumer_web",
+                    search_mode: "enabled",
+                    protocol_version: "v1",
+                    market: "US",
+                    language: "en",
+                    sample_ordinal: 1,
+                  },
+                  original_status: "unknown",
+                  observed_live: false,
+                  scheduled_at: "2026-09-01T00:00:00Z",
+                  observation: {
+                    raw_answer: "Example lamp is a useful camping choice.",
+                    citations: [],
+                    observed_at: "2026-09-01T00:00:00Z",
+                    received_at: "2026-09-01T00:01:00Z",
+                    provenance: {
+                      revision_id: "analysis-1",
+                      source: { kind: "capture", capture_id: "capture-1" },
+                      source_sha256: "digest",
+                      observed_at: "2026-09-01T00:00:00Z",
+                      analyzed_at: "2026-09-01T00:01:00Z",
+                      actual_model: "analysis-model",
+                      config_revision: 1,
+                      parser_version: "v1",
+                      prompt_version: "v1",
+                    },
+                  },
+                  recommendations: {
+                    version: "geo.recommendations.v2",
+                    status: "verified",
+                    items: [
+                      {
+                        name: "Example lamp",
+                        kind: "product",
+                        mention_order: 1,
+                        rank: 1,
+                        reason: "Portable",
+                        evidence_quote:
+                          "Example lamp is a useful camping choice.",
+                        citation_urls: [],
+                        brand_attribution: null,
+                      },
+                    ],
+                  },
+                },
+              ],
             }),
           );
         return baseFetch(request, init);
@@ -340,6 +409,48 @@ describe("P13 versioned question sets", () => {
     );
     await userEvent.click(await screen.findByText("报告详情"));
     expect(await screen.findByText("报告版本 1")).toBeVisible();
+    const report = screen.getByRole("region", { name: "测量报告" });
+    expect(report.closest(".fui-AccordionPanel")).toBeNull();
+    expect(
+      within(report).queryByRole("heading", { name: "问题集排名报告" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getAllByLabelText("关注对象")).toHaveLength(1);
+    expect(
+      within(report).getByRole("columnheader", { name: "推荐率" }),
+    ).toBeVisible();
+    expect(
+      within(report).getByRole("columnheader", {
+        name: "首位比例（明确排名推荐中）",
+      }),
+    ).toBeVisible();
+    const statistics = within(
+      within(report).getByRole("region", { name: "平台推荐对比" }),
+    ).getByRole("table");
+    expect(within(statistics).getAllByText(/1 \/ 1/)).toHaveLength(2);
+    for (const metric of within(statistics).getAllByText(/1 \/ 1/)) {
+      expect(metric).toBeVisible();
+    }
+    expect(screen.getByRole("button", { name: "测量历史" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    const focusSettings = screen.getByText("关注对象设置", {
+      selector: "summary",
+    });
+    expect(focusSettings.closest("details")).not.toHaveAttribute("open");
+    await userEvent.click(focusSettings);
+    expect(focusSettings.closest("details")).toHaveAttribute("open");
+    await userEvent.click(focusSettings);
+    expect(report).toBeVisible();
+    expect(
+      vi
+        .mocked(fetch)
+        .mock.calls.filter(([request]) =>
+          new URL(String(request), "http://localhost").pathname.endsWith(
+            "/measurement-reports/report-1",
+          ),
+        ),
+    ).toHaveLength(1);
     expect(
       calls.filter((call) =>
         /\/(serp-capabilities|serp-measurements|citation-insights|source-channel-recommendations|measurement-options|versions)(\/|$)/.test(
