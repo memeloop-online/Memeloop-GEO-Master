@@ -262,7 +262,7 @@ function mockApi(
       return Promise.resolve(
         response({
           session_id: "login-1",
-          account_id: "account-1",
+          account_id: body.account_id,
           phase: "login_required",
         }),
       );
@@ -344,13 +344,11 @@ function AuthStatusProbe() {
   );
 }
 
-function renderOperator() {
+function renderOperator(
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+) {
   return render(
-    <QueryClientProvider
-      client={
-        new QueryClient({ defaultOptions: { queries: { retry: false } } })
-      }
-    >
+    <QueryClientProvider client={client}>
       <FluentProvider theme={webLightTheme}>
         <AuthProvider>
           <AuthStatusProbe />
@@ -1309,6 +1307,142 @@ describe("account page", () => {
       ),
     ).toBe(true);
   });
+
+  it.each([
+    [false, "ready"],
+    [false, "expired"],
+    [true, "ready"],
+    [true, "expired"],
+  ] as const)(
+    "reconnects the selected existing account without creating another (operator=%s, status=%s)",
+    async (operator, status) => {
+      const existing = {
+        ...account,
+        account_id: "existing-account",
+        status,
+      };
+      const { requests } = mockApi([existing], operator);
+      if (operator) renderOperator();
+      else renderPage();
+      await userEvent.click(
+        await screen.findByRole("button", {
+          name: operator
+            ? "重新登录"
+            : status === "ready"
+              ? "重新连接"
+              : "登录并验证",
+        }),
+      );
+      await screen.findByRole("group", { name: "远程浏览器画面" });
+      const prefix = operator ? "/api/v1/operator" : "/api/v1";
+      expect(
+        requests.filter(
+          ({ method, path }) =>
+            method === "POST" && path === `${prefix}/channel-login-sessions`,
+        ),
+      ).toEqual([
+        expect.objectContaining({
+          body: operator
+            ? { account_id: existing.account_id }
+            : { project_id: "project-1", account_id: existing.account_id },
+        }),
+      ]);
+      expect(
+        requests.filter(
+          ({ method, path }) =>
+            method === "POST" && path.endsWith("/channel-accounts"),
+        ),
+      ).toHaveLength(0);
+    },
+  );
+
+  it.each([false, true])(
+    "retries saving the same verified session and refreshes the canonical account (operator=%s)",
+    async (operator) => {
+      const canonical = {
+        ...account,
+        account_id: "canonical-account",
+        display_name: "已更新的账号",
+      };
+      const { requests, fetchMock, setIdentityReady } = mockApi(
+        [{ ...canonical, display_name: "原有账号" }],
+        operator,
+      );
+      const defaultFetch = fetchMock.getMockImplementation()!;
+      let completionCount = 0;
+      fetchMock.mockImplementation((request, init) => {
+        const result = defaultFetch(request, init);
+        const path = new URL(String(request), "http://localhost").pathname;
+        if (path.endsWith("/channel-login-sessions/login-1/complete")) {
+          completionCount++;
+          return Promise.resolve(
+            completionCount === 1
+              ? response(
+                  {
+                    code: "conflict",
+                    message: "Connection could not be saved.",
+                  },
+                  409,
+                )
+              : response({ account: canonical }),
+          );
+        }
+        if (
+          completionCount > 1 &&
+          path.endsWith("/channel-accounts") &&
+          (init?.method ?? "GET") === "GET"
+        )
+          return Promise.resolve(response({ items: [canonical] }));
+        return result;
+      });
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      if (operator) renderOperator(client);
+      else renderPage("connect", client);
+      await userEvent.click(
+        await screen.findByRole("button", {
+          name: operator ? "创建并登录总部账号" : "启动远程登录",
+        }),
+      );
+      await screen.findByRole("group", { name: "远程浏览器画面" });
+      setIdentityReady();
+      await client.invalidateQueries({
+        queryKey: operator
+          ? ["operator-channel-login", "login-1"]
+          : ["channel-login", "tenant-1", "project-1", "login-1"],
+      });
+      const retry = await screen.findByRole("button", {
+        name: "重试保存连接",
+      });
+      expect(screen.getByText("Connection could not be saved.")).toBeVisible();
+      expect(screen.getByLabelText("远程登录")).toBeVisible();
+      expect(completionCount).toBe(1);
+      await userEvent.click(retry);
+      await screen.findByRole("heading", { name: canonical.display_name });
+      await waitFor(() =>
+        expect(screen.queryByLabelText("远程登录")).toBeNull(),
+      );
+      const writes = requests.filter(({ method }) => method === "POST");
+      expect(
+        writes.filter(({ path }) => path.endsWith("/channel-accounts")),
+      ).toHaveLength(1);
+      expect(
+        writes.filter(({ path }) => path.endsWith("/channel-login-sessions")),
+      ).toHaveLength(1);
+      expect(
+        writes
+          .filter(({ path }) => path.endsWith("/complete"))
+          .map(({ path, body }) => ({ path, body })),
+      ).toEqual(
+        Array.from({ length: 2 }, () => ({
+          path: `/api/v1/${operator ? "operator/" : ""}channel-login-sessions/login-1/complete`,
+          body: undefined,
+        })),
+      );
+      expect(requests.some(({ method }) => method === "DELETE")).toBe(false);
+    },
+  );
 
   it("creates a project-scoped group through the service", async () => {
     const { requests } = mockApi();

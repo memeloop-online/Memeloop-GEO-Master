@@ -4,6 +4,7 @@ use crate::{AppError, ChannelSecret, OperatorId, ProjectId, TenantId};
 /// Trusted verification result plus the account/session snapshot read before
 /// verification. Secret bytes never implement Debug or public serialization.
 pub struct VerifiedLoginStorage {
+    pub reconnect: Option<VerifiedLoginReconnect>,
     pub account_id: Uuid,
     pub secret_scope: crate::TenantScope,
     pub owner_kind: crate::ChannelOwnerKind,
@@ -14,6 +15,13 @@ pub struct VerifiedLoginStorage {
     pub display_name: String,
     pub avatar_url: Option<String>,
     pub session: ChannelSecret,
+}
+/// An already connected customer account discovered by a new login. The
+/// browser keeps its original owner; only the credential destination changes.
+pub struct VerifiedLoginReconnect {
+    pub source_account_id: Uuid,
+    pub reservation_id: Uuid,
+    pub network_binding_id: Uuid,
 }
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -62,6 +70,7 @@ pub struct BeginBrowserOperation {
 #[derive(Clone)]
 pub struct BrowserOperation {
     pub login_verified_at: Option<DateTime<Utc>>,
+    pub login_verified_account_id: Option<Uuid>,
     pub network_binding_id: Option<Uuid>,
     pub network_scope: Option<crate::AccountNetworkScope>,
     pub operation_id: Uuid,
@@ -82,6 +91,9 @@ pub struct BrowserOperation {
 }
 
 impl BrowserOperation {
+    pub fn owns_account(&self, account_id: Uuid) -> bool {
+        self.account_id == account_id || self.login_verified_account_id == Some(account_id)
+    }
     pub fn pin_network(
         &mut self,
         selection: &crate::BrowserNetworkSelection,
@@ -133,7 +145,11 @@ impl BrowserOperation {
         storage: &VerifiedLoginStorage,
     ) -> Result<(), AppError> {
         if &self.scope != scope
-            || self.account_id != storage.account_id
+            || self.account_id
+                != storage
+                    .reconnect
+                    .as_ref()
+                    .map_or(storage.account_id, |reconnect| reconnect.source_account_id)
             || self.purpose != BrowserOperationPurpose::Login
             || self.state != BrowserOperationState::StartRequested
             || scope.operator_id != storage.secret_scope.operator_id
@@ -145,6 +161,14 @@ impl BrowserOperation {
             || storage.session.encrypted_bytes().is_empty()
         {
             return Err(AppError::conflict("login no longer owns browser operation"));
+        }
+        if storage.reconnect.is_some()
+            && (storage.owner_kind != crate::ChannelOwnerKind::Customer
+                || self.account_id == storage.account_id
+                || storage.expected_platform_account_id.as_deref()
+                    != Some(storage.platform_account_id.as_str()))
+        {
+            return Err(AppError::conflict("login reconnect destination differs"));
         }
         match storage.owner_kind {
             crate::ChannelOwnerKind::Customer
@@ -179,6 +203,7 @@ impl BrowserOperation {
         }
         Ok(Self {
             login_verified_at: None,
+            login_verified_account_id: None,
             network_binding_id: None,
             network_scope: None,
             operation_id: input.operation_id,

@@ -22,6 +22,7 @@ fn decode<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> Result<T, App
 pub(crate) fn record(row: PgRow) -> Result<BrowserOperation, AppError> {
     Ok(BrowserOperation {
         login_verified_at: row.try_get("login_verified_at").map_err(db)?,
+        login_verified_account_id: row.try_get("login_verified_account_id").map_err(db)?,
         network_binding_id: row.try_get("network_binding_id").map_err(db)?,
         network_scope: row
             .try_get::<Option<serde_json::Value>, _>("network_scope")
@@ -217,7 +218,7 @@ impl BrowserOperationRepository for PgChannelJobRepository {
         account_id: Uuid,
     ) -> Result<Option<BrowserOperation>, AppError> {
         sqlx::query("SELECT op.* FROM browser_operations op JOIN channel_account_preflight_reservations gate ON gate.browser_operation_id=op.operation_id \
-            WHERE op.operator_id=$1 AND op.account_id=$2 AND op.state<>'\"Disposed\"'::jsonb")
+            WHERE op.operator_id=$1 AND gate.account_id=$2 AND op.state<>'\"Disposed\"'::jsonb")
             .bind(operator.as_uuid()).bind(account_id).fetch_optional(&self.pool).await.map_err(db)?.map(record).transpose()
     }
     async fn save_owned_login_session(
@@ -242,14 +243,59 @@ impl BrowserOperationRepository for PgChannelJobRepository {
         op.validate_login_commit(scope, storage)?;
         let gate: Option<Uuid> = sqlx::query_scalar("SELECT browser_operation_id FROM channel_account_preflight_reservations \
             WHERE operator_id=$1 AND account_id=$2 AND reservation_id=$3 AND browser_operation_id=$4 FOR UPDATE")
-            .bind(scope.operator_id.as_uuid()).bind(storage.account_id).bind(op.reservation_id).bind(operation_id)
+            .bind(scope.operator_id.as_uuid()).bind(op.account_id).bind(op.reservation_id).bind(operation_id)
             .fetch_optional(&mut *tx).await.map_err(db)?;
         if gate != Some(operation_id) {
             return Err(AppError::conflict("login account gate differs"));
         }
+        if let Some(reconnect) = &storage.reconnect {
+            super::account_networks::lock_head(&mut tx, scope.operator_id, storage.account_id)
+                .await?;
+            let target_gate: Option<Uuid> = sqlx::query_scalar(
+                "SELECT reservation_id FROM channel_account_preflight_reservations \
+                 WHERE operator_id=$1 AND account_id=$2 AND reservation_id=$3 \
+                 AND expires_at>$4 AND browser_operation_id IS NULL FOR UPDATE",
+            )
+            .bind(scope.operator_id.as_uuid())
+            .bind(storage.account_id)
+            .bind(reconnect.reservation_id)
+            .bind(at)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db)?;
+            if target_gate != Some(reconnect.reservation_id) {
+                return Err(AppError::conflict("reconnect account is in use"));
+            }
+            let network = super::account_networks::state_tx(
+                &mut tx,
+                &AccountNetworkScope {
+                    operator_id: scope.operator_id,
+                    tenant_id: Some(storage.secret_scope.tenant_id),
+                    project_id: storage.secret_scope.project_id,
+                    account_id: storage.account_id,
+                },
+            )
+            .await?;
+            if network.is_none_or(|head| head.active.binding_id != reconnect.network_binding_id) {
+                return Err(AppError::conflict("reconnect account network changed"));
+            }
+        }
         super::channels::save_verified_login_storage_tx(&mut tx, storage, at).await?;
-        sqlx::query("UPDATE browser_operations SET login_verified_at=COALESCE(login_verified_at,$2) WHERE operation_id=$1")
-            .bind(operation_id).bind(at).execute(&mut *tx).await.map_err(db)?;
+        if let Some(reconnect) = &storage.reconnect {
+            sqlx::query(
+                "UPDATE channel_account_preflight_reservations SET browser_operation_id=$4 \
+                WHERE operator_id=$1 AND account_id=$2 AND reservation_id=$3",
+            )
+            .bind(scope.operator_id.as_uuid())
+            .bind(storage.account_id)
+            .bind(reconnect.reservation_id)
+            .bind(operation_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        }
+        sqlx::query("UPDATE browser_operations SET login_verified_at=COALESCE(login_verified_at,$2),login_verified_account_id=$3 WHERE operation_id=$1")
+            .bind(operation_id).bind(at).bind(storage.account_id).execute(&mut *tx).await.map_err(db)?;
         tx.commit().await.map_err(db)?;
         Ok(())
     }
@@ -267,7 +313,7 @@ impl BrowserOperationRepository for PgChannelJobRepository {
         account_id: Uuid,
     ) -> Result<Option<BrowserOperation>, AppError> {
         sqlx::query("SELECT op.* FROM browser_operations op JOIN channel_account_preflight_reservations gate ON gate.browser_operation_id=op.operation_id \
-            WHERE op.operator_id=$1 AND op.account_id=$2 AND op.scope=$3 AND op.state<>'\"Disposed\"'::jsonb")
+            WHERE op.operator_id=$1 AND gate.account_id=$2 AND op.scope=$3 AND op.state<>'\"Disposed\"'::jsonb")
             .bind(scope.operator_id.as_uuid()).bind(account_id).bind(json(scope)?)
             .fetch_optional(&self.pool).await.map_err(db)?.map(record).transpose()
     }
@@ -340,16 +386,27 @@ impl BrowserOperationRepository for PgChannelJobRepository {
         .map_err(db)?
         .ok_or_else(|| AppError::not_found("browser operation not found"))?;
         let mut op = record(row)?;
+        if let Some(destination) = op
+            .login_verified_account_id
+            .filter(|id| *id != op.account_id)
+        {
+            super::account_networks::lock_head(&mut tx, scope.operator_id, destination).await?;
+        }
         op.transition(scope, action, at)?;
         sqlx::query("UPDATE browser_operations SET state=$2,version=$3,updated_at=$4,next_check_at=$5,released_unstarted=$6 WHERE operation_id=$1")
             .bind(id).bind(json(&op.state)?).bind(op.version).bind(op.updated_at).bind(op.next_check_at).bind(op.released_unstarted).execute(&mut *tx).await.map_err(db)?;
         if op.state == BrowserOperationState::Disposed {
-            let released=sqlx::query("DELETE FROM channel_account_preflight_reservations \
-                WHERE operator_id=$1 AND account_id=$2 AND reservation_id=$3 AND browser_operation_id=$4")
-                .bind(scope.operator_id.as_uuid()).bind(op.account_id).bind(op.reservation_id).bind(op.operation_id)
-                .execute(&mut *tx).await.map_err(db)?;
-            if released.rows_affected() == 1 {
-                super::account_networks::promote_pending(&mut tx, scope.operator_id, op.account_id)
+            let released: Vec<Uuid> = sqlx::query_scalar(
+                "DELETE FROM channel_account_preflight_reservations \
+                WHERE operator_id=$1 AND browser_operation_id=$2 RETURNING account_id",
+            )
+            .bind(scope.operator_id.as_uuid())
+            .bind(op.operation_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db)?;
+            for account_id in released {
+                super::account_networks::promote_pending(&mut tx, scope.operator_id, account_id)
                     .await?;
             }
         }

@@ -156,6 +156,7 @@ async fn single_queue_fixture(
 
 fn verified_storage(operator: OperatorId, account: Uuid) -> VerifiedLoginStorage {
     VerifiedLoginStorage {
+        reconnect: None,
         account_id: account,
         secret_scope: TenantScope::new(operator, Uuid::new_v4().into(), None),
         owner_kind: ChannelOwnerKind::OperatorPool,

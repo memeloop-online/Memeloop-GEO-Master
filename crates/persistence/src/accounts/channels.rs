@@ -191,6 +191,24 @@ pub(crate) async fn save_verified_login_storage_tx(
     storage: &geo_domain::VerifiedLoginStorage,
     at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), AppError> {
+    if let Some(reconnect) = &storage.reconnect {
+        let source: Option<Uuid> = sqlx::query_scalar(
+            "SELECT account_id FROM channel_accounts WHERE operator_id=$1 AND tenant_id=$2 \
+             AND project_id=$3 AND account_id=$4 AND platform=$5 AND platform_account_id IS NULL \
+             AND encrypted_session IS NULL AND metadata->>'owner_kind'='customer' FOR UPDATE",
+        )
+        .bind(storage.secret_scope.operator_id.as_uuid())
+        .bind(storage.secret_scope.tenant_id.as_uuid())
+        .bind(project(&storage.secret_scope)?)
+        .bind(reconnect.source_account_id)
+        .bind(&storage.platform)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db_error)?;
+        if source != Some(reconnect.source_account_id) {
+            return Err(AppError::conflict("login source is not an empty account"));
+        }
+    }
     lock_platform_identity(
         tx,
         storage.secret_scope.operator_id,
@@ -268,6 +286,20 @@ pub(crate) async fn save_verified_login_storage_tx(
         return Err(AppError::conflict(
             "login account changed during verification",
         ));
+    }
+    if let Some(reconnect) = &storage.reconnect {
+        sqlx::query(
+            "UPDATE channel_accounts SET metadata=metadata || $5::jsonb \
+             WHERE operator_id=$1 AND tenant_id=$2 AND project_id=$3 AND account_id=$4",
+        )
+        .bind(storage.secret_scope.operator_id.as_uuid())
+        .bind(storage.secret_scope.tenant_id.as_uuid())
+        .bind(project(&storage.secret_scope)?)
+        .bind(reconnect.source_account_id)
+        .bind(serde_json::json!({"enabled":false,"status":"disabled","updated_at":at}))
+        .execute(&mut **tx)
+        .await
+        .map_err(db_error)?;
     }
     Ok(())
 }

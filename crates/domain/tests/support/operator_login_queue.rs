@@ -440,6 +440,7 @@ pub async fn verify(
         .unwrap()
         .unwrap();
     let storage = VerifiedLoginStorage {
+        reconnect: None,
         account_id: second.account_id,
         secret_scope: TenantScope::new(operator, Uuid::new_v4().into(), None),
         owner_kind: ChannelOwnerKind::OperatorPool,
