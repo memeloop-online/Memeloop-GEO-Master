@@ -55,7 +55,7 @@ import {
   availableAnalysis,
   observationAnalysisKey,
 } from "./observationAnalysisResult";
-import "./measurementMessages";
+import { measurementDiagnosticKeys } from "./measurementMessages";
 import {
   PublicationLookupPanel,
   safeOriginalPublicUrl,
@@ -195,6 +195,24 @@ export function TargetCard({
                 ? t("automaticProviderUnavailable")
                 : t(`automaticOutcome.${status}`, { defaultValue: status });
   if (automatic && input.kind === "measure") {
+    const unknownExplanation = (outcome?: ChannelOutcome | null) => {
+      const diagnostic = measurementDiagnosticKeys(
+        outcome?.runner_evidence ?? [],
+      );
+      return (
+        <>
+          {diagnostic ? (
+            t("resultDiagnostic", {
+              stage: t(diagnostic.stage),
+              reason: t(diagnostic.reason),
+            })
+          ) : (
+            <span>{unknownDetail(outcome)}</span>
+          )}{" "}
+          {t("resultCheckLatest")}
+        </>
+      );
+    };
     const measurementDate = (value?: string | null) =>
       value
         ? new Date(value).toLocaleString(i18n.resolvedLanguage)
@@ -289,7 +307,7 @@ export function TargetCard({
                     {receipt}
                     {outcome?.status === "unknown" &&
                       !extractionPending(outcome) && (
-                        <p>{unknownDetail(outcome)}</p>
+                        <p>{unknownExplanation(outcome)}</p>
                       )}
                   </details>
                 </>
@@ -339,8 +357,30 @@ export function TargetCard({
           status === "unknown" &&
           !hasSavedAnswer &&
           !extractionPending(latestOutcome) && (
-            <p role="status">{unknownDetail(latestOutcome)}</p>
+            <p role="status">{unknownExplanation(latestOutcome)}</p>
           )}
+        <details>
+          <summary>{t("resultConditions")}</summary>
+          <p>{t("resultRequestedModel", { value: input.model })}</p>
+          <p>
+            {t("resultSurface", {
+              value:
+                input.surface === "consumer_web"
+                  ? t("resultConsumerWeb")
+                  : t("resultOtherCondition", { value: input.surface }),
+            })}
+          </p>
+          <p>
+            {t("resultSearchMode", {
+              value:
+                input.search_mode === "web_search"
+                  ? t("resultWebSearch")
+                  : t("resultOtherCondition", { value: input.search_mode }),
+            })}
+          </p>
+          <p>{t("resultMarket", { value: input.market })}</p>
+          <p>{t("resultLanguage", { value: input.language })}</p>
+        </details>
         <details
           onToggle={(event) =>
             setShowTechnicalDetails(event.currentTarget.open)

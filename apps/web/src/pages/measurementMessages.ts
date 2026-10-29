@@ -82,6 +82,36 @@ const zh = {
   automaticInFlight: "执行中或等待结果",
   automaticInFlightDetail: "正在等待测量结果。",
   automaticUnknownDetail: "未能确认本次测量结果。",
+  resultCheckLatest: "可刷新记录查看最新状态。",
+  resultDiagnostic: "{{stage}}未完成：{{reason}}",
+  resultDiagnosticStage: {
+    preparation: "测量准备",
+    settings: "测量设置",
+    configuration: "网页模型与联网设置",
+    submission: "问题提交",
+    capture: "回答采集",
+    prompt: "回答解析准备",
+    extraction: "回答解析",
+    verification: "回答核对",
+  },
+  resultDiagnosticReason: {
+    exception: "处理发生异常。",
+    timeout: "等待时间已用尽。",
+    cancelled: "处理已中断。",
+    empty: "未取得可用回答。",
+    persistence: "原始记录未能保存。",
+    sourceTooLarge: "原始回答记录过长。",
+    unverified: "未能确认所需回答或证据。",
+  },
+  resultConditions: "本次指定测量条件",
+  resultRequestedModel: "指定模型：{{value}}",
+  resultSurface: "测量方式：{{value}}",
+  resultSearchMode: "联网设置：{{value}}",
+  resultMarket: "市场：{{value}}",
+  resultLanguage: "语言：{{value}}",
+  resultConsumerWeb: "平台网页",
+  resultWebSearch: "联网搜索",
+  resultOtherCondition: "其他（{{value}}）",
   automaticProviderUnavailable: "平台暂时无法回答",
   automaticProviderUnavailableDetail: "平台暂时无法回答，请稍后再试。",
   automaticUnverifiedResult: "结果尚未验证",
@@ -108,7 +138,7 @@ const zh = {
     observed: "已取得测量结果",
     refused: "测量时被拒答",
     missing: "测量缺测",
-    unknown: "测量结果未知",
+    unknown: "结果待确认",
     failed: "测量失败",
     login_required: "需要重新登录",
     unsupported: "当前不支持测量",
@@ -205,6 +235,37 @@ const en = {
   automaticInFlight: "Running or awaiting a result",
   automaticInFlightDetail: "Waiting for a measurement result.",
   automaticUnknownDetail: "This measurement result could not be confirmed.",
+  resultCheckLatest: "Refresh the record to check its latest status.",
+  resultDiagnostic: "{{stage}} did not finish: {{reason}}",
+  resultDiagnosticStage: {
+    preparation: "Measurement preparation",
+    settings: "Measurement setup",
+    configuration: "Web model and search setup",
+    submission: "Question submission",
+    capture: "Answer capture",
+    prompt: "Answer analysis preparation",
+    extraction: "Answer analysis",
+    verification: "Answer verification",
+  },
+  resultDiagnosticReason: {
+    exception: "an unexpected error occurred.",
+    timeout: "the available time ran out.",
+    cancelled: "processing was interrupted.",
+    empty: "no usable answer was obtained.",
+    persistence: "the original record could not be saved.",
+    sourceTooLarge:
+      "the original response record exceeded the capture size limit.",
+    unverified: "the required answer or evidence could not be verified.",
+  },
+  resultConditions: "Requested measurement conditions",
+  resultRequestedModel: "Requested model: {{value}}",
+  resultSurface: "Measurement method: {{value}}",
+  resultSearchMode: "Search setting: {{value}}",
+  resultMarket: "Market: {{value}}",
+  resultLanguage: "Language: {{value}}",
+  resultConsumerWeb: "Platform website",
+  resultWebSearch: "Web search",
+  resultOtherCondition: "Other ({{value}})",
   automaticProviderUnavailable: "Platform temporarily unavailable",
   automaticProviderUnavailableDetail:
     "The platform could not answer at this time. Please try again later.",
@@ -233,7 +294,7 @@ const en = {
     observed: "Measurement result received",
     refused: "The question was refused",
     missing: "Measurement unavailable",
-    unknown: "Measurement result unknown",
+    unknown: "Result awaiting confirmation",
     failed: "Measurement failed",
     login_required: "Sign in again",
     unsupported: "Measurement not supported",
@@ -241,6 +302,81 @@ const en = {
     verified: "Verified",
   },
 } as const;
+
+/** Translate only the fixed observation diagnostic contract, never error text. */
+export function measurementDiagnosticKeys(evidence: unknown[]) {
+  const stages: Record<string, keyof typeof en.resultDiagnosticStage> = {
+    input_validation: "preparation",
+    navigation: "preparation",
+    configuration: "settings",
+    config_model_menu: "configuration",
+    config_model_selection: "configuration",
+    config_toolkit: "configuration",
+    config_search_menu: "configuration",
+    config_search_setting: "configuration",
+    composer: "submission",
+    capture: "capture",
+    capture_setup: "capture",
+    capture_submission: "submission",
+    capture_request: "submission",
+    capture_creation: "capture",
+    capture_response: "capture",
+    capture_stream: "capture",
+    capture_eof: "capture",
+    rendered_answer: "capture",
+    extraction_prompt: "prompt",
+    extraction: "extraction",
+    interpretation: "verification",
+  };
+  const reasons: Record<string, keyof typeof en.resultDiagnosticReason> = {
+    unexpected_exception: "exception",
+    timeout: "timeout",
+    policy_timeout: "timeout",
+    budget_exhausted: "timeout",
+    cancelled: "cancelled",
+    evidence_empty: "empty",
+    answer_empty: "empty",
+    returned_none: "empty",
+    evidence_persist_failed: "persistence",
+    source_too_large: "sourceTooLarge",
+    unverified: "unverified",
+    capture_unverified: "unverified",
+    grounding_rejected: "unverified",
+    model_unverified: "unverified",
+    shape_rejected: "unverified",
+    source_root_rejected: "unverified",
+    source_response_rejected: "unverified",
+    source_event_rejected: "unverified",
+    source_delta_rejected: "unverified",
+    source_fragment_rejected: "unverified",
+    path_rejected: "unverified",
+    owner_rejected: "unverified",
+    quote_rejected: "unverified",
+    citation_rejected: "unverified",
+    identifier_rejected: "unverified",
+    answer_type_rejected: "unverified",
+    answer_bounds_rejected: "unverified",
+    answer_too_large: "unverified",
+    unicode_rejected: "unverified",
+  };
+  for (const item of evidence) {
+    if (!item || typeof item !== "object") continue;
+    const diagnostic = item as Record<string, unknown>;
+    if (
+      diagnostic.kind === "observation_diagnostic" &&
+      diagnostic.schema_version === "geo.observation.diagnostic.v1" &&
+      typeof diagnostic.stage === "string" &&
+      Object.hasOwn(stages, diagnostic.stage) &&
+      typeof diagnostic.code === "string" &&
+      Object.hasOwn(reasons, diagnostic.code)
+    ) {
+      return {
+        stage: `resultDiagnosticStage.${stages[diagnostic.stage]}`,
+        reason: `resultDiagnosticReason.${reasons[diagnostic.code]}`,
+      };
+    }
+  }
+}
 
 i18n.addResourceBundle("zh-CN", "measurement", zh, true, true);
 i18n.addResourceBundle("en", "measurement", en, true, true);

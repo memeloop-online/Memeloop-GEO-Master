@@ -1235,7 +1235,7 @@ describe("standalone arbitrary-topic measurement", () => {
         name: /自定义问题测量|如何观察流星雨/,
       }),
     );
-    expect(await screen.findByText("测量结果未知")).toBeInTheDocument();
+    expect(await screen.findByText("结果待确认")).toBeInTheDocument();
     expect(screen.getByText(/结果接收时间/)).toHaveTextContent(
       new Date("2026-10-01T00:01:34Z").toLocaleString("zh-CN"),
     );

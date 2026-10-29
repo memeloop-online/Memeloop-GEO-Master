@@ -16,6 +16,7 @@ import { ChannelJobsPage, PlannedTarget, TargetCard } from "./ChannelJobsPage";
 import * as channelApi from "../api/channelJobs";
 import i18n from "../i18n";
 import type { ObservationAnalysisPage } from "../api/observationAnalysis";
+import { measurementDiagnosticKeys } from "./measurementMessages";
 
 const savedAnalysisPage: ObservationAnalysisPage = {
   next_after: null,
@@ -223,6 +224,172 @@ describe("measurement target visibility", () => {
 
 describe("automatic measurement results", () => {
   it.each([
+    [
+      "zh-CN",
+      "extraction_prompt",
+      "unexpected_exception",
+      "prompt",
+      "exception",
+    ],
+    ["en", "extraction_prompt", "unexpected_exception", "prompt", "exception"],
+    ["zh-CN", "capture", "source_too_large", "capture", "sourceTooLarge"],
+    ["en", "capture", "source_too_large", "capture", "sourceTooLarge"],
+    ["zh-CN", "configuration", "policy_timeout", "settings", "timeout"],
+    ["en", "configuration", "policy_timeout", "settings", "timeout"],
+  ])(
+    "explains %s %s/%s failure without configuration or reanalysis actions",
+    async (language, stage, code, stageKey, reasonKey) => {
+      await i18n.changeLanguage(language);
+      const { requests } = await renderAutomaticResult({
+        status: "unknown",
+        raw_answer: null,
+        runner_evidence: [
+          {
+            kind: "observation_diagnostic",
+            schema_version: "geo.observation.diagnostic.v1",
+            stage,
+            code,
+            message: "synthetic-sensitive-error",
+          },
+          {
+            kind: "observation_diagnostic",
+            schema_version: "geo.observation.diagnostic.v1",
+            stage: "interpretation",
+            code: "unverified",
+          },
+        ],
+      });
+      const reason = i18n.t("resultDiagnostic", {
+        ns: "measurement",
+        stage: i18n.t(`resultDiagnosticStage.${stageKey}`, {
+          ns: "measurement",
+        }),
+        reason: i18n.t(`resultDiagnosticReason.${reasonKey}`, {
+          ns: "measurement",
+        }),
+      });
+      expect(screen.getByText(reason, { exact: false })).toBeVisible();
+      expect(
+        screen.queryByText(
+          i18n.t("automaticUnknownDetail", { ns: "measurement" }),
+        ),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.getAllByText(
+          i18n.t("automaticOutcome.unknown", { ns: "measurement" }),
+          { exact: false },
+        ).length,
+      ).toBeGreaterThan(0);
+      expect(
+        screen.getByText(i18n.t("resultCheckLatest", { ns: "measurement" }), {
+          exact: false,
+        }),
+      ).toBeVisible();
+      expect(
+        screen.queryByRole("link", {
+          name: i18n.t("settings", { ns: "observationAnalysis" }),
+        }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", {
+          name: i18n.t("parse", { ns: "observationAnalysis" }),
+        }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByText(
+          /synthetic-sensitive-error|unexpected_exception|extraction_prompt|source_too_large/,
+        ),
+      ).not.toBeInTheDocument();
+      expect(
+        requests.filter((request) => request.method === "POST"),
+      ).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ["capture_stream", "timeout", "capture", "timeout"],
+    ["capture", "evidence_persist_failed", "capture", "persistence"],
+    ["capture_response", "answer_empty", "capture", "empty"],
+    ["capture", "source_too_large", "capture", "sourceTooLarge"],
+    ["configuration", "policy_timeout", "settings", "timeout"],
+    ["config_search_setting", "unverified", "configuration", "unverified"],
+  ])(
+    "maps fixed %s/%s diagnostics without inspecting error text",
+    (stage, code, stageKey, reasonKey) => {
+      expect(
+        measurementDiagnosticKeys([
+          {
+            kind: "observation_diagnostic",
+            schema_version: "geo.observation.diagnostic.v1",
+            stage,
+            code,
+          },
+        ]),
+      ).toEqual({
+        stage: `resultDiagnosticStage.${stageKey}`,
+        reason: `resultDiagnosticReason.${reasonKey}`,
+      });
+    },
+  );
+
+  it.each([
+    { stage: "synthetic-sensitive-error", code: "timeout" },
+    { stage: "capture", code: "synthetic-sensitive-error" },
+    { stage: "constructor", code: "timeout" },
+    { stage: "capture", code: "constructor" },
+    { stage: "capture", code: "grounded" },
+    { stage: "capture", code: "timeout", schema_version: "other" },
+  ])("ignores unrecognized diagnostic fields: %j", (fields) => {
+    expect(
+      measurementDiagnosticKeys([
+        {
+          kind: "observation_diagnostic",
+          schema_version: "geo.observation.diagnostic.v1",
+          ...fields,
+        },
+      ]),
+    ).toBeUndefined();
+  });
+
+  it.each(["zh-CN", "en"])(
+    "discloses requested conditions below the result without loading raw JSON in %s",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      const { container, requests } = await renderAutomaticResult({
+        status: "unknown",
+      });
+      const summary = screen.getByText(
+        i18n.t("resultConditions", { ns: "measurement" }),
+      );
+      const disclosure = summary.closest("details")!;
+      expect(disclosure).not.toHaveAttribute("open");
+      expect(disclosure.previousElementSibling).toHaveAttribute(
+        "role",
+        "status",
+      );
+      await userEvent.click(summary);
+      expect(disclosure).toHaveAttribute("open");
+      for (const [key, value] of [
+        ["resultRequestedModel", "example-model"],
+        ["resultSurface", i18n.t("resultConsumerWeb", { ns: "measurement" })],
+        ["resultSearchMode", i18n.t("resultWebSearch", { ns: "measurement" })],
+        ["resultMarket", "CN"],
+        ["resultLanguage", "zh-CN"],
+      ]) {
+        expect(
+          within(disclosure).getByText(
+            i18n.t(key, { ns: "measurement", value }),
+          ),
+        ).toBeVisible();
+      }
+      expect(container.querySelector("pre")).toBeNull();
+      expect(
+        requests.filter((request) => request.method === "POST"),
+      ).toHaveLength(0);
+    },
+  );
+
+  it.each([
     ["zh-CN", true],
     ["en", true],
     ["zh-CN", false],
@@ -258,7 +425,7 @@ describe("automatic measurement results", () => {
       ).toBeGreaterThan(0);
       expect(
         screen.queryByText(
-          /结果未知|未能确认本次测量结果|盲目重发|等待对账|Measurement result unknown/,
+          /结果未知|结果待确认|未能确认本次测量结果|盲目重发|等待对账|Result awaiting confirmation/,
         ),
       ).not.toBeInTheDocument();
       expect(
