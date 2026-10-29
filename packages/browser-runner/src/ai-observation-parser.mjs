@@ -69,6 +69,7 @@ const diagnosticCodes = new Set([
   "answer_too_large",
   "unicode_rejected",
   "evidence_persist_failed",
+  "source_too_large",
   "grounded",
   "cancelled",
   "budget_exhausted",
@@ -469,12 +470,13 @@ export async function interpretObservation(
       exchange,
       provider,
     );
-    prompt = extractionPrompt(document);
-  } catch {
+  } catch (error) {
     reportObservationDiagnostic(
       onDiagnostic,
-      "extraction_prompt",
-      "unexpected_exception",
+      "capture",
+      error?.message === "observation_input_too_large"
+        ? "source_too_large"
+        : "unexpected_exception",
     );
     return null;
   }
@@ -489,6 +491,18 @@ export async function interpretObservation(
       onDiagnostic,
       "capture",
       "evidence_persist_failed",
+    );
+    return null;
+  }
+  // Prompt construction is independent of the durable source checkpoint.
+  // A preparation failure must not discard already captured provider evidence.
+  try {
+    prompt = extractionPrompt(document);
+  } catch {
+    reportObservationDiagnostic(
+      onDiagnostic,
+      "extraction_prompt",
+      "unexpected_exception",
     );
     return null;
   }

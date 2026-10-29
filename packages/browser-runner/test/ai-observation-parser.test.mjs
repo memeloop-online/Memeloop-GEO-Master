@@ -70,6 +70,90 @@ test("persistence-only source helper hashes bounded status-bearing documents and
   );
 });
 
+test("prompt construction failure preserves the acknowledged source checkpoint", async (t) => {
+  const source = { messages: [{ text: "Synthetic captured answer." }] };
+  const stringify = JSON.stringify;
+  const stored = [];
+  const diagnostics = [];
+  let extractionCalls = 0;
+  let sourceSerializations = 0;
+  const serialization = t.mock.method(
+    JSON,
+    "stringify",
+    function (value, ...args) {
+      if (
+        value?.messages?.[0]?.text === "Synthetic captured answer." &&
+        ++sourceSerializations === 2
+      ) {
+        assert.equal(stored.length, 1);
+        throw new Error("private synthetic preparation failure");
+      }
+      return stringify.call(this, value, ...args);
+    },
+  );
+  let result;
+  try {
+    result = await interpretObservation(source, {
+      onEvidence: async (record) => {
+        await Promise.resolve();
+        stored.push(record);
+      },
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+      browserExtract: async () => {
+        extractionCalls += 1;
+      },
+      apiExtract: async () => {
+        extractionCalls += 1;
+      },
+      allowLegacyApi: false,
+    });
+  } finally {
+    serialization.mock.restore();
+  }
+  assert.equal(result, null);
+  assert.equal(extractionCalls, 0);
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0].phase, "source");
+  assert.equal(stored[0].source_json, JSON.stringify(source));
+  assert.equal(
+    stored[0].source_sha256,
+    createHash("sha256").update(stored[0].source_json).digest("hex"),
+  );
+  assert.deepEqual(
+    diagnostics.map(({ stage, code }) => ({ stage, code })),
+    [{ stage: "extraction_prompt", code: "unexpected_exception" }],
+  );
+  assert.doesNotMatch(JSON.stringify(diagnostics), /private|Synthetic/u);
+});
+
+test("oversized capture is distinguished from prompt preparation without leaking source", async () => {
+  const diagnostics = [];
+  let calls = 0;
+  const result = await interpretObservation(
+    { messages: [{ text: "界".repeat(250_001) }] },
+    {
+      onEvidence: async () => {
+        calls += 1;
+      },
+      browserExtract: async () => {
+        calls += 1;
+      },
+      apiExtract: async () => {
+        calls += 1;
+      },
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+      allowLegacyApi: false,
+    },
+  );
+  assert.equal(result, null);
+  assert.equal(calls, 0);
+  assert.deepEqual(
+    diagnostics.map(({ stage, code }) => ({ stage, code })),
+    [{ stage: "capture", code: "source_too_large" }],
+  );
+  assert.doesNotMatch(JSON.stringify(diagnostics), /界/u);
+});
+
 // Synthetic transport and extraction results only; no external requests.
 const exchange = {
   model: "observed-model",
