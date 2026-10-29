@@ -337,20 +337,53 @@ impl BrowserBridge {
                         "browser capability unavailable",
                     ));
                 }
+                Some(reason @ ("login_required" | "account_mismatch" | "challenge")) => {
+                    let message = match reason {
+                        "login_required" => "browser account identity is not verified",
+                        "account_mismatch" => "browser account differs from the connected account",
+                        _ => "browser account requires verification on the website",
+                    };
+                    return Err(AppError::conflict(message)
+                        .with_details(serde_json::json!({"reason": reason})));
+                }
+                Some(reason @ ("identity_not_ready" | "identity_probe_timeout")) => {
+                    return Err(AppError::new(
+                        ErrorCode::DependencyUnavailable,
+                        "browser account identity could not be checked; retry later",
+                    )
+                    .with_details(serde_json::json!({"reason": reason})));
+                }
+                Some(reason @ ("session_busy" | "session_starting" | "session_closing")) => {
+                    return Err(AppError::conflict(
+                        "browser session is occupied or changing state; retry later",
+                    )
+                    .with_details(serde_json::json!({"reason": reason})));
+                }
+                Some("measurement_options_unavailable") => {
+                    return Err(AppError::capability_missing(
+                        "website model menu is unavailable; retry later",
+                    )
+                    .with_details(
+                        serde_json::json!({"reason": "measurement_options_unavailable"}),
+                    ));
+                }
                 _ => {}
             }
-            return Err(
-                if status == StatusCode::CONFLICT || status == StatusCode::UNPROCESSABLE_ENTITY {
-                    AppError::conflict("browser login has not verified the account identity")
-                } else if status == StatusCode::NOT_FOUND {
-                    AppError::not_found("browser login session expired")
-                } else {
-                    AppError::new(
-                        ErrorCode::DependencyUnavailable,
-                        "browser runner unavailable",
-                    )
-                },
-            );
+            return Err(if status == StatusCode::CONFLICT {
+                AppError::conflict("browser operation conflicts with the current session state")
+            } else if status == StatusCode::UNPROCESSABLE_ENTITY {
+                AppError::new(
+                    ErrorCode::DependencyUnavailable,
+                    "browser operation result is unavailable",
+                )
+            } else if status == StatusCode::NOT_FOUND {
+                AppError::not_found("browser login session expired")
+            } else {
+                AppError::new(
+                    ErrorCode::DependencyUnavailable,
+                    "browser runner unavailable",
+                )
+            });
         }
         const MAX_RUNNER_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
         let mut body = Vec::new();
@@ -451,11 +484,6 @@ impl BrowserBridge {
                     "browser model discovery unavailable; retry when the connection is restored",
                 )
             })?;
-        if response.status() == StatusCode::UNPROCESSABLE_ENTITY {
-            return Err(AppError::capability_missing(
-                "website model menu is unavailable; reconnect or retry later",
-            ));
-        }
         let options: MeasurementOptions = Self::response(response).await?;
         options.validate()?;
         Ok(options)

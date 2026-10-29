@@ -67,13 +67,13 @@ async fn runner_errors_distinguish_missing_runtime_from_temporary_desktop_failur
             StatusCode::CONFLICT,
             json!({"error": "login_required"}).to_string(),
             ErrorCode::Conflict,
-            None,
+            Some("login_required"),
         ),
         (
             StatusCode::UNPROCESSABLE_ENTITY,
             json!({"error": "account_mismatch"}).to_string(),
             ErrorCode::Conflict,
-            None,
+            Some("account_mismatch"),
         ),
         (
             StatusCode::NOT_FOUND,
@@ -112,6 +112,124 @@ async fn runner_errors_distinguish_missing_runtime_from_temporary_desktop_failur
                 .and_then(|details| details["reason"].as_str()),
             reason
         );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn discovery_http_errors_preserve_only_known_runner_reasons() {
+    for (status, body, code, reason) in [
+        (
+            409,
+            json!({"error":"login_required"}),
+            ErrorCode::Conflict,
+            Some("login_required"),
+        ),
+        (
+            409,
+            json!({"error":"account_mismatch"}),
+            ErrorCode::Conflict,
+            Some("account_mismatch"),
+        ),
+        (
+            409,
+            json!({"error":"challenge"}),
+            ErrorCode::Conflict,
+            Some("challenge"),
+        ),
+        (
+            409,
+            json!({"error":"session_busy"}),
+            ErrorCode::Conflict,
+            Some("session_busy"),
+        ),
+        (
+            409,
+            json!({"error":"session_starting"}),
+            ErrorCode::Conflict,
+            Some("session_starting"),
+        ),
+        (
+            409,
+            json!({"error":"session_closing"}),
+            ErrorCode::Conflict,
+            Some("session_closing"),
+        ),
+        (
+            503,
+            json!({"error":"identity_not_ready"}),
+            ErrorCode::DependencyUnavailable,
+            Some("identity_not_ready"),
+        ),
+        (
+            503,
+            json!({"error":"identity_probe_timeout"}),
+            ErrorCode::DependencyUnavailable,
+            Some("identity_probe_timeout"),
+        ),
+        (
+            422,
+            json!({"error":"measurement_options_unavailable"}),
+            ErrorCode::CapabilityMissing,
+            Some("measurement_options_unavailable"),
+        ),
+        (
+            409,
+            json!({"error":"untrusted-secret"}),
+            ErrorCode::Conflict,
+            None,
+        ),
+        (
+            422,
+            json!({"error":"untrusted-secret"}),
+            ErrorCode::DependencyUnavailable,
+            None,
+        ),
+        (
+            409,
+            json!({"error": {"message":"untrusted-secret"}}),
+            ErrorCode::Conflict,
+            None,
+        ),
+        (
+            422,
+            json!({"error":"account_mismatch", "padding":"x".repeat(4096)}),
+            ErrorCode::DependencyUnavailable,
+            None,
+        ),
+    ] {
+        let session_id = Uuid::new_v4();
+        let app = Router::new()
+            .route(
+                &format!("/v1/sessions/{session_id}/complete"),
+                post({
+                    let body = body.clone();
+                    move || async move { (StatusCode::from_u16(status).unwrap(), axum::Json(body)) }
+                }),
+            )
+            .route(
+                &format!("/v1/sessions/{session_id}/measurement-options"),
+                get(move || async move { (StatusCode::from_u16(status).unwrap(), axum::Json(body)) }),
+            );
+        let (bridge, server) = serve(app).await;
+        for error in [
+            bridge
+                .complete(session_id)
+                .await
+                .err()
+                .expect("runner error"),
+            bridge.measurement_options(session_id).await.unwrap_err(),
+        ] {
+            assert_eq!(error.code, code);
+            assert_eq!(
+                error.details,
+                reason.map(|reason| json!({"reason": reason})),
+            );
+            assert!(!error.message.contains("untrusted-secret"));
+            if reason.is_none() {
+                assert!(!error.message.contains("identity"));
+            }
+        }
         server.abort();
     }
 }

@@ -611,10 +611,9 @@ export function createRunner(options = {}) {
     record.busy = true;
     try {
       const identity = await record.adapter.identify(record.page);
-      if (
-        !validateIdentity(identity) ||
-        identity.platform_account_id !== record.identity.platform_account_id
-      )
+      if (!validateIdentity(identity))
+        throw new RunnerError(503, "identity_not_ready");
+      if (identity.platform_account_id !== record.identity.platform_account_id)
         throw new RunnerError(409, "account_mismatch");
       const result = await record.adapter.inspectMeasurementOptions(
         record.page,
