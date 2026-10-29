@@ -553,6 +553,21 @@ impl ChannelRepository for MemoryChannelRepository {
         } else {
             None
         };
+        let reconnect_source = storage
+            .reconnect
+            .as_ref()
+            .map(|reconnect| key(&storage.secret_scope, reconnect.source_account_id))
+            .transpose()?;
+        if let Some(source) = reconnect_source
+            && !data.accounts.get(&source).is_some_and(|record| {
+                record.account.owner_kind == ChannelOwnerKind::Customer
+                    && record.account.platform == storage.platform
+                    && record.account.platform_account_id.is_none()
+                    && record.session.is_none()
+            })
+        {
+            return Err(AppError::conflict("login source is not an empty account"));
+        }
         if data.accounts.iter().any(|(k, r)| {
             k.0 == operator
                 && Some(*k) != customer_key
@@ -606,6 +621,12 @@ impl ChannelRepository for MemoryChannelRepository {
             None => {
                 save!(data.pool_accounts.get_mut(&(operator, storage.account_id)));
             }
+        }
+        if let Some(source) = reconnect_source {
+            let record = data.accounts.get_mut(&source).expect("validated source");
+            record.account.enabled = false;
+            record.account.status = ChannelStatus::Disabled;
+            record.account.updated_at = at;
         }
         Ok(())
     }

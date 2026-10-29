@@ -59,6 +59,7 @@ pub async fn verify_login_commit(
         .await
         .unwrap();
     let storage = VerifiedLoginStorage {
+        reconnect: None,
         account_id,
         secret_scope: TenantScope::new(operator, Uuid::new_v4().into(), None),
         owner_kind: ChannelOwnerKind::OperatorPool,

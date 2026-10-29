@@ -1922,7 +1922,7 @@ pub async fn complete_login(
     let scope = scope(&state, &tenant, query.project_id)
         .await
         .map_err(|e| err(e, context))?;
-    let session = valid_login(&state, &scope, &auth, id, false)
+    let session = valid_login(&state, &scope, &auth, id, true)
         .await
         .map_err(|e| err(e, context))?;
     state
@@ -1931,79 +1931,6 @@ pub async fn complete_login(
         .await
         .map_err(|e| err(e, context))?;
     let service = state.channel_service();
-    let browser = service.browser().map_err(|e| err(e, context))?;
-    let record = service
-        .repository
-        .get_account(&scope, session.account_id)
-        .await
-        .map_err(|e| err(e, context))?;
-    let verified = browser.complete(id).await.map_err(|e| err(e, context))?;
-    if verified.identity.platform_account_id.trim().is_empty()
-        || verified.identity.display_name.trim().is_empty()
-    {
-        return Err(err(
-            AppError::conflict("connector did not verify account identity"),
-            context,
-        ));
-    }
-    if !record.account.enabled {
-        return Err(err(AppError::conflict("account is disabled"), context));
-    }
-    if record
-        .account
-        .platform_account_id
-        .as_ref()
-        .is_some_and(|prior| prior != &verified.identity.platform_account_id)
-    {
-        return Err(err(
-            AppError::conflict("login resolved to a different platform account"),
-            context,
-        ));
-    }
-    let bytes = serde_json::to_vec(&verified.storage_state).map_err(|_| {
-        err(
-            AppError::new(ErrorCode::Internal, "browser session invalid"),
-            context,
-        )
-    })?;
-    if bytes.len() > 2 * 1024 * 1024 {
-        return Err(err(
-            AppError::invalid_request("browser session exceeds maximum size"),
-            context,
-        ));
-    }
-    let storage = geo_domain::VerifiedLoginStorage {
-        account_id: session.account_id,
-        secret_scope: scope.clone(),
-        owner_kind: ChannelOwnerKind::Customer,
-        platform: record.account.platform,
-        expected_platform_account_id: record.account.platform_account_id,
-        expected_session: record.session,
-        platform_account_id: verified.identity.platform_account_id,
-        display_name: verified.identity.display_name,
-        avatar_url: verified.identity.avatar_url,
-        session: service
-            .encrypt(&scope, session.account_id, "session", &bytes)
-            .map_err(|e| err(e, context))?,
-    };
-    service
-        .operations()
-        .map_err(|e| err(e, context))?
-        .save_owned_login_session(
-            &login_operation_scope(&scope, &auth, false),
-            id,
-            &storage,
-            service.repository.as_ref(),
-            Utc::now(),
-        )
-        .await
-        .map_err(|e| err(e, context))?;
-    let account = service
-        .repository
-        .get_account(&scope, session.account_id)
-        .await
-        .map_err(|e| err(e, context))?
-        .account;
     let operation = authorize_login_operation(
         &state,
         &login_operation_scope(&scope, &auth, false),
@@ -2012,6 +1939,173 @@ pub async fn complete_login(
     )
     .await
     .map_err(|e| err(e, context))?;
+    let account = if let Some(account_id) = operation.login_verified_account_id {
+        service
+            .repository
+            .get_account(&scope, account_id)
+            .await
+            .map_err(|e| err(e, context))?
+            .account
+    } else {
+        if operation.state == geo_domain::BrowserOperationState::Disposed
+            || Utc::now() - session.created_at > Duration::minutes(20)
+        {
+            return Err(err(AppError::not_found("login session expired"), context));
+        }
+        let browser = service.browser().map_err(|e| err(e, context))?;
+        let mut record = service
+            .repository
+            .get_account(&scope, session.account_id)
+            .await
+            .map_err(|e| err(e, context))?;
+        let verified = browser.complete(id).await.map_err(|e| err(e, context))?;
+        if verified.identity.platform_account_id.trim().is_empty()
+            || verified.identity.display_name.trim().is_empty()
+        {
+            return Err(err(
+                AppError::conflict("connector did not verify account identity"),
+                context,
+            ));
+        }
+        if !record.account.enabled {
+            return Err(err(AppError::conflict("account is disabled"), context));
+        }
+        if record
+            .account
+            .platform_account_id
+            .as_ref()
+            .is_some_and(|prior| prior != &verified.identity.platform_account_id)
+        {
+            return Err(err(
+                AppError::conflict("login resolved to a different platform account"),
+                context,
+            ));
+        }
+        let bytes = serde_json::to_vec(&verified.storage_state).map_err(|_| {
+            err(
+                AppError::new(ErrorCode::Internal, "browser session invalid"),
+                context,
+            )
+        })?;
+        if bytes.len() > 2 * 1024 * 1024 {
+            return Err(err(
+                AppError::invalid_request("browser session exceeds maximum size"),
+                context,
+            ));
+        }
+        // A new login can identify an account that is already connected. Reuse
+        // only this project's customer record, never a pool or another scope.
+        if record.account.platform_account_id.is_none()
+            && record.session.is_none()
+            && let Some(existing) = service
+                .repository
+                .list_accounts(&scope)
+                .await
+                .map_err(|e| err(e, context))?
+                .into_iter()
+                .find(|account| {
+                    account.owner_kind == ChannelOwnerKind::Customer
+                        && account.platform == record.account.platform
+                        && account.platform_account_id.as_deref()
+                            == Some(verified.identity.platform_account_id.as_str())
+                })
+        {
+            record = service
+                .repository
+                .get_account(&scope, existing.account_id)
+                .await
+                .map_err(|e| err(e, context))?;
+        }
+        let account_id = record.account.account_id;
+        let reservation_id = (account_id != session.account_id).then(Uuid::new_v4);
+        if let Some(reservation_id) = reservation_id {
+            let now = Utc::now();
+            service
+                .operations()
+                .map_err(|e| err(e, context))?
+                .reserve_account(
+                    &scope,
+                    account_id,
+                    reservation_id,
+                    now,
+                    now + geo_domain::CHANNEL_EXECUTION_LEASE,
+                )
+                .await
+                .map_err(|e| err(e, context))?;
+        }
+        let saved = async {
+            let reconnect = if let Some(reservation_id) = reservation_id {
+                let network_scope = service.account_network_scope(&scope, account_id).await?;
+                let network = service
+                    .operations()?
+                    .get_account_network(&network_scope)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::conflict("connected account network is unavailable")
+                    })?;
+                let source_proxy =
+                    serde_json::to_value(service.operation_proxy(&operation, &scope)?)
+                        .map_err(|_| AppError::conflict("login network is unavailable"))?;
+                let target_proxy = serde_json::to_value(service.binding_proxy(&network.active)?)
+                    .map_err(|_| AppError::conflict("connected account network is unavailable"))?;
+                if source_proxy != target_proxy {
+                    return Err(AppError::conflict(
+                        "login network differs from the connected account",
+                    ));
+                }
+                Some(geo_domain::VerifiedLoginReconnect {
+                    source_account_id: session.account_id,
+                    reservation_id,
+                    network_binding_id: network.active.binding_id,
+                })
+            } else {
+                None
+            };
+            let storage = geo_domain::VerifiedLoginStorage {
+                reconnect,
+                account_id,
+                secret_scope: scope.clone(),
+                owner_kind: ChannelOwnerKind::Customer,
+                platform: record.account.platform,
+                expected_platform_account_id: record.account.platform_account_id,
+                expected_session: record.session,
+                platform_account_id: verified.identity.platform_account_id,
+                display_name: verified.identity.display_name,
+                avatar_url: verified.identity.avatar_url,
+                session: service.encrypt(&scope, account_id, "session", &bytes)?,
+            };
+            service
+                .operations()?
+                .save_owned_login_session(
+                    &login_operation_scope(&scope, &auth, false),
+                    id,
+                    &storage,
+                    service.repository.as_ref(),
+                    Utc::now(),
+                )
+                .await
+        }
+        .await;
+        if saved.is_err()
+            && let Some(reservation_id) = reservation_id
+        {
+            let released = service
+                .operations()
+                .map_err(|e| err(e, context))?
+                .release_account(&scope, account_id, reservation_id)
+                .await;
+            saved.map_err(|e| err(e, context))?;
+            released.map_err(|e| err(e, context))?;
+        } else {
+            saved.map_err(|e| err(e, context))?;
+        }
+        service
+            .repository
+            .get_account(&scope, account_id)
+            .await
+            .map_err(|e| err(e, context))?
+            .account
+    };
     service
         .dispose_owned_operation(&operation)
         .await
@@ -2798,6 +2892,7 @@ pub(crate) async fn verify_pool_login(
         ));
     }
     let storage = geo_domain::VerifiedLoginStorage {
+        reconnect: None,
         account_id: session.account_id,
         secret_scope: scope.clone(),
         owner_kind: ChannelOwnerKind::OperatorPool,

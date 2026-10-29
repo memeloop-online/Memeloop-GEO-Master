@@ -1033,7 +1033,7 @@ impl crate::AccountNetworkBindingRepository for MemoryChannelJobRepository {
                         .contains_key(&(scope.operator_id.as_uuid(), account.account_id))
                     && operations.values().any(|op| {
                         op.scope.operator_id == scope.operator_id
-                            && op.account_id == account.account_id
+                            && op.owns_account(account.account_id)
                             && op.state != crate::BrowserOperationState::Disposed
                     })
                     && channels
@@ -1074,7 +1074,7 @@ impl crate::AccountNetworkBindingRepository for MemoryChannelJobRepository {
                 .values()
                 .find(|op| {
                     op.scope.operator_id == scope.operator_id
-                        && op.account_id == binding.scope.account_id
+                        && op.owns_account(binding.scope.account_id)
                         && op.state != crate::BrowserOperationState::Disposed
                 })
                 .map(|op| op.operation_id);
@@ -1108,7 +1108,7 @@ impl crate::AccountNetworkBindingRepository for MemoryChannelJobRepository {
                 let mut head = head.clone();
                 head.busy = operations.values().any(|op| {
                     op.scope.operator_id == scope.operator_id
-                        && op.account_id == scope.account_id
+                        && op.owns_account(scope.account_id)
                         && op.state != crate::BrowserOperationState::Disposed
                 });
                 Ok(Some(head))
@@ -1150,7 +1150,7 @@ impl crate::AccountNetworkBindingRepository for MemoryChannelJobRepository {
             .await?;
         let active_op = operations.values().find(|op| {
             op.scope.operator_id == scope.operator_id
-                && op.account_id == scope.account_id
+                && op.owns_account(scope.account_id)
                 && op.state != crate::BrowserOperationState::Disposed
         });
         let mut staged = networks.clone();
@@ -1206,7 +1206,7 @@ impl crate::BrowserOperationRepository for MemoryChannelJobRepository {
             .values()
             .find(|op| {
                 op.scope.operator_id == operator
-                    && op.account_id == account_id
+                    && op.owns_account(account_id)
                     && op.state != crate::BrowserOperationState::Disposed
             })
             .cloned())
@@ -1219,26 +1219,54 @@ impl crate::BrowserOperationRepository for MemoryChannelJobRepository {
         channels: &dyn crate::ChannelRepository,
         at: DateTime<Utc>,
     ) -> Result<(), AppError> {
-        let gates = self.1.lock().await;
+        let mut gates = self.1.lock().await;
         let mut operations = self.2.lock().await;
         let op = operations
             .get(&operation_id)
             .ok_or_else(|| AppError::not_found("browser operation not found"))?;
         op.validate_login_commit(scope, storage)?;
         if !gates
-            .get(&(scope.operator_id.as_uuid(), storage.account_id))
+            .get(&(scope.operator_id.as_uuid(), op.account_id))
             .is_some_and(|(owner, _)| *owner == op.reservation_id)
         {
             return Err(AppError::conflict("login account gate differs"));
         }
+        let networks = self.3.lock().await;
+        if let Some(reconnect) = &storage.reconnect {
+            let key = (scope.operator_id.as_uuid(), storage.account_id);
+            if !gates
+                .get(&key)
+                .is_some_and(|(owner, expiry)| *owner == reconnect.reservation_id && *expiry > at)
+                || operations.values().any(|other| {
+                    other.scope.operator_id == scope.operator_id
+                        && other.owns_account(storage.account_id)
+                        && other.state != crate::BrowserOperationState::Disposed
+                })
+            {
+                return Err(AppError::conflict("reconnect account is in use"));
+            }
+            if !networks.heads.get(&key).is_some_and(|head| {
+                head.active.binding_id == reconnect.network_binding_id
+                    && head.active.scope.tenant_id == Some(storage.secret_scope.tenant_id)
+                    && head.active.scope.project_id == storage.secret_scope.project_id
+            }) {
+                return Err(AppError::conflict("reconnect account network changed"));
+            }
+        }
         // Disposal takes these exact locks. Verification may finish after cancel,
         // but its credential write cannot pass the terminal state boundary.
         channels.save_verified_login_storage(storage, at).await?;
-        operations
+        if storage.reconnect.is_some() {
+            gates.insert(
+                (scope.operator_id.as_uuid(), storage.account_id),
+                (op.reservation_id, op.expires_at),
+            );
+        }
+        let op = operations
             .get_mut(&operation_id)
-            .expect("validated operation")
-            .login_verified_at
-            .get_or_insert(at);
+            .expect("validated operation");
+        op.login_verified_at.get_or_insert(at);
+        op.login_verified_account_id = Some(storage.account_id);
         Ok(())
     }
     async fn browser_operation_exists(
@@ -1265,7 +1293,7 @@ impl crate::BrowserOperationRepository for MemoryChannelJobRepository {
             .values()
             .find(|op| {
                 &op.scope == scope
-                    && op.account_id == account_id
+                    && op.owns_account(account_id)
                     && op.state != crate::BrowserOperationState::Disposed
             })
             .cloned())
@@ -1342,26 +1370,32 @@ impl crate::BrowserOperationRepository for MemoryChannelJobRepository {
         op.transition(scope, action, at)?;
         let result = op.clone();
         if !was_disposed && result.state == crate::BrowserOperationState::Disposed {
-            let key = (scope.operator_id.as_uuid(), result.account_id);
-            let another_owner = operations.values().any(|other| {
-                other.operation_id != id
-                    && other.scope.operator_id == scope.operator_id
-                    && other.account_id == result.account_id
-                    && other.state != crate::BrowserOperationState::Disposed
-            });
-            if !another_owner
-                && gates
-                    .get(&key)
-                    .is_some_and(|(owner, _)| *owner == result.reservation_id)
+            for account_id in [Some(result.account_id), result.login_verified_account_id]
+                .into_iter()
+                .flatten()
+                .collect::<std::collections::HashSet<_>>()
             {
-                gates.remove(&key);
-                let mut networks = self.3.lock().await;
-                if let Some(head) = networks.heads.get_mut(&key) {
-                    if let Some(pending) = head.pending.take() {
-                        head.active = pending;
-                        head.version += 1;
+                let key = (scope.operator_id.as_uuid(), account_id);
+                let another_owner = operations.values().any(|other| {
+                    other.operation_id != id
+                        && other.scope.operator_id == scope.operator_id
+                        && other.owns_account(account_id)
+                        && other.state != crate::BrowserOperationState::Disposed
+                });
+                if !another_owner
+                    && gates
+                        .get(&key)
+                        .is_some_and(|(owner, _)| *owner == result.reservation_id)
+                {
+                    gates.remove(&key);
+                    let mut networks = self.3.lock().await;
+                    if let Some(head) = networks.heads.get_mut(&key) {
+                        if let Some(pending) = head.pending.take() {
+                            head.active = pending;
+                            head.version += 1;
+                        }
+                        head.busy = false;
                     }
-                    head.busy = false;
                 }
             }
         }
@@ -1395,7 +1429,7 @@ pub(crate) fn prepare_memory_browser(
     if operations.values().any(|op| {
         op.session_id == input.session_id
             || (op.scope.operator_id == scope.operator_id
-                && op.account_id == input.account_id
+                && op.owns_account(input.account_id)
                 && op.state != crate::BrowserOperationState::Disposed)
     }) {
         return Err(AppError::conflict("browser ownership busy"));
@@ -2045,7 +2079,7 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
         let key = (scope.operator_id.as_uuid(), account_id);
         if self.2.lock().await.values().any(|op| {
             op.scope.operator_id == scope.operator_id
-                && op.account_id == account_id
+                && op.owns_account(account_id)
                 && op.state != crate::BrowserOperationState::Disposed
         }) {
             return Err(AppError::conflict("channel account browser busy"));
@@ -2071,7 +2105,7 @@ impl ChannelJobRepository for MemoryChannelJobRepository {
         let key = (scope.operator_id.as_uuid(), account_id);
         if self.2.lock().await.values().any(|op| {
             op.scope.operator_id == scope.operator_id
-                && op.account_id == account_id
+                && op.owns_account(account_id)
                 && op.state != crate::BrowserOperationState::Disposed
         }) {
             return Ok(());
