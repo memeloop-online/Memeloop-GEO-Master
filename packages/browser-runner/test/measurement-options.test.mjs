@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { inspectKimiMeasurementOptions } from "../src/kimi-connect-search.mjs";
 import { createRunner } from "../src/runner.mjs";
+import { createRunnerServer } from "../src/server.mjs";
 
 const observed = {
   models: [{ id: "observed-model", label: "Observed model" }],
@@ -135,14 +136,18 @@ test("model inspection keeps identity and unavailable-result guards without send
     await create();
     await runner.complete("inspection");
     const identity = state.identity;
-    for (const changed of [
-      null,
-      { ...identity, platform_account_id: "other-account" },
+    for (const [changed, status, code] of [
+      [null, 503, "identity_not_ready"],
+      [
+        { ...identity, platform_account_id: "other-account" },
+        409,
+        "account_mismatch",
+      ],
     ]) {
       state.identity = changed;
       await assert.rejects(
         runner.measurementOptions("inspection"),
-        runnerError(409, "account_mismatch"),
+        runnerError(status, code),
       );
     }
     assert.equal(state.inspections, 0);
@@ -185,6 +190,65 @@ test("model inspection reserves its session and releases it after completion", a
     assert.equal(state.executions, 0);
   } finally {
     finish(observed);
+    await runner.shutdown();
+  }
+});
+
+test("model discovery HTTP distinguishes missing identity, mismatch and unavailable models", async () => {
+  const { runner, state, create } = inspectionFixture([], "installed");
+  const server = createRunnerServer({
+    token: "fixture-token",
+    runner,
+    subsetPdfFont: null,
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${server.address().port}/v1/sessions/inspection`;
+  const request = async (path, method = "GET") => {
+    const response = await fetch(`${url}/${path}`, {
+      method,
+      headers: { authorization: "Bearer fixture-token" },
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  try {
+    await create();
+    const identity = state.identity;
+    state.identity = null;
+    assert.deepEqual(await request("complete", "POST"), {
+      status: 409,
+      body: { error: "login_required" },
+    });
+    state.identity = identity;
+    assert.equal((await request("complete", "POST")).status, 200);
+    for (const [changed, status, error] of [
+      [null, 503, "identity_not_ready"],
+      [
+        { ...identity, platform_account_id: "other-account" },
+        409,
+        "account_mismatch",
+      ],
+    ]) {
+      state.identity = changed;
+      assert.deepEqual(await request("measurement-options"), {
+        status,
+        body: { error },
+      });
+    }
+    assert.equal(state.inspections, 0);
+    state.identity = identity;
+    state.options = null;
+    assert.deepEqual(await request("measurement-options"), {
+      status: 422,
+      body: { error: "measurement_options_unavailable" },
+    });
+    state.options = observed;
+    assert.deepEqual(await request("measurement-options"), {
+      status: 200,
+      body: observed,
+    });
+    assert.equal(state.executions, 0);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
     await runner.shutdown();
   }
 });
