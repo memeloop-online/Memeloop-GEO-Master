@@ -461,7 +461,7 @@ describe("saved response analysis", () => {
   });
 
   it.each(["zh-CN", "en"])(
-    "shows interrupted automatic failure guidance and existing settings in %s",
+    "shows interrupted automatic failure guidance without assuming missing configuration in %s",
     async (language) => {
       await i18n.changeLanguage(language);
       const { create } = setup([], true, true, {
@@ -477,10 +477,10 @@ describe("saved response analysis", () => {
         ),
       ).toBeInTheDocument();
       expect(
-        screen.getByRole("link", {
+        screen.queryByRole("link", {
           name: i18n.t("settings", { ns: "observationAnalysis" }),
         }),
-      ).toHaveAttribute("href", "/app/tenant/project/settings?tab=ai");
+      ).not.toBeInTheDocument();
       expect(
         screen.getByRole("button", {
           name: i18n.t("parse", { ns: "observationAnalysis" }),
@@ -618,7 +618,7 @@ describe("saved response analysis", () => {
     ["zh-CN", "配置解析模型", "重新解析"],
     ["en", "Configure analysis model", "Reanalyze"],
   ])(
-    "keeps direct optional AI settings navigation available after analysis failure in %s",
+    "offers direct AI settings navigation for explicit missing configuration in %s",
     async (language, linkName, reanalyzeName) => {
       await i18n.changeLanguage(language);
       const { create } = setup([
@@ -630,7 +630,7 @@ describe("saved response analysis", () => {
             candidate_json: null,
             prompt_tokens: 0,
             completion_tokens: 0,
-            outcome: { status: "failed", code: "model_http_unauthorized" },
+            outcome: { status: "failed", code: "model_unconfigured" },
           },
         },
       ]);
@@ -684,6 +684,41 @@ describe("saved response analysis", () => {
       expect(message).not.toContain(code);
     }
   });
+
+  it.each(["zh-CN", "en"])(
+    "does not redirect other failures or resolved configuration failures to setup in %s",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      const { create } = setup(
+        ["model_timeout", "model_unconfigured"].map((code, index) => ({
+          ...revision,
+          request: { ...revision.request, revision_id: `revision-${index}` },
+          state: "completed",
+          result: {
+            actual_model: null,
+            candidate_json: null,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            outcome: { status: "failed", code },
+          },
+        })),
+      );
+      await screen.findByText(
+        i18n.t("failureTimeout", { ns: "observationAnalysis" }),
+      );
+      expect(
+        screen.queryByRole("link", {
+          name: i18n.t("settings", { ns: "observationAnalysis" }),
+        }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.getByRole("button", {
+          name: i18n.t("parse", { ns: "observationAnalysis" }),
+        }),
+      ).toBeEnabled();
+      expect(create).not.toHaveBeenCalled();
+    },
+  );
 
   it.each(["zh-CN", "en"])(
     "shows specific failure guidance in %s without submitting again or hiding model metadata",
@@ -765,10 +800,9 @@ describe("saved response analysis", () => {
       screen.queryByRole("button", { name: "重新解析" }),
     ).not.toBeInTheDocument();
     expect(create).not.toHaveBeenCalled();
-    expect(screen.getByRole("link", { name: "配置解析模型" })).toHaveAttribute(
-      "href",
-      "/app/tenant/project/settings?tab=ai",
-    );
+    expect(
+      screen.queryByRole("link", { name: "配置解析模型" }),
+    ).not.toBeInTheDocument();
   });
 
   it("preserves the same submission key on transport failure and shows persisted pending state", async () => {

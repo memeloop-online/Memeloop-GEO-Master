@@ -30,7 +30,7 @@ const translations = {
     running: "正在解析",
     response_received: "正在整理回答",
     extractionInterrupted: "解析中断。你可以重新解析已存回答。",
-    extractionFailed: "解析未完成。请检查解析模型设置或稍后重新解析。",
+    extractionFailed: "解析未完成。可稍后重新解析已存回答。",
     grounded: "已与原始记录核对",
     unverified: "解析内容未能与原文核对，暂不可用。请查看原文后重新解析。",
     failed: "这次解析未完成。请稍后重新解析。",
@@ -94,7 +94,7 @@ const translations = {
     extractionInterrupted:
       "Analysis was interrupted. You can reanalyze the saved response.",
     extractionFailed:
-      "Analysis did not finish. Check the analysis model settings or try reanalyzing later.",
+      "Analysis did not finish. You can try reanalyzing the saved response later.",
     grounded: "Checked against the source record",
     unverified:
       "The analysis could not be verified against the source. Review the source before reanalyzing.",

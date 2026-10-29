@@ -156,6 +156,10 @@ export function ObservationAnalysisPanel({
   ]);
   const hasSource = Boolean(history.data?.pages[0]?.sources.length);
   const extraction = history.data?.pages[0]?.extraction;
+  const latestAnalysis = revisions[0]?.result?.outcome;
+  const modelUnconfigured =
+    latestAnalysis?.status === "failed" &&
+    latestAnalysis.code === "model_unconfigured";
   const analysisActive = revisions.some((item) => item.state !== "completed");
   const date = (value: string) =>
     new Date(value).toLocaleString(i18n.resolvedLanguage);
@@ -291,11 +295,13 @@ export function ObservationAnalysisPanel({
       >
         {t("refresh")}
       </Button>
-      <Link
-        to={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/settings?tab=ai`}
-      >
-        {t("settings")}
-      </Link>
+      {modelUnconfigured && canWrite && (
+        <Link
+          to={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/settings?tab=ai`}
+        >
+          {t("settings")}
+        </Link>
+      )}
       {(!requestedRevisionId || primary) &&
         revisions
           .filter((revision) => revision !== primary)
