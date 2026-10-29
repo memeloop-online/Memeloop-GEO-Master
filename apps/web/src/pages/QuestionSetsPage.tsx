@@ -375,12 +375,15 @@ export function QuestionSetsPage() {
           <p>{t("pageIntro")}</p>
         </div>
       </section>
-      <MeasurementFocusPanel
-        key={`${tenantId}/${projectId}/focus`}
-        tenantId={tenantId}
-        projectId={projectId}
-        canWrite={canWrite}
-      />
+      <details className="measurement-focus-settings">
+        <summary>{t("focusSettings")}</summary>
+        <MeasurementFocusPanel
+          key={`${tenantId}/${projectId}/focus`}
+          tenantId={tenantId}
+          projectId={projectId}
+          canWrite={canWrite}
+        />
+      </details>
       <nav aria-label="测量页面" className="measurement-tabs">
         <TabList
           aria-label="测量页面"

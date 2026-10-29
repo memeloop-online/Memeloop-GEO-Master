@@ -63,17 +63,29 @@ export function StandaloneMeasurementPanel({
     params.get("version") ?? params.get("versionId") ?? "";
   const selectedId = params.get("record") ?? params.get("planId") ?? undefined;
   const selectedRankReport = params.get("rankReport");
+  const [previewScope, setPreviewScope] = useState<{
+    setId: string;
+    versionId: string;
+  }>();
+  useEffect(() => {
+    setPreviewScope(undefined);
+  }, [selectedId, requestedSetId, requestedVersionId, tenantId, projectId]);
+  const reportScope =
+    selectedRankReport && requestedSetId && requestedVersionId
+      ? { setId: requestedSetId, versionId: requestedVersionId }
+      : previewScope;
   const [historyOpen, setHistoryOpen] = useState(
-    !selectedId || Boolean(selectedRankReport),
+    !selectedId && !selectedRankReport,
   );
   useEffect(() => {
-    setHistoryOpen(!selectedId || Boolean(selectedRankReport));
-  }, [selectedId, selectedRankReport, tenantId, projectId]);
+    setHistoryOpen(!selectedId && !selectedRankReport && !previewScope);
+  }, [selectedId, selectedRankReport, previewScope, tenantId, projectId]);
   const selectRecord = (
     id: string,
     questionSetId?: string,
     questionVersionId?: string,
   ) => {
+    setPreviewScope(undefined);
     setHistoryOpen(false);
     setParams((previous) => {
       const next = new URLSearchParams(previous);
@@ -274,7 +286,6 @@ export function StandaloneMeasurementPanel({
         recordsOnly &&
         active &&
         historyOpen &&
-        !(selectedRankReport && requestedSetId === id) &&
         (openFolders[id] ?? requestedSetId === id),
       ),
       retry: false,
@@ -842,7 +853,25 @@ export function StandaloneMeasurementPanel({
       )}
       {recordsOnly && (
         <>
-          <h2>测量记录</h2>
+          {reportScope && (
+            <section
+              className="measurement-selected-report"
+              aria-label={t("selectedReport")}
+            >
+              <QuestionSetRecommendationTrend
+                key={`${reportScope.setId}/${reportScope.versionId}`}
+                tenantId={tenantId}
+                projectId={projectId}
+                questionSetId={reportScope.setId}
+                questionSetVersionId={reportScope.versionId}
+                initiallyExpanded
+                embedded
+                showFocusSettings={false}
+                onPreview={() => setPreviewScope(reportScope)}
+              />
+            </section>
+          )}
+          {!reportScope && <h2>测量记录</h2>}
           <Accordion
             collapsible
             openItems={historyOpen ? ["history"] : []}
@@ -959,12 +988,29 @@ export function StandaloneMeasurementPanel({
                                         : versionId,
                                     })}
                               </summary>
-                              <QuestionSetRecommendationTrend
-                                tenantId={tenantId}
-                                projectId={projectId}
-                                questionSetId={groupId}
-                                questionSetVersionId={versionId}
-                              />
+                              <Button
+                                appearance="subtle"
+                                onClick={() => {
+                                  setPreviewScope({
+                                    setId: groupId,
+                                    versionId,
+                                  });
+                                  setHistoryOpen(false);
+                                  if (selectedRankReport) {
+                                    setParams((previous) => {
+                                      const next = new URLSearchParams(
+                                        previous,
+                                      );
+                                      next.delete("rankReport");
+                                      return next;
+                                    });
+                                  }
+                                }}
+                              >
+                                {t("open", {
+                                  ns: "questionSetRecommendationTrend",
+                                })}
+                              </Button>
                               <ul className="measurement-history-records">
                                 {plans.map((plan) =>
                                   recordButton(plan, groupId, versionId),

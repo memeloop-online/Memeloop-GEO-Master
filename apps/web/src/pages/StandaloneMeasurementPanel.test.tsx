@@ -571,18 +571,22 @@ describe("standalone arbitrary-topic measurement", () => {
       await userEvent.click(
         within(versionFolder).getByRole("button", { name: "排名变化" }),
       );
-      await userEvent.click(await within(versionFolder).findByText("报告详情"));
-      await userEvent.click(
-        within(versionFolder).getByText("已保存的测量报告"),
+      const report = screen.getByRole("region", { name: "测量报告" });
+      expect(
+        versionFolder.querySelector(".measurement-period-report"),
+      ).toBeNull();
+      expect(screen.getByRole("button", { name: "测量历史" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
       );
+      await userEvent.click(await within(report).findByText("报告详情"));
+      await userEvent.click(within(report).getByText("已保存的测量报告"));
       await userEvent.click(
-        await within(versionFolder).findByRole("button", {
+        await within(report).findByRole("button", {
           name: /查看版本 1/,
         }),
       );
-      expect(
-        await within(versionFolder).findByText("报告版本 1"),
-      ).toBeVisible();
+      expect(await within(report).findByText("报告版本 1")).toBeVisible();
       expect(listMeasurementReports).toHaveBeenCalledWith(
         "tenant-1",
         "project-1",
@@ -593,6 +597,7 @@ describe("standalone arbitrary-topic measurement", () => {
         "project-1",
         "report-1",
       );
+      expect(getMeasurementReport).toHaveBeenCalledOnce();
       expect(listMeasurementPlans).toHaveBeenCalledTimes(1);
       expect(getChannelTarget).not.toHaveBeenCalled();
       expect(screen.getByTestId("measurement-url")).toHaveTextContent(
@@ -601,9 +606,13 @@ describe("standalone arbitrary-topic measurement", () => {
     },
   );
 
-  it.each([true, false])(
-    "opens a linked saved rank report on reload independently of the current history page (record listed: %s)",
-    async (listed) => {
+  it.each([
+    { listed: true, legacy: false },
+    { listed: false, legacy: false },
+    { listed: false, legacy: true },
+  ])(
+    "opens a linked saved rank report independently (record listed: $listed, legacy URL: $legacy)",
+    async ({ listed, legacy }) => {
       const questionSet = {
         question_set_id: "set-1",
         question_set_version_id: "version-1",
@@ -653,13 +662,13 @@ describe("standalone arbitrary-topic measurement", () => {
         false,
         true,
         false,
-        "/?tab=records&record=measurement-1&set=set-1&version=version-1&rankReport=report-1",
+        `/?tab=records&record=measurement-1&${legacy ? "questionSetId" : "set"}=set-1&${legacy ? "versionId" : "version"}=version-1&rankReport=report-1`,
       );
       await userEvent.click(await screen.findByText("报告详情"));
       expect(await screen.findByText("报告版本 1")).toBeVisible();
       expect(screen.getByRole("button", { name: "测量历史" })).toHaveAttribute(
         "aria-expanded",
-        "true",
+        "false",
       );
       expect(getMeasurementReport).toHaveBeenCalledWith(
         "tenant-1",
@@ -668,6 +677,28 @@ describe("standalone arbitrary-topic measurement", () => {
       );
       expect(getMeasurementReportPreview).not.toHaveBeenCalled();
       expect(listAllQuestionSetVersions).not.toHaveBeenCalled();
+      expect(listMeasurementPlans).not.toHaveBeenCalled();
+      expect(getMeasurementReport).toHaveBeenCalledOnce();
+      const selectedReport = screen.getByRole("region", { name: "测量报告" });
+      const historyButton = screen.getByRole("button", { name: "测量历史" });
+      expect(
+        selectedReport.compareDocumentPosition(historyButton) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(selectedReport.closest(".fui-AccordionPanel")).toBeNull();
+      await userEvent.click(historyButton);
+      await waitFor(() => expect(listMeasurementPlans).toHaveBeenCalledOnce());
+      expect(screen.getAllByRole("region", { name: "测量报告" })).toHaveLength(
+        1,
+      );
+      expect(getMeasurementReport).toHaveBeenCalledOnce();
+      await userEvent.click(
+        within(selectedReport).getByRole("button", { name: "刷新测量报告" }),
+      );
+      await waitFor(() =>
+        expect(getMeasurementReport).toHaveBeenCalledTimes(2),
+      );
+      expect(getMeasurementReportPreview).not.toHaveBeenCalled();
       expect(screen.getByTestId("measurement-url")).toHaveTextContent(
         "record=measurement-1",
       );
@@ -698,20 +729,14 @@ describe("standalone arbitrary-topic measurement", () => {
         await userEvent.click(
           screen.getByRole("button", { name: "Back to previous selection" }),
         );
-        await waitFor(() =>
-          expect(
-            screen
-              .getByText("历史版本 version-1")
-              .closest("details")!
-              .parentElement!.closest("details"),
-          ).toHaveAttribute("open"),
-        );
+        expect(historyButton).toHaveAttribute("aria-expanded", "false");
         await userEvent.click(await screen.findByText("报告详情"));
         expect(await screen.findByText("报告版本 1")).toBeVisible();
         await userEvent.click(
           screen.getByRole("button", { name: "返回测量结果预览" }),
         );
-        await userEvent.click(screen.getByRole("button", { name: "测量历史" }));
+        expect(screen.getByRole("region", { name: "测量报告" })).toBeVisible();
+        await userEvent.click(historyButton);
         await waitFor(() =>
           expect(listAllQuestionSetVersions).toHaveBeenCalledWith(
             "tenant-1",

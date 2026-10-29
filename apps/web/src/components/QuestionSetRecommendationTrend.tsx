@@ -10,23 +10,34 @@ export function QuestionSetRecommendationTrend({
   projectId,
   questionSetId,
   questionSetVersionId,
+  initiallyExpanded = false,
+  onPreview,
+  embedded = false,
+  showFocusSettings = true,
 }: {
   tenantId: string;
   projectId: string;
   questionSetId: string;
   questionSetVersionId: string;
+  initiallyExpanded?: boolean;
+  onPreview?: () => void;
+  embedded?: boolean;
+  showFocusSettings?: boolean;
 }) {
   const { t } = useTranslation("questionSetRecommendationTrend");
   const [searchParams, setSearchParams] = useSearchParams();
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(initiallyExpanded);
   const selectedReportId =
-    searchParams.get("set") === questionSetId &&
-    searchParams.get("version") === questionSetVersionId
+    (searchParams.get("set") ?? searchParams.get("questionSetId")) ===
+      questionSetId &&
+    (searchParams.get("version") ?? searchParams.get("versionId")) ===
+      questionSetVersionId
       ? searchParams.get("rankReport") || undefined
       : undefined;
   const open = expanded || Boolean(selectedReportId);
   const selectReport = (reportId: string | undefined) => {
     setExpanded(true);
+    if (!reportId) onPreview?.();
     setSearchParams((previous) => {
       const next = new URLSearchParams(previous);
       if (reportId) {
@@ -56,6 +67,8 @@ export function QuestionSetRecommendationTrend({
           projectId={projectId}
           selectedReportId={selectedReportId}
           onSelectReport={selectReport}
+          embedded={embedded}
+          showFocusSettings={showFocusSettings}
           questionSet={{
             question_set_id: questionSetId,
             question_set_version_id: questionSetVersionId,

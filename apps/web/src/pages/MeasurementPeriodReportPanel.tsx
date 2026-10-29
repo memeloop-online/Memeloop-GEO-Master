@@ -86,6 +86,7 @@ export function MeasurementPeriodReportPanel({
   selectedReportId,
   onSelectReport,
   embedded = false,
+  showFocusSettings = true,
 }: {
   tenantId: string;
   projectId: string;
@@ -93,6 +94,7 @@ export function MeasurementPeriodReportPanel({
   selectedReportId?: string;
   onSelectReport?: (reportId: string | undefined) => void;
   embedded?: boolean;
+  showFocusSettings?: boolean;
 }) {
   const { session } = useAuth();
   const navigate = useNavigate();
@@ -718,12 +720,14 @@ export function MeasurementPeriodReportPanel({
         </>
       )}
       {reportActions}
-      <MeasurementFocusPanel
-        tenantId={tenantId}
-        projectId={projectId}
-        canWrite={Boolean(canWrite)}
-        compact
-      />
+      {showFocusSettings && (
+        <MeasurementFocusPanel
+          tenantId={tenantId}
+          projectId={projectId}
+          canWrite={Boolean(canWrite)}
+          compact
+        />
+      )}
       {current.isPending ? (
         <p role="status">{t("loading")}</p>
       ) : current.isError ? (
