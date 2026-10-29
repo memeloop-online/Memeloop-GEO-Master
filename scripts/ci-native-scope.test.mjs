@@ -20,6 +20,8 @@ test("only explicit web/browser source and Markdown paths may skip native checks
     "apps/web/src/i18n/messages.ts",
     "apps/web/src/components/example.test.tsx",
     "apps/web/src/nested/helper.test.ts",
+    "apps/web/src/styles.css",
+    "apps/web/src/components/example.module.css",
     "packages/browser-runner/src/index.mjs",
     "packages/browser-runner/src/nested/helper.mjs",
     "packages/browser-runner/test/capture.test.mjs",
@@ -29,6 +31,9 @@ test("only explicit web/browser source and Markdown paths may skip native checks
     "CONTRIBUTING.md",
   ];
   assert.equal(nativeRequired({ ...pr, paths }), false);
+  for (const path of paths) {
+    assert.equal(nativeRequired({ ...pr, paths: [path] }), false, path);
+  }
   for (const path of [
     "packages/browser-runner/src/extraction-prompt.txt",
     "packages/browser-runner/test/fixture.json",
@@ -36,23 +41,37 @@ test("only explicit web/browser source and Markdown paths may skip native checks
     "packages/browser-runner/Dockerfile",
     "packages/agent-runtime/src/index.mjs",
     "crates/api/src/lib.rs",
+    "crates/worker/src/runtime.rs",
+    "crates/worker/src/timers.js",
     "Cargo.toml",
     "Cargo.lock",
     "rust-toolchain.toml",
+    ".cargo/config.toml",
+    "package.json",
     "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
     "apps/web/package.json",
     "apps/web/vite.config.ts",
     "apps/web/tsconfig.app.json",
+    "apps/web/styles.css",
+    "apps/web/public/styles.css",
     "apps/web/src/main.tsx.bak",
     "apps/web/src/main.ts.txt",
     "apps/web/src/main.TSX",
     "apps/web/src/main.js",
-    "apps/web/src/styles.css",
+    "apps/web/src/styles.css.bak",
+    "apps/web/src/styles.css.scss",
+    "apps/web/src/styles.CSS",
+    "apps/web/src/styles.scss",
     "apps/web/src/prompt.txt",
     "apps/web/src2/main.tsx",
+    "apps/web/src2/styles.css",
     "apps/web/src/.tsx",
+    "apps/web/src/.css",
     "apps/web/src/main.tsx\nCargo.lock",
+    "apps/web/src/styles.css\nCargo.lock",
     "apps/web/src/main.tsx/other",
+    "apps/web/src/styles.css/other",
     "scripts/bundle-agent.mjs",
     ".github/workflows/ci.yml",
     "scripts/ci-native-scope.mjs",
@@ -80,14 +99,22 @@ test("empty and unsupported event contexts require native checks", () => {
     "",
   ]) {
     assert.equal(
-      nativeRequired({ ...pr, eventName, paths: ["README.md"] }),
+      nativeRequired({
+        ...pr,
+        eventName,
+        paths: ["README.md", "apps/web/src/styles.css"],
+      }),
       true,
     );
     assert.equal(determineNativeScope({ eventName, event: {} }), true);
   }
   for (const baseRef of ["release", "", undefined]) {
     assert.equal(
-      nativeRequired({ ...pr, baseRef, paths: ["README.md"] }),
+      nativeRequired({
+        ...pr,
+        baseRef,
+        paths: ["README.md", "apps/web/src/styles.css"],
+      }),
       true,
     );
     assert.equal(
@@ -177,19 +204,54 @@ test("native-to-docs rename cannot hide the removed native input", (t) => {
   assert.equal(repo.scope(base, head), true);
 });
 
-test("frontend additions, edits, and deletions may skip native checks", (t) => {
+test("frontend TS/TSX/CSS additions, edits, and deletions may skip native checks", (t) => {
   const repo = repository(t);
   repo.write("apps/web/src/old.tsx", "base");
+  repo.write("apps/web/src/styles.css", "base");
   const base = repo.commit();
   repo.write("apps/web/src/old.tsx", "edited");
+  repo.write("apps/web/src/styles.css", "edited");
   repo.write("apps/web/src/nested/helper.ts", "added");
+  repo.write("apps/web/src/nested/component.css", "added");
   const edited = repo.commit();
   assert.equal(repo.scope(base, edited), false);
   repo.git("rm", "apps/web/src/old.tsx");
+  repo.git("rm", "apps/web/src/styles.css");
   const deleted = repo.commit();
   assert.equal(repo.scope(edited, deleted), false);
   assert.equal(repo.scope(base, deleted), false);
 });
+
+test("CSS cannot hide native or dependency inputs earlier in the PR", (t) => {
+  const repo = repository(t);
+  repo.write("apps/web/src/styles.css", "base");
+  const base = repo.commit();
+  repo.write("Cargo.lock", "changed");
+  const native = repo.commit();
+  repo.write("apps/web/src/styles.css", "edited");
+  const head = repo.commit();
+  assert.equal(repo.scope(native, head), false);
+  assert.equal(repo.scope(base, head), true);
+});
+
+for (const [from, to] of [
+  ["crates/example/src/lib.rs", "apps/web/src/moved.css"],
+  ["apps/web/src/styles.css", "apps/web/styles.css"],
+]) {
+  test(`rename across the CSS allowlist boundary requires native checks: ${from} -> ${to}`, (t) => {
+    const repo = repository(t);
+    repo.write(from, "identical content");
+    const base = repo.commit();
+    mkdirSync(dirname(join(repo.cwd, to)), { recursive: true });
+    renameSync(join(repo.cwd, from), join(repo.cwd, to));
+    const head = repo.commit();
+    assert.match(
+      repo.git("diff", "--name-status", "--find-renames", base, head),
+      /^R100/,
+    );
+    assert.equal(repo.scope(base, head), true);
+  });
+}
 
 test("native-to-frontend rename cannot hide the removed native input", (t) => {
   const repo = repository(t);
