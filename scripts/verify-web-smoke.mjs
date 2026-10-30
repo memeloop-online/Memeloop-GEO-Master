@@ -1777,34 +1777,103 @@ async function main() {
     width: 390,
     height: 844,
   });
-  const measureTab = page.getByRole("tab", { name: "开始测量", exact: true });
-  await measureTab.focus();
-  await page.keyboard.press("ArrowRight");
-  const searchTab = page.getByRole("tab", { name: "传统搜索", exact: true });
+  const measurementNavigation = page.getByRole("navigation", {
+    name: "测量页面",
+    exact: true,
+  });
+  const measureAction = measurementNavigation.getByRole("button", {
+    name: "开始测量",
+    exact: true,
+  });
+  const recordsAction = measurementNavigation.getByRole("button", {
+    name: "测量记录",
+    exact: true,
+  });
+  const moreActions = measurementNavigation.locator(
+    ".measurement-more-actions > summary",
+  );
+  await page
+    .getByRole("textbox", { name: "要测量的问题", exact: true })
+    .waitFor();
   assert(
-    await searchTab.evaluate((element) => element === document.activeElement),
-    "Measurement tabs did not move keyboard focus to web search",
+    (await measureAction.getAttribute("aria-current")) === "page",
+    "Measurement must open directly on the question entry",
+  );
+  await measureAction.focus();
+  await page.keyboard.press("Tab");
+  assert(
+    await recordsAction.evaluate(
+      (element) => element === document.activeElement,
+    ),
+    "Measurement actions did not move keyboard focus to records",
+  );
+  await page.keyboard.press("Tab");
+  assert(
+    await moreActions.evaluate((element) => element === document.activeElement),
+    "Measurement actions did not move keyboard focus to more actions",
+  );
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Tab");
+  const searchAction = measurementNavigation.getByRole("button", {
+    name: "传统搜索",
+    exact: true,
+  });
+  assert(
+    await searchAction.evaluate(
+      (element) => element === document.activeElement,
+    ),
+    "More actions did not move keyboard focus to web search",
   );
   await page.keyboard.press("Enter");
   await page.waitForURL((url) => url.searchParams.get("tab") === "search");
   await page
-    .getByRole("tabpanel", { name: "传统搜索", exact: true })
+    .getByRole("region", { name: "传统搜索", exact: true })
     .getByRole("heading", { name: "搜索排名", exact: true })
     .waitFor();
   assert(
-    (await searchTab.getAttribute("aria-selected")) === "true",
-    "Web search keyboard navigation did not select its tab",
+    (await searchAction.getAttribute("aria-current")) === "page",
+    "Web search keyboard navigation did not select its section",
   );
-  await page.keyboard.press("ArrowRight");
   assert(
-    await page
-      .getByRole("tab", { name: "测量记录", exact: true })
-      .evaluate((element) => element === document.activeElement),
-    "Measurement tabs did not move keyboard focus",
+    await moreActions.evaluate((element) => element === document.activeElement),
+    "Selecting a secondary action did not restore focus to more actions",
+  );
+  assert(
+    !(await measurementNavigation
+      .locator(".measurement-more-actions")
+      .evaluate((element) => element.open)),
+    "Selecting a secondary action did not collapse more actions",
+  );
+  await page.keyboard.press("Shift+Tab");
+  assert(
+    await recordsAction.evaluate(
+      (element) => element === document.activeElement,
+    ),
+    "Measurement actions did not move keyboard focus back to records",
   );
   await page.keyboard.press("Enter");
   await page.waitForURL((url) => url.searchParams.get("tab") === "records");
-  await page.getByRole("tab", { name: "问题集", exact: true }).click();
+  assert(
+    (await recordsAction.getAttribute("aria-current")) === "page",
+    "Measurement records keyboard navigation did not select its section",
+  );
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Tab");
+  const questionSetsAction = measurementNavigation.getByRole("button", {
+    name: "问题集",
+    exact: true,
+  });
+  assert(
+    await questionSetsAction.evaluate(
+      (element) => element === document.activeElement,
+    ),
+    "More actions did not move keyboard focus to question sets",
+  );
+  await page.keyboard.press("Enter");
+  await page.waitForURL((url) => url.searchParams.get("tab") === "sets");
   await page
     .getByRole("heading", { name: "问题集与版本", exact: true })
     .waitFor();
