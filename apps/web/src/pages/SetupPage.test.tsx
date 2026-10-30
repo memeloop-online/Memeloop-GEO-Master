@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -9,6 +9,7 @@ import { AuthProvider } from "../auth/AuthProvider";
 import type { AuthSession } from "../auth/types";
 import { setCsrfToken, setUnauthorizedHandler } from "../api/client";
 import { SetupPage } from "./SetupPage";
+import "./AgentWorkbenchPage";
 
 const session: AuthSession = {
   user: {
@@ -342,11 +343,6 @@ async function advanceToLaunch(
   await screen.findByRole("heading", { name: "发布资源与预算" });
   await screen.findByRole("heading", { name: "资源与预算估算" });
 }
-
-beforeAll(async () => {
-  // Load the real navigation destination before timing setup interactions.
-  await import("./AgentWorkbenchPage");
-});
 
 afterEach(() => {
   setCsrfToken(undefined);
