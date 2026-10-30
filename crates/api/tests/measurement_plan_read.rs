@@ -8,6 +8,19 @@ use geo_worker::{HostOps, MeasurementPlanReadRequest, MeasurementPlanStatus};
 use serde_json::json;
 use uuid::Uuid;
 
+#[tokio::test]
+async fn durable_state_exposes_saved_evidence_before_runtime_snapshot_or_callbacks() {
+    // Lazy construction opens no connection and needs no deployment credentials.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://synthetic:synthetic@127.0.0.1:1/synthetic")
+        .unwrap();
+    let database = geo_persistence::Database::from_pool(pool);
+    let state = AppState::from_database_with_parser_profiles(&database, None, None);
+    let runtime_snapshot = state.clone();
+    assert!(state.observation_evidence_resolver().is_some());
+    assert!(runtime_snapshot.observation_evidence_resolver().is_some());
+}
+
 async fn project(state: &AppState) -> TenantScope {
     let base = TenantScope::new(DEVELOPMENT_OPERATOR_ID, DEVELOPMENT_TENANT_ID, None);
     let project = state

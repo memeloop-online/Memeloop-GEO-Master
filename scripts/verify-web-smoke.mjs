@@ -1816,10 +1816,9 @@ async function main() {
   await page.keyboard.press("Tab");
   await page.keyboard.press("Tab");
   await page.keyboard.press("Tab");
-  const searchAction = measurementNavigation.getByRole("button", {
-    name: "传统搜索",
-    exact: true,
-  });
+  const searchAction = measurementNavigation
+    .locator("button")
+    .filter({ hasText: /^传统搜索$/ });
   assert(
     await searchAction.evaluate(
       (element) => element === document.activeElement,
