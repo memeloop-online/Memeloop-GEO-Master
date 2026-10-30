@@ -1,0 +1,74 @@
+.agent-chat-surface :has(> .agent-measurement-welcome) {
+  flex-shrink: 0;
+  min-height: min-content;
+  justify-content: flex-start;
+}
+
+.agent-measurement-welcome {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 660px;
+  margin: auto;
+  padding: 24px;
+  color: var(--colorNeutralForeground2);
+}
+
+.agent-measurement-welcome h2 {
+  margin: 0 0 12px;
+  color: var(--colorNeutralForeground1);
+  font-size: 22px;
+  line-height: 1.4;
+}
+
+.agent-measurement-welcome p {
+  margin: 8px 0;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.agent-measurement-examples {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 16px 0;
+}
+
+.agent-measurement-examples button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 12px;
+  white-space: normal;
+  text-align: start;
+  overflow-wrap: anywhere;
+}
+
+.agent-measurement-examples button span {
+  color: var(--colorNeutralForeground2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+@media (max-width: 600px) {
+  .agent-measurement-welcome {
+    padding: 16px;
+  }
+
+  .agent-measurement-welcome h2 {
+    font-size: 18px;
+  }
+
+  .agent-measurement-examples {
+    gap: 8px;
+  }
+
+  .agent-measurement-examples button {
+    min-height: 60px;
+    padding: 10px;
+  }
+
+  .agent-measurement-examples button span {
+    display: none;
+  }
+}

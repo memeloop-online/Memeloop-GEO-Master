@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { TopicQuestionGenerator } from "./TopicQuestionGenerator";
 import { createAgentConversation, postAgentMessage } from "../api/agent";
+import i18n from "../i18n";
 
 vi.mock("../api/agent", () => ({
   createAgentConversation: vi.fn(),
@@ -55,9 +56,58 @@ beforeEach(() => {
   } as Awaited<ReturnType<typeof postAgentMessage>>);
 });
 
-afterEach(() => vi.resetAllMocks());
+afterEach(async () => {
+  cleanup();
+  vi.resetAllMocks();
+  await i18n.changeLanguage("zh-CN");
+});
 
 describe("topic candidate-question entry", () => {
+  it.each(["zh-CN", "en"])(
+    "preserves explicit measurement intent and distinguishes natural recommendation questions (%s)",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      const user = userEvent.setup();
+      renderGenerator();
+      await user.type(
+        screen.getByRole("textbox", {
+          name: i18n.t("topic", { ns: "topicQuestions" }),
+        }),
+        "Please measure recommendations for home batteries",
+      );
+      await user.click(
+        screen.getByRole("button", {
+          name: i18n.t("submit", { ns: "topicQuestions" }),
+        }),
+      );
+      await screen.findByTestId("destination");
+      const content = vi.mocked(postAgentMessage).mock.calls[0][3].content;
+      for (const tool of [
+        "question_create",
+        "channel_discover",
+        "measurement_options",
+        "measurement_plan_create",
+        "measurement_plan_read",
+      ])
+        expect(content).toContain(tool);
+      expect(content).toContain(
+        "Please measure recommendations for home batteries",
+      );
+      expect(content).not.toContain("不要启动测量");
+      expect(content).not.toContain("; do not start measurement.");
+      expect(content).toContain(
+        language === "en"
+          ? "do not automatically start paid measurement"
+          : "不自动启动付费测量",
+      );
+      expect(content).toContain(
+        language === "en"
+          ? "Do not insert tracked product or store names"
+          : "自然推荐问题不加入关注产品或店铺名称",
+      );
+    },
+  );
+
   it("keeps the topic as user content, uses project defaults and opens only the accepted conversation", async () => {
     const user = userEvent.setup();
     renderGenerator();

@@ -8,8 +8,6 @@ import {
   MessageBar,
   MessageBarBody,
   Select,
-  Tab,
-  TabList,
   Textarea,
 } from "@fluentui/react-components";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -172,7 +170,7 @@ export function QuestionSetsPage() {
       ? "records"
       : params.has("set") || params.has("questionSetId")
         ? "sets"
-        : "sets";
+        : "measure";
   const [visitedTabs, setVisitedTabs] = useState(
     () => new Set<MeasurementTab>([tab]),
   );
@@ -370,51 +368,66 @@ export function QuestionSetsPage() {
     <main className="workbench-page question-sets-page">
       <section className="page-hero">
         <div>
-          <p className="eyebrow">独立测量</p>
-          <h1>测量与洞察</h1>
+          <h1>{t("pageTitle")}</h1>
           <p>{t("pageIntro")}</p>
         </div>
       </section>
-      <details className="measurement-focus-settings">
-        <summary>{t("focusSettings")}</summary>
-        <MeasurementFocusPanel
-          key={`${tenantId}/${projectId}/focus`}
-          tenantId={tenantId}
-          projectId={projectId}
-          canWrite={canWrite}
-        />
-      </details>
-      <nav aria-label="测量页面" className="measurement-tabs">
-        <TabList
-          aria-label="测量页面"
-          selectedValue={tab}
-          onTabSelect={(_, data) =>
-            updateSelection({ tab: String(data.value) })
+      <nav aria-label={t("pageNavigation")} className="measurement-actions">
+        <Button
+          appearance={tab === "measure" ? "primary" : "secondary"}
+          aria-current={tab === "measure" ? "page" : undefined}
+          onClick={() =>
+            updateSelection({
+              tab: "measure",
+              record: null,
+              planId: null,
+              target: null,
+              attempt: null,
+              analysisRevision: null,
+              rankReport: null,
+              folder: null,
+            })
           }
         >
-          {tabs.map((entry) => (
-            <Tab id={`measurement-tab-${entry}`} key={entry} value={entry}>
-              {t(entry)}
-            </Tab>
-          ))}
-        </TabList>
+          {t("measure")}
+        </Button>
+        <Button
+          appearance="subtle"
+          aria-current={tab === "records" ? "page" : undefined}
+          onClick={() => updateSelection({ tab: "records" })}
+        >
+          {t("records")}
+        </Button>
+        <details className="measurement-more-actions">
+          <summary>{t("moreActions")}</summary>
+          <div>
+            {(["sets", "insights", "search"] as const).map((entry) => (
+              <Button
+                key={entry}
+                appearance="subtle"
+                aria-current={tab === entry ? "page" : undefined}
+                onClick={(event) => {
+                  updateSelection({ tab: entry });
+                  const menu = event.currentTarget.closest("details");
+                  if (menu) {
+                    menu.open = false;
+                    menu.querySelector("summary")?.focus();
+                  }
+                }}
+              >
+                {t(entry)}
+              </Button>
+            ))}
+          </div>
+        </details>
       </nav>
-      <section
-        role="tabpanel"
-        aria-labelledby="measurement-tab-measure"
-        hidden={tab !== "measure"}
-        aria-label={t("measure")}
-      >
+      <section hidden={tab !== "measure"} aria-label={t("measure")}>
         {wasVisited("measure") && (
           <>
-            <StandaloneMeasurementPanel
-              key={`${tenantId}/${projectId}`}
-              tenantId={tenantId}
-              projectId={projectId}
-              canWrite={canWrite}
-              active={tab === "measure"}
-            />
-            <details className="measurement-prediction">
+            <details
+              className="measurement-prediction"
+              hidden={params.has("record") || params.has("planId")}
+            >
               <summary>{t("prediction")}</summary>
               <TopicQuestionGenerator
                 tenantId={tenantId}
@@ -422,25 +435,22 @@ export function QuestionSetsPage() {
                 canWrite={canWrite}
               />
             </details>
+            <StandaloneMeasurementPanel
+              key={`${tenantId}/${projectId}`}
+              tenantId={tenantId}
+              projectId={projectId}
+              canWrite={canWrite}
+              active={tab === "measure"}
+            />
           </>
         )}
       </section>
-      <section
-        role="tabpanel"
-        aria-labelledby="measurement-tab-search"
-        hidden={tab !== "search"}
-        aria-label={t("search")}
-      >
+      <section hidden={tab !== "search"} aria-label={t("search")}>
         {wasVisited("search") && (
           <SerpMeasurementPanel tenantId={tenantId} projectId={projectId} />
         )}
       </section>
-      <section
-        role="tabpanel"
-        aria-labelledby="measurement-tab-records"
-        hidden={tab !== "records"}
-        aria-label={t("records")}
-      >
+      <section hidden={tab !== "records"} aria-label={t("records")}>
         {wasVisited("records") && (
           <StandaloneMeasurementPanel
             key={`${tenantId}/${projectId}/records`}
@@ -452,12 +462,7 @@ export function QuestionSetsPage() {
           />
         )}
       </section>
-      <section
-        role="tabpanel"
-        aria-labelledby="measurement-tab-insights"
-        hidden={tab !== "insights"}
-        aria-label={t("insights")}
-      >
+      <section hidden={tab !== "insights"} aria-label={t("insights")}>
         {wasVisited("insights") && (
           <CitationInsightsPanel
             key={`${tenantId}/${projectId}/citations`}
@@ -466,12 +471,7 @@ export function QuestionSetsPage() {
           />
         )}
       </section>
-      <section
-        role="tabpanel"
-        aria-labelledby="measurement-tab-sets"
-        hidden={tab !== "sets"}
-        aria-label={t("sets")}
-      >
+      <section hidden={tab !== "sets"} aria-label={t("sets")}>
         <section aria-label="问题集与版本">
           <h2>{t("questionsHeading")}</h2>
           <p>{t("questionsIntro")}</p>
@@ -834,6 +834,15 @@ export function QuestionSetsPage() {
             )
           ))}
       </section>
+      <details className="measurement-focus-settings">
+        <summary>{t("focusSettings")}</summary>
+        <MeasurementFocusPanel
+          key={`${tenantId}/${projectId}/focus`}
+          tenantId={tenantId}
+          projectId={projectId}
+          canWrite={canWrite}
+        />
+      </details>
     </main>
   );
 }

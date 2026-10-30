@@ -3058,7 +3058,11 @@ pub struct MeasurementTargetStatus {
     pub outcome_status: Option<geo_domain::ChannelOutcomeStatus>,
     pub fixture: Option<bool>,
     pub received_at: Option<DateTime<Utc>>,
-    /// Exact live, ad-hoc answer when it fits in the bounded tool response.
+    pub conditions: Option<geo_domain::MeasurementReportConditions>,
+    /// Saved interpretation provenance does not upgrade the original receipt.
+    pub analysis_provenance: Option<geo_domain::SavedAnalysisProvenance>,
+    pub recommendations: Option<serde_json::Value>,
+    /// Exact saved answer when it fits in the bounded tool response.
     /// Otherwise the target ID points to the full scoped result detail.
     pub answer: Option<String>,
     pub answer_available: bool,
@@ -3095,15 +3099,22 @@ impl MeasurementPlanStatus {
                     || !target.citations.is_empty() && !target.citations_available
                     || target.citations.len() > 50
                     || target.citations.iter().any(|url| url.len() > 2048)
+                    || target.recommendations.is_some() && target.analysis_provenance.is_none()
+                    || target.analysis_provenance.is_some() && target.outcome_status.is_none()
+                    || (target.answer_available
+                        || target.citations_available
+                        || target.analysis_provenance.is_some())
+                        && target.conditions.is_none()
                     || (target.answer_available || target.citations_available)
                         && (target.fixture != Some(false)
-                            || !matches!(
-                                target.outcome_status,
-                                Some(
-                                    geo_domain::ChannelOutcomeStatus::Observed
-                                        | geo_domain::ChannelOutcomeStatus::Refused
-                                )
-                            ))
+                            || target.analysis_provenance.is_none()
+                                && !matches!(
+                                    target.outcome_status,
+                                    Some(
+                                        geo_domain::ChannelOutcomeStatus::Observed
+                                            | geo_domain::ChannelOutcomeStatus::Refused
+                                    )
+                                ))
             })
         {
             return Err("measurement plan status is invalid or unrelated".into());
@@ -5458,6 +5469,9 @@ mod tests {
                 outcome_status: None,
                 fixture: None,
                 received_at: None,
+                conditions: None,
+                analysis_provenance: None,
+                recommendations: None,
                 answer: None,
                 answer_available: false,
                 citations: vec![],
@@ -5475,6 +5489,18 @@ mod tests {
         evidence_pointer.targets[0].fixture = Some(false);
         evidence_pointer.targets[0].received_at = Some(Utc::now());
         evidence_pointer.targets[0].answer_available = true;
+        evidence_pointer.targets[0].conditions = Some(geo_domain::MeasurementReportConditions {
+            question: "Synthetic question".into(),
+            provider: "synthetic".into(),
+            model: "model".into(),
+            surface: "consumer_web".into(),
+            search_mode: "web_search".into(),
+            protocol_version: "v1".into(),
+            question_set_version: "ad_hoc.v1".into(),
+            market: "generic".into(),
+            language: "en".into(),
+            sample_ordinal: 0,
+        });
         assert!(evidence_pointer.validate_for(&requested).is_ok());
         evidence_pointer.targets[0].fixture = Some(true);
         assert!(evidence_pointer.validate_for(&requested).is_err());

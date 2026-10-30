@@ -353,7 +353,13 @@ async fn discovery_for_provider(provider: &str) {
     assert_eq!(read.targets[0].state, "queued");
     assert_eq!(read.targets[0].target_id, accepted.target_id);
     let status_json = serde_json::to_string(&read).unwrap();
-    assert!(!status_json.contains("rain gauges"));
+    assert_eq!(
+        read.targets[0].conditions.as_ref().unwrap().question,
+        command.question
+    );
+    assert!(status_json.contains("rain gauges"));
+    assert!(read.targets[0].answer.is_none());
+    assert!(!read.targets[0].answer_available);
     assert!(!status_json.contains("raw_answer"));
     assert!(!status_json.contains("cycle_id"));
     let repository = state.channel_job_repository();
@@ -394,13 +400,16 @@ async fn discovery_for_provider(provider: &str) {
     .await
     .unwrap();
     assert_eq!(observed.targets[0].state, "completed");
+    // An observed status alone is not a trusted official-search receipt.
+    assert_eq!(observed.targets[0].answer, None);
+    assert!(!observed.targets[0].answer_available);
+    assert!(observed.targets[0].citations.is_empty());
+    assert!(!observed.targets[0].citations_available);
+    assert!(observed.targets[0].analysis_provenance.is_none());
+    assert!(observed.targets[0].recommendations.is_none());
     assert_eq!(
-        observed.targets[0].answer.as_deref(),
-        Some("Actual answer from live evidence")
-    );
-    assert_eq!(
-        observed.targets[0].citations,
-        ["https://example.org/evidence"]
+        observed.targets[0].outcome_status,
+        Some(ChannelOutcomeStatus::Observed)
     );
     assert_eq!(observed.targets[0].fixture, Some(false));
 
@@ -488,6 +497,9 @@ async fn discovery_for_provider(provider: &str) {
         Some(ChannelOutcomeStatus::Observed)
     );
     assert!(!hidden.targets[0].answer_available);
+    assert!(hidden.targets[0].conditions.is_none());
+    assert!(hidden.targets[0].analysis_provenance.is_none());
+    assert!(hidden.targets[0].recommendations.is_none());
     let changed = MeasurementPlanCreateRequest {
         question: "Different question?".into(),
         ..command.clone()

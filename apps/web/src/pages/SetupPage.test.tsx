@@ -476,7 +476,9 @@ describe("project setup workflow", () => {
     await user.type(screen.getByRole("textbox", { name: "月度预算" }), "60000");
     await user.click(screen.getByRole("button", { name: "启动项目" }));
     expect(
-      await screen.findByRole("heading", { name: "从你的资料或想法开始" }),
+      await screen.findByRole("heading", {
+        name: "客户问 AI 时，会推荐你的产品或店铺吗？",
+      }),
     ).toBeInTheDocument();
     expect(
       postCalls(fetchMock).filter(
@@ -517,7 +519,9 @@ describe("project setup workflow", () => {
     ).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "重试启动" }));
     expect(
-      await screen.findByRole("heading", { name: "从你的资料或想法开始" }),
+      await screen.findByRole("heading", {
+        name: "客户问 AI 时，会推荐你的产品或店铺吗？",
+      }),
     ).toBeInTheDocument();
 
     const starts = postCalls(fetchMock).filter(
@@ -548,7 +552,9 @@ describe("project setup workflow", () => {
 
     await advanceToLaunch(user);
     await user.click(screen.getByRole("button", { name: "启动项目" }));
-    await screen.findByRole("heading", { name: "从你的资料或想法开始" });
+    await screen.findByRole("heading", {
+      name: "客户问 AI 时，会推荐你的产品或店铺吗？",
+    });
     await user.click(screen.getByRole("link", { name: "项目总览" }));
     await screen.findByText(/项目启动请求已受理/);
     const startReadsBeforeRefresh = fetchMock.mock.calls.filter(
@@ -775,7 +781,9 @@ describe("project setup workflow", () => {
     await screen.findByRole("heading", { name: "发布资源与预算" });
     await screen.findByRole("heading", { name: "资源与预算估算" });
     await user.click(screen.getByRole("button", { name: "启动项目" }));
-    await screen.findByRole("heading", { name: "从你的资料或想法开始" });
+    await screen.findByRole("heading", {
+      name: "客户问 AI 时，会推荐你的产品或店铺吗？",
+    });
 
     const sourcePatch = fetchMock.mock.calls.find(([request, init]) => {
       if (
@@ -908,7 +916,9 @@ describe("project setup workflow", () => {
     await user.click(screen.getByRole("button", { name: "启动项目" }));
 
     expect(
-      await screen.findByRole("heading", { name: "从你的资料或想法开始" }),
+      await screen.findByRole("heading", {
+        name: "客户问 AI 时，会推荐你的产品或店铺吗？",
+      }),
     ).toBeInTheDocument();
     expect(
       fetchMock.mock.calls.some(
