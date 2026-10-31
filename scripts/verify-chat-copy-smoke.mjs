@@ -199,8 +199,15 @@ async function main() {
   await page.getByTestId("agent-workbench-page").waitFor();
   const freshUrl = page.url();
   const list = page.getByRole("complementary", { name: "AI 对话列表" });
-  await page.getByRole("heading", { name: "从你的资料或想法开始" }).waitFor();
-  await page.getByPlaceholder("提出问题、描述任务，或添加文件").waitFor();
+  await page
+    .getByRole("heading", {
+      name: "客户问 AI 时，会推荐你的产品或店铺吗？",
+      exact: true,
+    })
+    .waitFor();
+  await page
+    .getByPlaceholder("输入你的产品、店铺或想测量的问题…", { exact: true })
+    .waitFor();
   assert(
     (await list.getByRole("heading", { name: "AI 工作台" }).count()) === 1 &&
       (await list.getByText("还没有对话。").count()) === 1 &&
@@ -345,10 +352,15 @@ async function main() {
   await englishList.getByRole("button", { name: "New", exact: true }).click();
   await page.waitForURL(/\/app\/[^/]+\/[^/]+\/chat$/);
   await page
-    .getByRole("heading", { name: "Start with your files or ideas" })
+    .getByRole("heading", {
+      name: "Will AI recommend your product or store?",
+      exact: true,
+    })
     .waitFor();
   await page
-    .getByPlaceholder("Ask a question, describe a task, or add a file")
+    .getByPlaceholder("Enter your product, store, or a question to measure…", {
+      exact: true,
+    })
     .waitFor();
   await screenshot(page, "chat-en-first-desktop", {
     width: 1440,

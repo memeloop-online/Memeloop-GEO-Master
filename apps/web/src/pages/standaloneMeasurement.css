@@ -75,3 +75,34 @@
   font-weight: var(--fontWeightRegular);
   overflow-wrap: anywhere;
 }
+.measurement-entry-form {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.measurement-composer > summary {
+  font-size: var(--fontSizeBase400);
+  font-weight: var(--fontWeightSemibold);
+}
+
+.measurement-composer summary,
+.measurement-result-evidence > summary,
+.measurement-account-settings > summary {
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.measurement-account-settings {
+  padding: 10px 12px;
+  border-radius: var(--borderRadiusMedium);
+  background: var(--colorNeutralBackground2);
+}
+
+.measurement-account-settings[open] > summary {
+  margin-bottom: 12px;
+}
+
+.measurement-result-evidence {
+  margin-top: 16px;
+}

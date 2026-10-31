@@ -1,0 +1,104 @@
+.measurement-outcome,
+.measurement-outcome-target,
+.measurement-outcome-column,
+.measurement-outcome-items {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.measurement-outcome {
+  overflow-wrap: anywhere;
+}
+
+.measurement-outcome h3,
+.measurement-outcome h4,
+.measurement-outcome h5,
+.measurement-outcome p {
+  margin: 0;
+}
+
+.measurement-outcome-target {
+  padding: 20px;
+  border: 1px solid var(--colorNeutralStroke2);
+  border-radius: 12px;
+  background: var(--colorNeutralBackground1);
+}
+
+.measurement-outcome-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 24px;
+  min-width: 0;
+}
+
+.measurement-outcome-conditions,
+.measurement-outcome-heading,
+.measurement-outcome-item-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 16px;
+}
+
+.measurement-outcome-heading {
+  justify-content: space-between;
+  align-items: center;
+}
+
+.measurement-outcome-conditions,
+.measurement-outcome-scope {
+  color: var(--colorNeutralForeground2);
+  font-size: 12px;
+}
+
+.measurement-outcome-item {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--colorNeutralStroke2);
+  border-radius: 8px;
+}
+
+.measurement-outcome summary {
+  cursor: pointer;
+}
+
+.measurement-outcome blockquote {
+  margin: 8px 0;
+  padding-left: 12px;
+  border-left: 2px solid var(--colorNeutralStroke2);
+  white-space: pre-wrap;
+}
+
+.measurement-outcome ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.measurement-outcome-discuss {
+  justify-self: start;
+  padding: 10px 16px;
+  border-radius: 6px;
+  background: var(--colorBrandBackground);
+  color: var(--colorNeutralForegroundOnBrand);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.measurement-outcome-discuss:hover {
+  background: var(--colorBrandBackgroundHover);
+}
+
+@media (max-width: 767px) {
+  .measurement-outcome-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 20px;
+  }
+
+  .measurement-outcome-target {
+    padding: 12px;
+  }
+}

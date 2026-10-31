@@ -37,6 +37,7 @@ import {
 import { ErrorState, LoadingState } from "../components/AsyncState";
 import { QuestionSetRecommendationTrend } from "../components/QuestionSetRecommendationTrend";
 import { PlannedTarget } from "./ChannelJobsPage";
+import { MeasurementOutcomeSummary } from "../components/MeasurementOutcomeSummary";
 import "./measurementMessages";
 import "./standaloneMeasurement.css";
 
@@ -75,11 +76,20 @@ export function StandaloneMeasurementPanel({
       ? { setId: requestedSetId, versionId: requestedVersionId }
       : previewScope;
   const [historyOpen, setHistoryOpen] = useState(
-    !selectedId && !selectedRankReport,
+    recordsOnly && !selectedId && !selectedRankReport,
   );
   useEffect(() => {
-    setHistoryOpen(!selectedId && !selectedRankReport && !previewScope);
-  }, [selectedId, selectedRankReport, previewScope, tenantId, projectId]);
+    setHistoryOpen(
+      recordsOnly && !selectedId && !selectedRankReport && !previewScope,
+    );
+  }, [
+    recordsOnly,
+    selectedId,
+    selectedRankReport,
+    previewScope,
+    tenantId,
+    projectId,
+  ]);
   const selectRecord = (
     id: string,
     questionSetId?: string,
@@ -89,7 +99,7 @@ export function StandaloneMeasurementPanel({
     setHistoryOpen(false);
     setParams((previous) => {
       const next = new URLSearchParams(previous);
-      next.set("tab", "records");
+      next.set("tab", recordsOnly ? "records" : "measure");
       next.delete("planId");
       next.delete("target");
       next.delete("attempt");
@@ -155,13 +165,13 @@ export function StandaloneMeasurementPanel({
   const history = useQuery({
     queryKey: [...key, "list", after],
     queryFn: () => listMeasurementPlans(tenantId, projectId, after),
-    enabled: Boolean(session && recordsOnly && active && historyOpen),
+    enabled: Boolean(session && active && historyOpen),
     retry: false,
   });
   const detail = useQuery({
     queryKey: [...key, "detail", selectedId],
     queryFn: () => getMeasurementPlan(tenantId, projectId, selectedId!),
-    enabled: Boolean(session && recordsOnly && active && selectedId),
+    enabled: Boolean(session && active && selectedId),
     retry: false,
   });
   const accounts = (channels.accounts.data?.items ?? []).filter((account) =>
@@ -233,7 +243,9 @@ export function StandaloneMeasurementPanel({
     ],
     queryFn: () => listAllQuestionSets(tenantId, projectId),
     enabled: Boolean(
-      session && (recordsOnly ? active && historyOpen : canWrite),
+      session &&
+      active &&
+      (historyOpen || (!recordsOnly && canWrite && mode === "bound")),
     ),
     retry: false,
   });
@@ -283,7 +295,6 @@ export function StandaloneMeasurementPanel({
       queryFn: () => listAllQuestionSetVersions(tenantId, projectId, id),
       enabled: Boolean(
         session &&
-        recordsOnly &&
         active &&
         historyOpen &&
         (openFolders[id] ?? requestedSetId === id),
@@ -502,11 +513,11 @@ export function StandaloneMeasurementPanel({
       : Boolean(question.trim()) &&
         new TextEncoder().encode(question.trim()).length <= 4000);
   return (
-    <section className="channel-jobs-section" aria-label="独立问题测量">
+    <section className="channel-jobs-section" aria-label={t("measure")}>
       {!recordsOnly && (
-        <>
-          <h2>开始测量</h2>
-          <p>输入问题，选择账号，查看联网搜索答案。</p>
+        <details className="measurement-composer" open={!selectedId}>
+          <summary>{t(selectedId ? "newMeasurement" : "measure")}</summary>
+          <p>{t("measurementEntryHint")}</p>
           {channels.platforms.isPending && (
             <LoadingState label={t("platformCatalogLoading")} />
           )}
@@ -518,11 +529,11 @@ export function StandaloneMeasurementPanel({
             />
           )}
           {channels.accounts.isPending && (
-            <LoadingState label="正在读取测量账号" />
+            <LoadingState label={t("accountsLoading")} />
           )}
           {channels.accounts.isError && (
             <ErrorState
-              title="测量账号无法读取"
+              title={t("accountsUnavailable")}
               detail={errorText(channels.accounts.error)}
               onRetry={() => void channels.accounts.refetch()}
             />
@@ -540,25 +551,11 @@ export function StandaloneMeasurementPanel({
                 </Link>
               </p>
             )}
-          {!canWrite && <p role="status">当前权限只能查看测量历史。</p>}
+          {!canWrite && <p role="status">{t("measurementReadOnly")}</p>}
           {canWrite && (
-            <div>
-              <Field label="问题来源">
-                <Select
-                  value={mode}
-                  onChange={(_, data) =>
-                    setMode(data.value as "custom" | "bound")
-                  }
-                  disabled={submission.isPending}
-                >
-                  <option value="custom">自定义问题</option>
-                  <option value="bound">
-                    已有问题集{sets.data ? `（${sets.data.items.length}）` : ""}
-                  </option>
-                </Select>
-              </Field>
+            <div className="measurement-entry-form">
               {mode === "custom" ? (
-                <Field label="要测量的问题">
+                <Field label={t("questionInput")}>
                   <Textarea
                     value={question}
                     onChange={(_, data) => setQuestion(data.value)}
@@ -655,117 +652,121 @@ export function StandaloneMeasurementPanel({
                   )}
                 </>
               )}
-              <Field label="独立测量账号">
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <Select
-                    style={{ flex: 1, minWidth: 0 }}
-                    value={selectedAccount?.account_id ?? ""}
-                    onChange={(_, data) => setAccountId(data.value)}
-                    disabled={submission.isPending || !accounts.length}
-                  >
-                    {!selectedAccount && (
-                      <option value="">
-                        {accounts.length
-                          ? accounts.some((account) =>
-                              supportsMeasurement(account.platform),
-                            )
-                            ? "请重新连接账号"
-                            : t("noMeasurementAccount")
-                          : "尚未连接账号"}
-                      </option>
-                    )}
-                    {accounts.map((account) => (
-                      <option
-                        key={account.account_id}
-                        value={account.account_id}
-                        disabled={
-                          !account.enabled ||
-                          account.status !== "ready" ||
-                          !supportsMeasurement(account.platform)
-                        }
-                      >
-                        {channels.platforms.data?.items.find(
-                          (platform) => platform.id === account.platform,
-                        )?.label ?? account.platform}
-                        {account.display_name && ` · ${account.display_name}`} ·{" "}
-                        {!supportsMeasurement(account.platform)
-                          ? t("measurementUnavailable")
-                          : account.enabled && account.status === "ready"
-                            ? "已登录"
-                            : !account.enabled || account.status === "disabled"
-                              ? "已停用"
-                              : account.status === "unverified"
-                                ? "身份待验证"
-                                : "需要重新连接"}
-                      </option>
-                    ))}
-                  </Select>
-                  {accounts.length > 0 && (
-                    <Tooltip
-                      content={t("addMeasurementAccount")}
-                      relationship="label"
-                    >
-                      <Link
-                        to={`/app/${tenantId}/${projectId}/channels/connect`}
-                        aria-label={t("addMeasurementAccount")}
-                        style={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          minWidth: 32,
-                          minHeight: 32,
-                        }}
-                      >
-                        <AddRegular aria-hidden="true" />
-                      </Link>
-                    </Tooltip>
-                  )}
-                </div>
+              <Field label={t("entryQuestionSource")}>
+                <Select
+                  value={mode}
+                  onChange={(_, data) =>
+                    setMode(data.value as "custom" | "bound")
+                  }
+                  disabled={submission.isPending}
+                >
+                  <option value="custom">{t("customQuestion")}</option>
+                  <option value="bound">
+                    {t("existingQuestionSet")}
+                    {sets.data ? ` (${sets.data.items.length})` : ""}
+                  </option>
+                </Select>
               </Field>
-              {!accountReady &&
-                accounts.some(
-                  (account) => !account.enabled || account.status !== "ready",
-                ) && (
-                  <p>
-                    <Link to={`/app/${tenantId}/${projectId}/channels`}>
-                      重新连接已有账号
-                    </Link>
-                  </p>
-                )}
-              {accountReady && options.isPending && (
-                <LoadingState label="正在识别网页模型" />
-              )}
-              {accountReady && options.isError && (
-                <ErrorState
-                  title="暂时无法读取网页模型"
-                  detail={errorText(options.error)}
-                  onRetry={() => void options.refetch({ cancelRefetch: false })}
-                />
-              )}
-              {accountReady && options.data && !models.length && (
-                <p>
-                  未发现可用网页模型。
-                  <Button
-                    appearance="subtle"
-                    disabled={options.isFetching || !active}
-                    onClick={() =>
-                      void options.refetch({ cancelRefetch: false })
-                    }
+              <details
+                className="measurement-account-settings"
+                open={!accountReady}
+              >
+                <summary>
+                  {t("adjustMeasurementAccount", {
+                    account:
+                      selectedAccount?.display_name ||
+                      channels.platforms.data?.items.find(
+                        (platform) => platform.id === selectedAccount?.platform,
+                      )?.label ||
+                      t("connectMeasurementAccount"),
+                    model:
+                      models.find((item) => item.id === selectedModel)?.label ||
+                      t("modelDiscoveryPending"),
+                  })}
+                </summary>
+                <Field label={t("measurementAccount")}>
+                  <div
+                    style={{ display: "flex", alignItems: "center", gap: 8 }}
                   >
-                    重新识别模型
-                  </Button>
-                </p>
-              )}
-              {selectedModel && (
-                <p>
-                  模型：
-                  {models.find((item) => item.id === selectedModel)?.label}
-                </p>
-              )}
-              <details>
-                <summary>高级选项</summary>
+                    <Select
+                      style={{ flex: 1, minWidth: 0 }}
+                      value={selectedAccount?.account_id ?? ""}
+                      onChange={(_, data) => setAccountId(data.value)}
+                      disabled={submission.isPending || !accounts.length}
+                    >
+                      {!selectedAccount && (
+                        <option value="">
+                          {accounts.length
+                            ? accounts.some((account) =>
+                                supportsMeasurement(account.platform),
+                              )
+                              ? t("reconnectAccount")
+                              : t("noMeasurementAccount")
+                            : t("noConnectedAccount")}
+                        </option>
+                      )}
+                      {accounts.map((account) => (
+                        <option
+                          key={account.account_id}
+                          value={account.account_id}
+                          disabled={
+                            !account.enabled ||
+                            account.status !== "ready" ||
+                            !supportsMeasurement(account.platform)
+                          }
+                        >
+                          {channels.platforms.data?.items.find(
+                            (platform) => platform.id === account.platform,
+                          )?.label ?? account.platform}
+                          {account.display_name && ` · ${account.display_name}`}{" "}
+                          ·{" "}
+                          {!supportsMeasurement(account.platform)
+                            ? t("measurementUnavailable")
+                            : account.enabled && account.status === "ready"
+                              ? t("accountReady")
+                              : !account.enabled ||
+                                  account.status === "disabled"
+                                ? t("accountDisabled")
+                                : account.status === "unverified"
+                                  ? t("accountUnverified")
+                                  : t("accountReconnectNeeded")}
+                        </option>
+                      ))}
+                    </Select>
+                    {accounts.length > 0 && (
+                      <Tooltip
+                        content={t("addMeasurementAccount")}
+                        relationship="label"
+                      >
+                        <Link
+                          to={`/app/${tenantId}/${projectId}/channels/connect`}
+                          aria-label={t("addMeasurementAccount")}
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            minWidth: 32,
+                            minHeight: 32,
+                          }}
+                        >
+                          <AddRegular aria-hidden="true" />
+                        </Link>
+                      </Tooltip>
+                    )}
+                  </div>
+                </Field>
+                {!accountReady &&
+                  accounts.some(
+                    (account) => !account.enabled || account.status !== "ready",
+                  ) && (
+                    <p>
+                      <Link to={`/app/${tenantId}/${projectId}/channels`}>
+                        {t("reconnectExistingAccount")}
+                      </Link>
+                    </p>
+                  )}
                 <div className="channel-jobs-form">
-                  <Field label="网页模型">
+                  <Field label={t("webModel")}>
                     <Select
                       value={selectedModel ?? ""}
                       onChange={(_, data) => setModel(data.value)}
@@ -792,6 +793,35 @@ export function StandaloneMeasurementPanel({
                   >
                     {t("refreshMeasurementModels")}
                   </Button>
+                </div>
+              </details>
+              {accountReady && options.isPending && (
+                <LoadingState label={t("discoverModels")} />
+              )}
+              {accountReady && options.isError && (
+                <ErrorState
+                  title={t("discoverModelsUnavailable")}
+                  detail={errorText(options.error)}
+                  onRetry={() => void options.refetch({ cancelRefetch: false })}
+                />
+              )}
+              {accountReady && options.data && !models.length && (
+                <p>
+                  {t("noDiscoveredModels")}
+                  <Button
+                    appearance="subtle"
+                    disabled={options.isFetching || !active}
+                    onClick={() =>
+                      void options.refetch({ cancelRefetch: false })
+                    }
+                  >
+                    {t("retryModelDiscovery")}
+                  </Button>
+                </p>
+              )}
+              <details>
+                <summary>{t("advancedOptions")}</summary>
+                <div className="channel-jobs-form">
                   {mode === "bound" && (
                     <Field label="问题集版本">
                       <Select
@@ -833,291 +863,291 @@ export function StandaloneMeasurementPanel({
                 onClick={start}
               >
                 {submission.isPending
-                  ? "正在提交测量…"
+                  ? t("submittingMeasurement")
                   : submission.isError
-                    ? "重试提交测量"
-                    : "开始测量"}
+                    ? t("retryMeasurementSubmission")
+                    : t("measure")}
               </Button>
-              {submission.isSuccess && (
-                <p role="status">测量计划已受理，执行结果以以下记录为准。</p>
-              )}
               {submission.isError && (
                 <ErrorState
-                  title="测量提交未确认"
-                  detail={`${errorText(submission.error)} 可重试，或在测量记录中查看提交结果。`}
+                  title={t("measurementSubmissionUnconfirmed")}
+                  detail={t("measurementSubmissionRetryHint", {
+                    error: errorText(submission.error),
+                  })}
                 />
               )}
             </div>
           )}
-        </>
+        </details>
       )}
-      {recordsOnly && (
-        <>
-          {reportScope && (
-            <section
-              className="measurement-selected-report"
-              aria-label={t("selectedReport")}
-            >
-              <QuestionSetRecommendationTrend
-                key={`${reportScope.setId}/${reportScope.versionId}`}
-                tenantId={tenantId}
-                projectId={projectId}
-                questionSetId={reportScope.setId}
-                questionSetVersionId={reportScope.versionId}
-                initiallyExpanded
-                embedded
-                showFocusSettings={false}
-                onPreview={() => setPreviewScope(reportScope)}
+      {reportScope && (
+        <section
+          className="measurement-selected-report"
+          aria-label={t("selectedReport")}
+        >
+          <QuestionSetRecommendationTrend
+            key={`${reportScope.setId}/${reportScope.versionId}`}
+            tenantId={tenantId}
+            projectId={projectId}
+            questionSetId={reportScope.setId}
+            questionSetVersionId={reportScope.versionId}
+            initiallyExpanded
+            embedded
+            showFocusSettings={false}
+            onPreview={() => setPreviewScope(reportScope)}
+          />
+        </section>
+      )}
+      {selectedId && detail.isPending && (
+        <LoadingState label={t("loadingSelectedMeasurement")} />
+      )}
+      {detail.isError && (
+        <ErrorState
+          title={t("selectedMeasurementUnavailable")}
+          detail={errorText(detail.error)}
+          onRetry={() => void detail.refetch()}
+        />
+      )}
+      {detail.data && !reportScope && (
+        <MeasurementOutcomeSummary
+          tenantId={tenantId}
+          projectId={projectId}
+          plan={detail.data}
+          active={active}
+        />
+      )}
+      <Accordion
+        collapsible
+        openItems={historyOpen ? ["history"] : []}
+        onToggle={(_, data) =>
+          setHistoryOpen(data.openItems.includes("history"))
+        }
+      >
+        <AccordionItem value="history">
+          <AccordionHeader>{t("measurementHistory")}</AccordionHeader>
+          <AccordionPanel>
+            <Button appearance="subtle" onClick={() => void history.refetch()}>
+              刷新测量历史
+            </Button>
+            {history.isPending && <LoadingState label="正在读取独立测量历史" />}
+            {history.isError && (
+              <ErrorState
+                title="测量历史无法读取"
+                detail={errorText(history.error)}
+                onRetry={() => void history.refetch()}
               />
-            </section>
-          )}
-          {!reportScope && <h2>测量记录</h2>}
-          <Accordion
-            collapsible
-            openItems={historyOpen ? ["history"] : []}
-            onToggle={(_, data) =>
-              setHistoryOpen(data.openItems.includes("history"))
-            }
-          >
-            <AccordionItem value="history">
-              <AccordionHeader>{t("measurementHistory")}</AccordionHeader>
-              <AccordionPanel>
-                <Button
-                  appearance="subtle"
-                  onClick={() => void history.refetch()}
-                >
-                  刷新测量历史
-                </Button>
-                {history.isPending && (
-                  <LoadingState label="正在读取独立测量历史" />
-                )}
-                {history.isError && (
-                  <ErrorState
-                    title="测量历史无法读取"
-                    detail={errorText(history.error)}
-                    onRetry={() => void history.refetch()}
-                  />
-                )}
-                {history.data?.items.length === 0 && (
-                  <p>还没有独立测量计划。</p>
-                )}
-                {sets.isError && (
-                  <ErrorState
-                    title={t("historySetsUnavailable")}
-                    detail={errorText(sets.error)}
-                    onRetry={() => void sets.refetch()}
-                  />
-                )}
-                <nav
-                  className="measurement-history-folders"
-                  aria-label={t("measurementFolders")}
-                >
-                  {[...groups].map(([groupId, versions]) => {
-                    const versionHistory =
-                      folderVersions[folderIds.indexOf(groupId)];
-                    const set = sets.data?.items.find(
-                      (item) => item.id === groupId,
-                    );
-                    const count = new Set(
-                      [...versions.values()].flat().map((plan) => plan.plan_id),
-                    ).size;
-                    return (
-                      <details
-                        className="measurement-history-folder"
-                        key={groupId}
-                        open={
-                          openFolders[groupId] ?? requestedSetId === groupId
-                        }
-                        onToggle={(event) => {
-                          const open = event.currentTarget.open;
-                          setOpenFolders((previous) =>
-                            previous[groupId] === open
-                              ? previous
-                              : { ...previous, [groupId]: open },
-                          );
-                        }}
-                      >
-                        <summary>
-                          {set?.name ?? t("unnamedQuestionSet")} ·{" "}
-                          {t("folderRecordCount", { count })}
-                        </summary>
-                        <Link
-                          to={`/app/${tenantId}/${projectId}/measurement?tab=sets&set=${encodeURIComponent(groupId)}`}
-                        >
-                          {t("viewQuestionSet")}
-                        </Link>{" "}
-                        {canWrite && (
-                          <Link
-                            to={`/app/${tenantId}/${projectId}/measurement?tab=measure&set=${encodeURIComponent(groupId)}`}
-                          >
-                            {t("measureQuestionSet")}
-                          </Link>
-                        )}
-                        {count === 0 && <p>{t("folderNoRecords")}</p>}
-                        {versionHistory.isFetching && (
-                          <LoadingState
-                            label={t("folderVersionsLoading")}
-                            compact
-                          />
-                        )}
-                        {versionHistory.isError && (
-                          <ErrorState
-                            title={t("folderVersionsUnavailable")}
-                            detail={errorText(versionHistory.error)}
-                            onRetry={() => void versionHistory.refetch()}
-                          />
-                        )}
-                        {[...versions].map(([versionId, plans]) => {
-                          const savedVersion = versionHistory.data?.items.find(
-                            (item) => item.id === versionId,
-                          );
-                          return (
-                            <details
-                              className="measurement-history-version"
-                              key={versionId}
-                              open
-                            >
-                              <summary>
-                                {set?.current_version_id === versionId
-                                  ? t("currentSetVersion", {
-                                      revision: set.current_revision,
-                                    })
-                                  : t("savedSetVersion", {
-                                      value: savedVersion
-                                        ? `v${savedVersion.revision}`
-                                        : versionId,
-                                    })}
-                              </summary>
-                              <Button
-                                appearance="subtle"
-                                onClick={() => {
-                                  setPreviewScope({
-                                    setId: groupId,
-                                    versionId,
-                                  });
-                                  setHistoryOpen(false);
-                                  if (selectedRankReport) {
-                                    setParams((previous) => {
-                                      const next = new URLSearchParams(
-                                        previous,
-                                      );
-                                      next.delete("rankReport");
-                                      return next;
-                                    });
-                                  }
-                                }}
-                              >
-                                {t("open", {
-                                  ns: "questionSetRecommendationTrend",
-                                })}
-                              </Button>
-                              <ul className="measurement-history-records">
-                                {plans.map((plan) =>
-                                  recordButton(plan, groupId, versionId),
-                                )}
-                              </ul>
-                            </details>
-                          );
-                        })}
-                      </details>
-                    );
-                  })}
+            )}
+            {history.data?.items.length === 0 && <p>还没有独立测量计划。</p>}
+            {sets.isError && (
+              <ErrorState
+                title={t("historySetsUnavailable")}
+                detail={errorText(sets.error)}
+                onRetry={() => void sets.refetch()}
+              />
+            )}
+            <nav
+              className="measurement-history-folders"
+              aria-label={t("measurementFolders")}
+            >
+              {[...groups].map(([groupId, versions]) => {
+                const versionHistory =
+                  folderVersions[folderIds.indexOf(groupId)];
+                const set = sets.data?.items.find(
+                  (item) => item.id === groupId,
+                );
+                const count = new Set(
+                  [...versions.values()].flat().map((plan) => plan.plan_id),
+                ).size;
+                return (
                   <details
                     className="measurement-history-folder"
-                    open={!requestedSetId}
+                    key={groupId}
+                    open={openFolders[groupId] ?? requestedSetId === groupId}
+                    onToggle={(event) => {
+                      const open = event.currentTarget.open;
+                      setOpenFolders((previous) =>
+                        previous[groupId] === open
+                          ? previous
+                          : { ...previous, [groupId]: open },
+                      );
+                    }}
                   >
                     <summary>
-                      {t("temporaryMeasurements")} ·{" "}
-                      {t("folderRecordCount", { count: temporaryPlans.length })}
+                      {set?.name ?? t("unnamedQuestionSet")} ·{" "}
+                      {t("folderRecordCount", { count })}
                     </summary>
-                    {temporaryPlans.length ? (
-                      <ul className="measurement-history-records">
-                        {temporaryPlans.map((plan) => recordButton(plan, ""))}
-                      </ul>
-                    ) : (
-                      <p>{t("folderNoRecords")}</p>
+                    <Link
+                      to={`/app/${tenantId}/${projectId}/measurement?tab=sets&set=${encodeURIComponent(groupId)}`}
+                    >
+                      {t("viewQuestionSet")}
+                    </Link>{" "}
+                    {canWrite && (
+                      <Link
+                        to={`/app/${tenantId}/${projectId}/measurement?tab=measure&set=${encodeURIComponent(groupId)}`}
+                      >
+                        {t("measureQuestionSet")}
+                      </Link>
                     )}
+                    {count === 0 && <p>{t("folderNoRecords")}</p>}
+                    {versionHistory.isFetching && (
+                      <LoadingState
+                        label={t("folderVersionsLoading")}
+                        compact
+                      />
+                    )}
+                    {versionHistory.isError && (
+                      <ErrorState
+                        title={t("folderVersionsUnavailable")}
+                        detail={errorText(versionHistory.error)}
+                        onRetry={() => void versionHistory.refetch()}
+                      />
+                    )}
+                    {[...versions].map(([versionId, plans]) => {
+                      const savedVersion = versionHistory.data?.items.find(
+                        (item) => item.id === versionId,
+                      );
+                      return (
+                        <details
+                          className="measurement-history-version"
+                          key={versionId}
+                          open
+                        >
+                          <summary>
+                            {set?.current_version_id === versionId
+                              ? t("currentSetVersion", {
+                                  revision: set.current_revision,
+                                })
+                              : t("savedSetVersion", {
+                                  value: savedVersion
+                                    ? `v${savedVersion.revision}`
+                                    : versionId,
+                                })}
+                          </summary>
+                          <Button
+                            appearance="subtle"
+                            onClick={() => {
+                              setPreviewScope({
+                                setId: groupId,
+                                versionId,
+                              });
+                              setHistoryOpen(false);
+                              if (selectedRankReport) {
+                                setParams((previous) => {
+                                  const next = new URLSearchParams(previous);
+                                  next.delete("rankReport");
+                                  return next;
+                                });
+                              }
+                            }}
+                          >
+                            {t("open", {
+                              ns: "questionSetRecommendationTrend",
+                            })}
+                          </Button>
+                          <ul className="measurement-history-records">
+                            {plans.map((plan) =>
+                              recordButton(plan, groupId, versionId),
+                            )}
+                          </ul>
+                        </details>
+                      );
+                    })}
                   </details>
-                </nav>
-                {previous.length > 0 && (
-                  <Button
-                    onClick={() => {
-                      setAfter(previous.at(-1));
-                      setPrevious((items) => items.slice(0, -1));
-                    }}
-                  >
-                    上一页测量
-                  </Button>
+                );
+              })}
+              <details
+                className="measurement-history-folder"
+                open={!requestedSetId}
+              >
+                <summary>
+                  {t("temporaryMeasurements")} ·{" "}
+                  {t("folderRecordCount", { count: temporaryPlans.length })}
+                </summary>
+                {temporaryPlans.length ? (
+                  <ul className="measurement-history-records">
+                    {temporaryPlans.map((plan) => recordButton(plan, ""))}
+                  </ul>
+                ) : (
+                  <p>{t("folderNoRecords")}</p>
                 )}
-                {history.data?.next_after && (
-                  <Button
-                    onClick={() => {
-                      setPrevious((items) => [...items, after]);
-                      setAfter(history.data!.next_after!);
-                    }}
-                  >
-                    下一页测量
-                  </Button>
-                )}
-              </AccordionPanel>
-            </AccordionItem>
-          </Accordion>
-          {selectedId && detail.isPending && (
-            <LoadingState label="正在读取测量计划" />
-          )}
-          {detail.isError && (
-            <ErrorState
-              title="测量计划无法读取"
-              detail={errorText(detail.error)}
-              onRetry={() => void detail.refetch()}
-            />
-          )}
-          {detail.data && (
-            <div className="channel-jobs-list">
-              {!detail.data.targets.length && <p>{detail.data.title}</p>}
-              <details>
-                <summary>{t("resultPlanDetails")}</summary>
-                <p>{t("resultPlanId", { value: detail.data.plan_id })}</p>
               </details>
-              {detail.data.targets
-                .filter((target) => {
-                  if (
-                    params.get("target") &&
-                    params.get("target") !== target.target_id
-                  )
-                    return false;
-                  if (target.input.kind !== "measure") return true;
-                  const reference = target.input.question_binding?.reference;
-                  if (requestedSetId)
-                    return (
-                      reference?.question_set_id === requestedSetId &&
-                      (!requestedVersionId ||
-                        reference.question_set_version_id ===
-                          requestedVersionId)
-                    );
-                  if (params.get("folder") === "temporary") return !reference;
-                  return true;
-                })
-                .map((target) => (
-                  <PlannedTarget
-                    key={target.target_id}
-                    target={target}
-                    tenantId={tenantId}
-                    projectId={projectId}
-                    canWrite={canWrite}
-                    active={active}
-                    accountDisplayName={
-                      channels.accounts.data?.items.find(
-                        (account) =>
-                          account.account_id === target.input.account_id,
-                      )?.display_name
-                    }
-                    automatic
-                  />
-                ))}
-            </div>
+            </nav>
+            {previous.length > 0 && (
+              <Button
+                onClick={() => {
+                  setAfter(previous.at(-1));
+                  setPrevious((items) => items.slice(0, -1));
+                }}
+              >
+                上一页测量
+              </Button>
+            )}
+            {history.data?.next_after && (
+              <Button
+                onClick={() => {
+                  setPrevious((items) => [...items, after]);
+                  setAfter(history.data!.next_after!);
+                }}
+              >
+                下一页测量
+              </Button>
+            )}
+          </AccordionPanel>
+        </AccordionItem>
+      </Accordion>
+      {detail.data && (
+        <details
+          className="measurement-result-evidence"
+          open={Boolean(
+            params.get("target") ||
+            params.get("attempt") ||
+            params.get("analysisRevision"),
           )}
-        </>
+        >
+          <summary>{t("resultEvidence")}</summary>
+          <div className="channel-jobs-list">
+            {!detail.data.targets.length && <p>{detail.data.title}</p>}
+            <details>
+              <summary>{t("resultPlanDetails")}</summary>
+              <p>{t("resultPlanId", { value: detail.data.plan_id })}</p>
+            </details>
+            {detail.data.targets
+              .filter((target) => {
+                if (
+                  params.get("target") &&
+                  params.get("target") !== target.target_id
+                )
+                  return false;
+                if (target.input.kind !== "measure") return true;
+                const reference = target.input.question_binding?.reference;
+                if (requestedSetId)
+                  return (
+                    reference?.question_set_id === requestedSetId &&
+                    (!requestedVersionId ||
+                      reference.question_set_version_id === requestedVersionId)
+                  );
+                if (params.get("folder") === "temporary") return !reference;
+                return true;
+              })
+              .map((target) => (
+                <PlannedTarget
+                  key={target.target_id}
+                  target={target}
+                  tenantId={tenantId}
+                  projectId={projectId}
+                  canWrite={canWrite}
+                  active={active}
+                  accountDisplayName={
+                    channels.accounts.data?.items.find(
+                      (account) =>
+                        account.account_id === target.input.account_id,
+                    )?.display_name
+                  }
+                  automatic
+                />
+              ))}
+          </div>
+        </details>
       )}
     </section>
   );

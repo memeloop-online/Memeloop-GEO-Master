@@ -29,15 +29,6 @@ pub fn configure_callbacks(
     let state = state
         .with_project_serp_settings(serp_settings)
         .with_serp_service(serp);
-    let state =
-        state.with_observation_evidence_resolver(geo_api::ObservationEvidenceResolver::new(
-            std::sync::Arc::new(
-                geo_persistence::PgObservationAnalysisRepository::from_database(database),
-            ),
-            std::sync::Arc::new(
-                geo_persistence::PgObservationCaptureRepository::from_database(database),
-            ),
-        ));
     let extraction_repository: std::sync::Arc<dyn geo_domain::ObservationExtractionRepository> =
         std::sync::Arc::new(
             geo_persistence::PgObservationExtractionRepository::from_database(database),

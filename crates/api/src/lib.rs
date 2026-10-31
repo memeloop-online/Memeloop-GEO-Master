@@ -583,6 +583,12 @@ impl AppState {
         .with_channel_job_repository(Arc::new(
             geo_persistence::PgChannelJobRepository::from_database(database),
         ))
+        // Runtime host capabilities clone this state before callback services
+        // are configured. Saved-evidence reads must already be available.
+        .with_observation_evidence_resolver(ObservationEvidenceResolver::new(
+            Arc::new(geo_persistence::PgObservationAnalysisRepository::from_database(database)),
+            Arc::new(geo_persistence::PgObservationCaptureRepository::from_database(database)),
+        ))
         .with_publication_lookup_repository(Arc::new(
             geo_persistence::PgPublicationLookupRepository::from_database(database),
         ))

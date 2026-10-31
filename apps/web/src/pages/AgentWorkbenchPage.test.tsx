@@ -24,18 +24,18 @@ import { AppRoutes } from "../app";
 import { AuthProvider } from "../auth/AuthProvider";
 import type { AuthSession } from "../auth/types";
 import i18n from "../i18n";
+import "./AgentWorkbenchPage";
 
 const originalScrollTo = Object.getOwnPropertyDescriptor(
   HTMLElement.prototype,
   "scrollTo",
 );
-beforeAll(async () => {
+beforeAll(() => {
   // jsdom has no layout scrolling; populated native transcripts invoke it.
   Object.defineProperty(HTMLElement.prototype, "scrollTo", {
     configurable: true,
     value: vi.fn(),
   });
-  await import("./AgentWorkbenchPage");
 });
 afterAll(() => {
   if (originalScrollTo) {
@@ -100,6 +100,92 @@ afterEach(async () => {
 });
 
 describe("P00 AI workbench routing", () => {
+  it.each(["zh-CN", "en"])(
+    "offers editable measurement examples without overwriting or sending drafts (%s)",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      const requests: Array<{ path: string; init?: RequestInit }> = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((request: RequestInfo | URL, init?: RequestInit) => {
+          const path = new URL(String(request), "http://localhost").pathname;
+          requests.push({ path, init });
+          return Promise.resolve(
+            response(
+              path.endsWith("/auth/session")
+                ? session
+                : { items: [], next_cursor: null },
+            ),
+          );
+        }),
+      );
+      renderApp("/app/tenant-a/project-a/chat");
+      const input = await screen.findByLabelText(i18n.t("chatWorkbench.input"));
+      const user = userEvent.setup();
+      const guidance = (key: string) =>
+        i18n.t(key, { ns: "chatMeasurementGuidance" });
+      expect(
+        screen.getByRole("heading", { name: guidance("title") }),
+      ).toBeInTheDocument();
+      for (const kind of ["product", "shop", "perception", "sources"]) {
+        await user.clear(input);
+        await user.click(
+          screen.getByRole("button", {
+            name: `${guidance(`examples.${kind}.title`)} ${guidance(`examples.${kind}.detail`)}`,
+          }),
+        );
+        expect(input).toHaveValue(guidance(`examples.${kind}.draft`));
+        expect(input).toHaveFocus();
+        await user.clear(input);
+        await user.type(input, "My edited draft");
+        await user.click(
+          screen.getByRole("button", {
+            name: `${guidance(`examples.${kind}.title`)} ${guidance(`examples.${kind}.detail`)}`,
+          }),
+        );
+        expect(input).toHaveValue("My edited draft");
+        expect(input).toHaveFocus();
+        expect(screen.getByText(guidance("preserved"))).toBeInTheDocument();
+      }
+      expect(
+        requests.filter(({ init }) => init?.method === "POST"),
+      ).toHaveLength(0);
+    },
+  );
+
+  it.each(["plan", "invalid", "mixed"])(
+    "handles a measurement-plan handoff without starting a conversation: %s",
+    async (reference) => {
+      const planId = "11111111-2222-4333-8444-555555555555";
+      const requests: Array<{ init?: RequestInit }> = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((request: RequestInfo | URL, init?: RequestInit) => {
+          requests.push({ init });
+          return Promise.resolve(
+            response(
+              String(request).includes("/auth/session")
+                ? session
+                : { items: [], next_cursor: null },
+            ),
+          );
+        }),
+      );
+      renderApp(
+        `/app/tenant-a/project-a/chat?measurementPlan=${reference === "invalid" ? "invalid" : planId}${reference === "mixed" ? `&measurementReport=${planId}` : ""}`,
+      );
+      const input = await screen.findByLabelText("输入任务");
+      await waitFor(() =>
+        reference === "plan"
+          ? expect((input as HTMLTextAreaElement).value).toContain(planId)
+          : expect(input).toHaveValue(""),
+      );
+      expect(
+        requests.filter(({ init }) => init?.method === "POST"),
+      ).toHaveLength(0);
+    },
+  );
+
   it.each([
     "unsent",
     "selected-question",
@@ -599,11 +685,13 @@ describe("P00 AI workbench routing", () => {
       "/app/tenant-a/project-a/chat",
     );
     expect(
-      screen.getByRole("heading", { name: "从你的资料或想法开始" }),
+      screen.getByRole("heading", {
+        name: "客户问 AI 时，会推荐你的产品或店铺吗？",
+      }),
     ).toBeInTheDocument();
     expect(screen.getByLabelText("输入任务")).toHaveAttribute(
       "placeholder",
-      "提出问题、描述任务，或添加文件",
+      "输入你的产品、店铺或想测量的问题…",
     );
     expect(
       screen.queryByRole("button", { name: "新建对话" }),
@@ -702,13 +790,15 @@ describe("P00 AI workbench routing", () => {
     expect(
       screen.getByText("AI 服务未启用，请联系管理员完成配置。"),
     ).toBeInTheDocument();
-    expect(screen.getByText("从你的资料或想法开始")).toBeInTheDocument();
+    expect(
+      screen.getByText("客户问 AI 时，会推荐你的产品或店铺吗？"),
+    ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "添加文件" }),
     ).toBeInTheDocument();
     expect(screen.getByLabelText("输入任务")).toBeInTheDocument();
     expect(
-      screen.getByText("可以在对话中逐步补充必要信息。"),
+      screen.getByText("选择示例，修改后发送；也可以直接提问。"),
     ).toBeInTheDocument();
     await act(async () => {
       await i18n.changeLanguage("en");
@@ -718,7 +808,7 @@ describe("P00 AI workbench routing", () => {
     ).toBeInTheDocument();
     expect(screen.getByLabelText("Enter a task")).toHaveAttribute(
       "placeholder",
-      "Ask a question, describe a task, or add a file",
+      "Enter your product, store, or a question to measure…",
     );
     expect(
       screen.getByText(

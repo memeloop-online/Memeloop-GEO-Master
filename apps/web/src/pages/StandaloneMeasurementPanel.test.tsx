@@ -17,6 +17,7 @@ import {
 } from "react-router-dom";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import { StandaloneMeasurementPanel } from "./StandaloneMeasurementPanel";
+import i18n from "../i18n";
 import {
   createMeasurementPlan,
   executeChannelTarget,
@@ -37,6 +38,11 @@ import {
   listMeasurementReports,
 } from "../api/measurementReports";
 
+vi.mock("../components/MeasurementOutcomeSummary", () => ({
+  MeasurementOutcomeSummary: ({ plan }: { plan: { plan_id: string } }) => (
+    <section aria-label="本次测量摘要">{plan.plan_id}</section>
+  ),
+}));
 const state = vi.hoisted(() => ({
   accounts: [] as unknown[],
   platforms: [] as unknown[],
@@ -238,11 +244,48 @@ beforeEach(() => {
     next_cursor: null,
   });
 });
-afterEach(() => {
+afterEach(async () => {
   cleanup();
   vi.restoreAllMocks();
+  await i18n.changeLanguage("zh-CN");
 });
 describe("standalone arbitrary-topic measurement", () => {
+  it.each([
+    ["zh-CN", "要测量的问题", "开始测量", "测量历史"],
+    ["en", "Question to measure", "Start measurement", "Measurement history"],
+  ])(
+    "shows the direct question entry in %s without loading history",
+    async (language, input, action, history) => {
+      await i18n.changeLanguage(language);
+      renderPanel();
+      expect(screen.getByRole("textbox", { name: input })).toBeVisible();
+      expect(screen.getByRole("button", { name: action })).toBeVisible();
+      expect(screen.getByRole("button", { name: history })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+      expect(listMeasurementPlans).not.toHaveBeenCalled();
+      expect(createMeasurementPlan).not.toHaveBeenCalled();
+    },
+  );
+
+  it("restores the exact submitted plan on the measurement route without opening history", async () => {
+    renderPanel(true, false, false, "/?tab=measure&record=measurement-1");
+    expect(
+      await screen.findByRole("region", { name: "本次测量摘要" }),
+    ).toHaveTextContent("measurement-1");
+    expect(getMeasurementPlan).toHaveBeenCalledWith(
+      "tenant-1",
+      "project-1",
+      "measurement-1",
+    );
+    expect(listMeasurementPlans).not.toHaveBeenCalled();
+    expect(createMeasurementPlan).not.toHaveBeenCalled();
+    expect(
+      screen.getByText("测量另一个问题").closest("details"),
+    ).not.toHaveAttribute("open");
+  });
+
   it("shows the question, platform, account and timestamp instead of a generic history label", async () => {
     vi.mocked(listMeasurementPlans).mockResolvedValue({
       items: [{ ...plan, title: "联网搜索测量", targets: [target] }],
@@ -268,16 +311,17 @@ describe("standalone arbitrary-topic measurement", () => {
       display_name: "另一个账号",
     });
     renderPanel();
-    await screen.findByText("模型：网页当前模型");
+    await screen.findByText(/测量账号 · 网页当前模型 · 调整/);
     expect(
       screen.queryByRole("link", { name: "重新连接已有账号" }),
     ).not.toBeInTheDocument();
+    await userEvent.click(screen.getByText(/测量账号 · 网页当前模型 · 调整/));
     expect(screen.getByRole("link", { name: "添加测量账号" })).toBeVisible();
   });
   it("uses the user's question as the new record title within the API byte limit", async () => {
     const user = userEvent.setup();
     renderPanel();
-    await screen.findByText("模型：网页当前模型");
+    await screen.findByText(/测量账号 · 网页当前模型 · 调整/);
     const question = "推荐适合出差的轻薄笔记本电脑。".repeat(8);
     await user.type(screen.getByLabelText("要测量的问题"), question);
     await user.click(screen.getByRole("button", { name: "开始测量" }));
@@ -310,7 +354,7 @@ describe("standalone arbitrary-topic measurement", () => {
         ),
       },
     );
-    await waitFor(() => expect(listAllQuestionSets).toHaveBeenCalledOnce());
+    expect(listAllQuestionSets).not.toHaveBeenCalled();
     window.dispatchEvent(new Event("focus"));
     expect(getMeasurementOptions).not.toHaveBeenCalled();
     expect(state.refetch).not.toHaveBeenCalled();
@@ -322,7 +366,9 @@ describe("standalone arbitrary-topic measurement", () => {
         active
       />,
     );
-    expect(await screen.findByText("模型：网页当前模型")).toBeVisible();
+    expect(
+      await screen.findByText(/测量账号 · 网页当前模型 · 调整/),
+    ).toBeVisible();
     expect(getMeasurementOptions).toHaveBeenCalledOnce();
     window.dispatchEvent(new Event("focus"));
     expect(state.refetch).toHaveBeenCalledOnce();
@@ -345,15 +391,15 @@ describe("standalone arbitrary-topic measurement", () => {
     const initialTime = Date.now();
     const now = vi.spyOn(Date, "now").mockReturnValue(initialTime);
     const panel = renderDiscoveryPanel(client);
-    await screen.findByText("模型：网页当前模型");
+    await screen.findByText(/测量账号 · 网页当前模型 · 调整/);
     now.mockReturnValue(initialTime + 31_000);
     panel.revisit(false);
     panel.revisit();
-    expect(screen.getByText("模型：网页当前模型")).toBeVisible();
+    expect(screen.getByText(/测量账号 · 网页当前模型 · 调整/)).toBeVisible();
     expect(getMeasurementOptions).toHaveBeenCalledOnce();
     panel.unmount();
     renderDiscoveryPanel(client);
-    await screen.findByText("模型：网页当前模型");
+    await screen.findByText(/测量账号 · 网页当前模型 · 调整/);
     expect(getMeasurementOptions).toHaveBeenCalledOnce();
   });
 
@@ -365,7 +411,7 @@ describe("standalone arbitrary-topic measurement", () => {
     const initialTime = Date.now();
     const now = vi.spyOn(Date, "now").mockReturnValue(initialTime);
     const panel = renderDiscoveryPanel(client);
-    await screen.findByText("模型：网页当前模型");
+    await screen.findByText(/测量账号 · 网页当前模型 · 调整/);
     panel.revisit(false);
     now.mockReturnValue(initialTime + 5 * 60_000 + 1);
     panel.revisit();
@@ -399,7 +445,9 @@ describe("standalone arbitrary-topic measurement", () => {
       models: [{ id: "completed-model", label: "已识别模型" }],
       selected_model: "completed-model",
     });
-    expect(await screen.findByText("模型：已识别模型")).toBeVisible();
+    expect(
+      await screen.findByText(/测量账号 · 已识别模型 · 调整/),
+    ).toBeVisible();
     expect(getMeasurementOptions).toHaveBeenCalledOnce();
   });
 
@@ -418,7 +466,7 @@ describe("standalone arbitrary-topic measurement", () => {
         defaultOptions: { queries: { retry: false } },
       });
       const panel = renderDiscoveryPanel(client);
-      await screen.findByText("模型：网页当前模型");
+      await screen.findByText(/测量账号 · 网页当前模型 · 调整/);
       let complete!: (
         value: Awaited<ReturnType<typeof getMeasurementOptions>>,
       ) => void;
@@ -430,7 +478,9 @@ describe("standalone arbitrary-topic measurement", () => {
       );
       state.accounts = [{ ...(state.accounts[0] as object), ...change }];
       panel.revisit();
-      expect(screen.queryByText("模型：网页当前模型")).not.toBeInTheDocument();
+      expect(
+        screen.queryByText(/测量账号 · 网页当前模型 · 调整/),
+      ).not.toBeInTheDocument();
       expect(screen.getByRole("button", { name: "开始测量" })).toBeDisabled();
       await waitFor(() =>
         expect(getMeasurementOptions).toHaveBeenCalledTimes(2),
@@ -439,7 +489,9 @@ describe("standalone arbitrary-topic measurement", () => {
         models: [{ id: "updated-model", label: "新可用模型" }],
         selected_model: "updated-model",
       });
-      expect(await screen.findByText("模型：新可用模型")).toBeVisible();
+      expect(
+        await screen.findByText(/测量账号 · 新可用模型 · 调整/),
+      ).toBeVisible();
     },
   );
 
@@ -448,10 +500,12 @@ describe("standalone arbitrary-topic measurement", () => {
       defaultOptions: { queries: { retry: false } },
     });
     const panel = renderDiscoveryPanel(client);
-    await screen.findByText("模型：网页当前模型");
+    await screen.findByText(/测量账号 · 网页当前模型 · 调整/);
     state.accounts = [{ ...(state.accounts[0] as object), status: "expired" }];
     panel.revisit();
-    expect(screen.queryByText("模型：网页当前模型")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/测量账号 · 网页当前模型 · 调整/),
+    ).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "开始测量" })).toBeDisabled();
     expect(getMeasurementOptions).toHaveBeenCalledOnce();
   });
@@ -914,7 +968,9 @@ describe("standalone arbitrary-topic measurement", () => {
         false,
         `/?tab=records&${parameter}=measurement-1`,
       );
-      expect(await screen.findByText("可在晴朗夜晚观测")).toBeVisible();
+      expect(await screen.findByText("可在晴朗夜晚观测")).not.toBeVisible();
+      await userEvent.click(screen.getByText("查看回答与原始证据"));
+      expect(screen.getByText("可在晴朗夜晚观测")).toBeVisible();
       expect(screen.getByRole("button", { name: "测量历史" })).toHaveAttribute(
         "aria-expanded",
         "false",
@@ -956,6 +1012,7 @@ describe("standalone arbitrary-topic measurement", () => {
         name: /自定义问题测量|如何观察流星雨/,
       }),
     );
+    await user.click(await screen.findByText("查看回答与原始证据"));
     expect(await screen.findByText(target.input.question)).toBeVisible();
     expect(history).toHaveAttribute("aria-expanded", "false");
     await user.click(history);
@@ -988,7 +1045,9 @@ describe("standalone arbitrary-topic measurement", () => {
     await user.click(history);
     expect(history).toHaveAttribute("aria-expanded", "true");
     await user.click(screen.getByRole("link", { name: "Open another record" }));
-    expect(await screen.findByText("另一条测量")).toBeVisible();
+    expect(
+      await screen.findByRole("region", { name: "本次测量摘要" }),
+    ).toHaveTextContent("measurement-2");
     expect(history).toHaveAttribute("aria-expanded", "false");
     expect(getMeasurementPlan).toHaveBeenCalledWith(
       "tenant-1",
@@ -1087,6 +1146,7 @@ describe("standalone arbitrary-topic measurement", () => {
           name: /自定义问题测量|如何观察流星雨/,
         }),
       );
+      await user.click(await screen.findByText("查看回答与原始证据"));
       expect(await screen.findByText(target.input.question)).toBeVisible();
       expect(
         screen.getByText(hasAccountLabel ? "kimi · 账号 测量账号" : "kimi"),
@@ -1147,9 +1207,10 @@ describe("standalone arbitrary-topic measurement", () => {
       screen.getByLabelText("要测量的问题"),
       target.input.question,
     );
-    await screen.findByText("模型：网页当前模型");
+    await screen.findByText(/测量账号 · 网页当前模型 · 调整/);
     await user.click(screen.getByRole("button", { name: "开始测量" }));
     expect(await screen.findByText("等待自动测量")).toBeInTheDocument();
+    await user.click(screen.getByText("查看回答与原始证据"));
     expect(screen.getByText("测量已排期。")).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "执行此目标" }),
@@ -1254,6 +1315,7 @@ describe("standalone arbitrary-topic measurement", () => {
       screen.queryByRole("button", { name: "执行此目标" }),
     ).not.toBeInTheDocument();
     expect(executeChannelTarget).not.toHaveBeenCalled();
+    await user.click(screen.getByText("查看回答与原始证据"));
     await user.click(screen.getByText("技术详情 / 原始证据"));
     expect(await screen.findByText(/响应采集超时/)).toBeVisible();
   });
@@ -1273,7 +1335,7 @@ describe("standalone arbitrary-topic measurement", () => {
     const user = userEvent.setup();
     renderPanel();
     await user.type(screen.getByLabelText("要测量的问题"), "如何观察流星雨？");
-    await screen.findByText("模型：网页当前模型");
+    await screen.findByText(/测量账号 · 网页当前模型 · 调整/);
     expect(screen.queryByLabelText("独立测量协议")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("测量模型标识")).not.toBeInTheDocument();
     expect(screen.getByText("高级选项").closest("details")).not.toHaveAttribute(
@@ -1296,9 +1358,14 @@ describe("standalone arbitrary-topic measurement", () => {
     );
     expect(input).not.toHaveProperty("cycle_id");
     expect(input).not.toHaveProperty("source_id");
-    expect(await screen.findByText(/测量计划已受理/)).toBeInTheDocument();
+    expect(
+      await screen.findByRole("region", { name: "本次测量摘要" }),
+    ).toHaveTextContent("measurement-1");
+    expect(
+      screen.getByText("测量另一个问题").closest("details"),
+    ).not.toHaveAttribute("open");
     expect(screen.getByTestId("measurement-url")).toHaveTextContent(
-      "tab=records&record=measurement-1",
+      "tab=measure&record=measurement-1",
     );
   });
   it("replays the exact timestamp and idempotency key after an uncertain submission", async () => {
@@ -1308,7 +1375,7 @@ describe("standalone arbitrary-topic measurement", () => {
     const user = userEvent.setup();
     renderPanel();
     await user.type(screen.getByLabelText("要测量的问题"), "任意问题");
-    await screen.findByText("模型：网页当前模型");
+    await screen.findByText(/测量账号 · 网页当前模型 · 调整/);
     await user.click(screen.getByRole("button", { name: "开始测量" }));
     await user.click(
       await screen.findByRole("button", { name: "重试提交测量" }),
@@ -1343,7 +1410,7 @@ describe("standalone arbitrary-topic measurement", () => {
   });
   it("places one accessible add-account link beside the selector without duplicate header controls", async () => {
     renderPanel();
-    await screen.findByText("模型：网页当前模型");
+    await screen.findByText(/测量账号 · 网页当前模型 · 调整/);
     const selector = screen.getByLabelText("独立测量账号");
     const add = screen.getByRole("link", { name: "添加测量账号" });
     expect(selector.parentElement?.parentElement).toContainElement(add);
