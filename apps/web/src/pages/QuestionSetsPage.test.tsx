@@ -15,6 +15,20 @@ import { setCsrfToken, setUnauthorizedHandler } from "../api/client";
 import i18n from "../i18n";
 import { QuestionSetsPage } from "./QuestionSetsPage";
 
+async function openSection(name: string, user = userEvent.setup()) {
+  if (["问题集", "信源洞察", "传统搜索"].includes(name)) {
+    await user.click(screen.getByText("更多", { selector: "summary" }));
+    await user.click(screen.getByRole("button", { name }));
+  } else {
+    await user.click(
+      within(screen.getByRole("navigation", { name: "测量页面" })).getByRole(
+        "button",
+        { name },
+      ),
+    );
+  }
+}
+
 const version = {
   id: "version-1",
   question_set_id: "set-1",
@@ -459,7 +473,7 @@ describe("P13 versioned question sets", () => {
       ),
     ).toEqual([]);
     expect(
-      document.querySelector('[aria-labelledby="measurement-tab-measure"]'),
+      document.querySelector('section[aria-label="开始测量"]'),
     ).toBeEmptyDOMElement();
   });
 
@@ -509,10 +523,10 @@ describe("P13 versioned question sets", () => {
         "/app/tenant-1/project-1/measurement?tab=records&record=measurement-1&planId=measurement-1&set=set-1&version=version-1&target=target-1&attempt=attempt-1&analysisRevision=analysis-1&rankReport=report-1",
       );
       expect(await screen.findByText("原问题集的测量")).toBeVisible();
-      await user.click(screen.getByRole("tab", { name: "问题集" }));
+      await openSection("问题集", user);
       await user.selectOptions(
         await within(
-          screen.getByRole("tabpanel", { name: "问题集" }),
+          screen.getByRole("region", { name: "问题集" }),
         ).findByLabelText(
           selection === "set" ? "选择问题集" : "选择不可变版本",
         ),
@@ -534,7 +548,7 @@ describe("P13 versioned question sets", () => {
           parameter,
         );
       }
-      await user.click(screen.getByRole("tab", { name: "测量记录" }));
+      await openSection("测量记录", user);
       expect(screen.queryByText("原问题集的测量")).not.toBeInTheDocument();
       expect(screen.getByRole("button", { name: "测量历史" })).toHaveAttribute(
         "aria-expanded",
@@ -564,11 +578,8 @@ describe("P13 versioned question sets", () => {
       await i18n.changeLanguage(language);
       const calls = mockApi();
       renderPage("/app/tenant-1/project-1/measurement?tab=search");
-      expect(await screen.findByRole("tab", { name: label })).toHaveAttribute(
-        "aria-selected",
-        "true",
-      );
-      const panel = screen.getByRole("tabpanel", { name: label });
+      expect(await screen.findByRole("region", { name: label })).toBeVisible();
+      const panel = screen.getByRole("region", { name: label });
       expect(
         within(panel).getByRole("heading", {
           name: i18n.t("title", { ns: "serp" }),
@@ -589,23 +600,20 @@ describe("P13 versioned question sets", () => {
     mockApi();
     renderPage();
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("tab", { name: "传统搜索" }));
+    await openSection("传统搜索", user);
     expect(screen.getByTestId("measurement-url")).toHaveTextContent(
       "tab=search",
     );
-    const panel = screen.getByRole("tabpanel", { name: "传统搜索" });
+    const panel = screen.getByRole("region", { name: "传统搜索" });
     await user.type(
       within(panel).getByRole("textbox", { name: /关键词/ }),
       "generic topic",
     );
-    await user.click(screen.getByRole("tab", { name: "问题集" }));
+    await openSection("问题集", user);
     await user.click(screen.getByRole("button", { name: "浏览器返回" }));
-    expect(screen.getByRole("tab", { name: "传统搜索" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    expect(screen.getByRole("region", { name: "传统搜索" })).toBeVisible();
     expect(
-      within(screen.getByRole("tabpanel", { name: "传统搜索" })).getByRole(
+      within(screen.getByRole("region", { name: "传统搜索" })).getByRole(
         "textbox",
         { name: /关键词/ },
       ),
@@ -615,8 +623,7 @@ describe("P13 versioned question sets", () => {
   it("creates a named immutable version from pasted lines and edits into a second version", async () => {
     const calls = mockApi();
     const user = userEvent.setup();
-    renderPage();
-    await user.click(screen.getByRole("tab", { name: "问题集" }));
+    renderPage("/app/tenant-1/project-1/measurement?tab=sets");
     expect(await screen.findByText("尚无问题集")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "新建问题集" }));
     await user.type(screen.getByLabelText("问题集名称"), "基础问题");
@@ -679,7 +686,7 @@ describe("P13 versioned question sets", () => {
     const calls = mockApi({ existing: true, conflict: true });
     const user = userEvent.setup();
     renderPage();
-    await user.click(screen.getByRole("tab", { name: "问题集" }));
+    await openSection("问题集", user);
     await user.selectOptions(
       await screen.findByLabelText("选择问题集"),
       "set-1",
@@ -752,7 +759,7 @@ describe("P13 versioned question sets", () => {
   it("supports a read-only project and recoverable list failure", async () => {
     mockApi({ existing: true, role: "viewer" });
     renderPage();
-    await userEvent.setup().click(screen.getByRole("tab", { name: "问题集" }));
+    await openSection("问题集");
     expect(await screen.findByText(/当前角色为只读/)).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "创建并保存问题集" }),
@@ -771,7 +778,7 @@ describe("P13 versioned question sets", () => {
   it("shows a retriable error when list access fails", async () => {
     const calls = mockApi({ listError: true });
     renderPage();
-    await userEvent.setup().click(screen.getByRole("tab", { name: "问题集" }));
+    await openSection("问题集");
     expect(await screen.findByText("问题集无法读取")).toBeInTheDocument();
     expect(
       within(
@@ -797,14 +804,14 @@ describe("P13 versioned question sets", () => {
     );
     await user.clear(screen.getByLabelText("问题 1"));
     await user.type(screen.getByLabelText("问题 1"), "未保存的修订");
-    await user.click(screen.getByRole("tab", { name: "信源洞察" }));
+    await openSection("信源洞察", user);
     expect(screen.getByTestId("measurement-url")).toHaveTextContent(
       "tab=insights",
     );
     await user.click(screen.getByRole("button", { name: "浏览器返回" }));
     expect(screen.getByLabelText("问题 1")).toHaveValue("未保存的修订");
-    await user.click(screen.getByRole("tab", { name: "开始测量" }));
-    await user.click(screen.getByRole("tab", { name: "问题集" }));
+    await openSection("开始测量", user);
+    await openSection("问题集", user);
     expect(screen.getByLabelText("问题 1")).toHaveValue("未保存的修订");
     expect(screen.getByTestId("measurement-url")).toHaveTextContent(
       "set=set-1",
@@ -843,7 +850,7 @@ describe("P13 versioned question sets", () => {
     expect(screen.getByLabelText("问题 1")).toHaveValue("怎样选型？");
     await user.clear(screen.getByLabelText("问题 1"));
     await user.type(screen.getByLabelText("问题 1"), "延迟加载后保留的修订");
-    await user.click(screen.getByRole("tab", { name: "信源洞察" }));
+    await openSection("信源洞察", user);
     await user.click(screen.getByRole("button", { name: "浏览器返回" }));
     expect(screen.getByLabelText("问题 1")).toHaveValue("延迟加载后保留的修订");
     expect(screen.getByTestId("measurement-url")).toHaveTextContent(
@@ -869,39 +876,39 @@ describe("P13 versioned question sets", () => {
     const user = userEvent.setup();
     renderPage();
     expect(screen.queryByLabelText("问题集名称")).not.toBeInTheDocument();
-    await user.click(screen.getByRole("tab", { name: "问题集" }));
+    await openSection("问题集", user);
     await user.click(screen.getByRole("button", { name: "新建问题集" }));
     await user.type(screen.getByLabelText("问题集名称"), "未保存的问题集");
     await user.click(screen.getByRole("button", { name: "收起新建" }));
     await user.click(screen.getByRole("button", { name: "新建问题集" }));
     expect(screen.getByLabelText("问题集名称")).toHaveValue("未保存的问题集");
-    await user.click(screen.getByRole("tab", { name: "测量记录" }));
-    await user.click(screen.getByRole("tab", { name: "问题集" }));
+    await openSection("测量记录", user);
+    await openSection("问题集", user);
     expect(screen.getByLabelText("问题集名称")).toHaveValue("未保存的问题集");
   });
 
-  it("starts with question sets and keeps temporary measurement and records keyboard-accessible", async () => {
+  it("starts with a question input and keeps measurement records and more actions keyboard-accessible", async () => {
     mockApi();
     const user = userEvent.setup();
     renderPage();
-    expect(screen.getByRole("tab", { name: "问题集" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
-    screen.getByRole("tab", { name: "开始测量" }).focus();
-    await user.keyboard("{Enter}");
+    expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
     expect(
       await screen.findByRole("textbox", { name: "要测量的问题" }),
     ).toBeInTheDocument();
-    screen.getByRole("tab", { name: "测量记录" }).focus();
+    screen.getByRole("button", { name: "测量记录" }).focus();
     await user.keyboard("{Enter}");
-    expect(screen.getByRole("tab", { name: "测量记录" })).toHaveAttribute(
-      "aria-selected",
-      "true",
+    expect(screen.getByRole("button", { name: "测量记录" })).toHaveAttribute(
+      "aria-current",
+      "page",
     );
     expect(screen.getByTestId("measurement-url")).toHaveTextContent(
       "tab=records",
     );
+    await user.click(screen.getByText("更多", { selector: "summary" }));
+    expect(await screen.findByRole("button", { name: "问题集" })).toBeVisible();
+    screen.getByRole("button", { name: "问题集" }).focus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByTestId("measurement-url")).toHaveTextContent("tab=sets");
   });
 
   it("restores unsaved edits after leaving and returning to the same project page", async () => {
@@ -938,7 +945,7 @@ describe("P13 versioned question sets", () => {
     const calls = mockApi({ createErrorOnce: true });
     const user = userEvent.setup();
     const page = renderPage();
-    await user.click(screen.getByRole("tab", { name: "问题集" }));
+    await openSection("问题集", user);
     await user.click(await screen.findByRole("button", { name: "新建问题集" }));
     await user.type(screen.getByLabelText("问题集名称"), "待确认问题");
     await user.type(screen.getByLabelText("每行一个问题"), "如何选择？");

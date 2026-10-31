@@ -1192,7 +1192,7 @@ test("chat onboarding calls scoped project tools and preserves acceptance semant
     );
     assert.match(
       canonicalSystemContent(requests[0]),
-      /Never inject target names or aliases/u,
+      /Keep target names and aliases separate from natural-discovery questions/u,
     );
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
@@ -3060,7 +3060,19 @@ test("topic prediction offers real model tools and only a saved question-set rec
     assert.match(canonicalSystemContent(requests[0]), /question_create/u);
     assert.match(
       canonicalSystemContent(requests[0]),
-      /not as real user queries/u,
+      /Describe these as suggested questions/u,
+    );
+    assert.match(
+      canonicalSystemContent(requests[0]),
+      /an explicit request to measure continues through the measurement tools/u,
+    );
+    assert.match(
+      canonicalSystemContent(requests[0]),
+      /Start with one relevant question on one available account/u,
+    );
+    assert.match(
+      canonicalSystemContent(requests[0]),
+      /When the user supplies a measurement plan reference, read that exact plan/u,
     );
     assert.deepEqual(calls, [generated]);
     assert.match(requests[1].messages.at(-1).content, /question_set_id/u);

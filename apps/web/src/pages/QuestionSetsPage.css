@@ -16,18 +16,26 @@
   display: none !important;
 }
 
-.measurement-tabs {
+.measurement-actions {
   display: flex;
   gap: 6px;
   min-width: 0;
-  overflow-x: auto;
-  white-space: nowrap;
-  scrollbar-width: thin;
+  flex-wrap: wrap;
   padding-bottom: 4px;
 }
 
-.measurement-tabs .fui-Tab {
+.measurement-actions .fui-Button {
   flex: 0 0 auto;
+}
+
+.measurement-more-actions > summary {
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.measurement-more-actions > div {
+  display: flex;
+  flex-wrap: wrap;
 }
 
 .question-sets-page > section:not(.page-hero) {
@@ -35,7 +43,7 @@
 }
 
 .measurement-prediction {
-  margin-top: 16px;
+  margin-bottom: 16px;
 }
 
 .measurement-focus-settings > summary {

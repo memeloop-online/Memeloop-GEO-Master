@@ -7,7 +7,6 @@ import {
   type ChangeEvent,
   type ClipboardEvent,
   type DragEvent,
-  type ReactNode,
 } from "react";
 import {
   Button,
@@ -19,9 +18,9 @@ import {
   AddRegular,
   ArrowSyncRegular,
   DismissRegular,
-  FolderOpenRegular,
 } from "@fluentui/react-icons";
 import { AgentChatView } from "@memeloop/react-ui/agent";
+import { useAui } from "@memeloop/react-ui/chat";
 import type { WebMemeLoopChatAdapter } from "@memeloop/react-ui/chat";
 import { createTheme, ThemeProvider } from "@mui/material/styles";
 import type { ConversationMessageListProjection } from "memeloop";
@@ -52,8 +51,46 @@ import {
   measurementRecommendationReference,
   type MeasurementRecommendationReference,
 } from "../components/MeasurementReportDraftBridge";
+import {
+  MeasurementPlanDraftBridge,
+  measurementPlanReference,
+} from "../components/MeasurementPlanDraftBridge";
 import { useAppearance } from "../appearance/AppearanceProvider";
 import { formatUiDate } from "../i18n";
+import "../i18n/chatMeasurementGuidance";
+import "./chatMeasurementGuidance.css";
+
+function MeasurementWelcome({ onFocus }: { onFocus: () => void }) {
+  const aui = useAui();
+  const { t } = useTranslation("chatMeasurementGuidance");
+  const [preserved, setPreserved] = useState(false);
+
+  return (
+    <div className="agent-measurement-welcome">
+      <h2>{t("title")}</h2>
+      <p>{t("description")}</p>
+      <p>{t("hint")}</p>
+      <div className="agent-measurement-examples">
+        {(["product", "shop", "perception", "sources"] as const).map((kind) => (
+          <Button
+            key={kind}
+            appearance="outline"
+            onClick={() => {
+              const hasDraft = aui.composer.getState().text !== "";
+              if (!hasDraft) aui.composer.setText(t(`examples.${kind}.draft`));
+              setPreserved(hasDraft);
+              onFocus();
+            }}
+          >
+            <strong>{t(`examples.${kind}.title`)}</strong>
+            <span>{t(`examples.${kind}.detail`)}</span>
+          </Button>
+        ))}
+      </div>
+      {preserved && <p role="status">{t("preserved")}</p>}
+    </div>
+  );
+}
 
 // A composer projection only, never saved or presented as a server conversation.
 const emptyConversation: AgentConversationDetail = {
@@ -229,6 +266,7 @@ function AgentChat({
   measurementReportId,
   measurementQuestionTargetId,
   measurementRecommendation,
+  measurementPlanId,
 }: {
   conversation: AgentConversationDetail;
   tenantId: string;
@@ -238,6 +276,7 @@ function AgentChat({
   measurementReportId?: string;
   measurementQuestionTargetId?: string;
   measurementRecommendation?: MeasurementRecommendationReference;
+  measurementPlanId?: string;
 }) {
   const { t } = useTranslation();
   const { appearance } = useAppearance();
@@ -259,6 +298,7 @@ function AgentChat({
   const [localTurnId, setLocalTurnId] = useState<string>();
   const [runtimeNotice, setRuntimeNotice] = useState<string>();
   const picker = useRef<HTMLInputElement>(null);
+  const chatColumn = useRef<HTMLElement>(null);
   const submissionInFlight = useRef(false);
   const pendingConversation = useRef<{ key: string; id?: string } | undefined>(
     undefined,
@@ -389,6 +429,8 @@ function AgentChat({
     () => ({
       conversationId: conversation.conversation.id,
       messages: conversation.messages.map(projectMessage),
+      // Welcome content starts at the top; only a transcript follows its live tail.
+      isAtLiveTail: conversation.messages.length > 0,
       isRunning: Boolean(activeTurnId),
       isLoading: false,
       error:
@@ -515,17 +557,9 @@ function AgentChat({
     ],
   );
 
-  const empty: ReactNode = (
-    <div className="agent-chat-empty">
-      <FolderOpenRegular fontSize={28} aria-hidden="true" />
-      <h2>{t("chatWorkbench.emptyTitle")}</h2>
-      <p>{t("chatWorkbench.emptyHint")}</p>
-      <p>{t("chatWorkbench.emptyDetail")}</p>
-    </div>
-  );
-
   return (
     <section
+      ref={chatColumn}
       className="agent-chat-column"
       aria-label={t("chatWorkbench.conversation")}
       onDragOverCapture={(event) => {
@@ -648,7 +682,12 @@ function AgentChat({
           <AgentChatView
             adapter={adapter}
             composerToolbar={
-              measurementReportId ? (
+              measurementPlanId ? (
+                <MeasurementPlanDraftBridge
+                  key={measurementPlanId}
+                  planId={measurementPlanId}
+                />
+              ) : measurementReportId ? (
                 <MeasurementReportDraftBridge
                   key={`${measurementReportId}:${measurementQuestionTargetId ?? ""}:${measurementRecommendation?.attemptId ?? ""}:${measurementRecommendation?.kind ?? ""}:${measurementRecommendation?.mentionOrder ?? ""}`}
                   reportId={measurementReportId}
@@ -657,7 +696,15 @@ function AgentChat({
                 />
               ) : undefined
             }
-            empty={empty}
+            empty={
+              <MeasurementWelcome
+                onFocus={() =>
+                  chatColumn.current
+                    ?.querySelector<HTMLTextAreaElement>("textarea")
+                    ?.focus()
+                }
+              />
+            }
             selectedFile={selectedFile}
             onFileSelect={(file) => addFiles([file])}
             onClearFile={() => setAttachments((current) => current.slice(1))}
@@ -684,7 +731,7 @@ function AgentChat({
                 </Button>
               </>
             )}
-            placeholder={t("chatWorkbench.placeholder")}
+            placeholder={t("chatMeasurementGuidance:placeholder")}
             composerLabels={{
               input: t("chatWorkbench.input"),
               send: t("chatWorkbench.send"),
@@ -714,7 +761,10 @@ export function AgentWorkbenchPage() {
   const { t } = useTranslation();
   const { tenantId, projectId, conversationId } = useParams();
   const { search } = useLocation();
-  const measurementReportId = measurementReportReference(search);
+  const measurementPlanId = measurementPlanReference(search);
+  const measurementReportId = new URLSearchParams(search).has("measurementPlan")
+    ? undefined
+    : measurementReportReference(search);
   const measurementQuestionTargetId =
     measurementQuestionTargetReference(search);
   const measurementRecommendation = measurementRecommendationReference(search);
@@ -798,6 +848,7 @@ export function AgentWorkbenchPage() {
               projectId={projectId}
               onRefresh={refresh}
               measurementReportId={measurementReportId}
+              measurementPlanId={measurementPlanId}
               measurementQuestionTargetId={measurementQuestionTargetId}
               measurementRecommendation={measurementRecommendation}
               onFirstMessage={(id) => {

@@ -5,8 +5,9 @@ use axum::{
 };
 use chrono::Utc;
 use geo_domain::{
-    AppError, ChannelTarget, ChannelTargetInput, ProjectId, ProjectStatus,
-    StandaloneMeasurementPlan, TenantScope, sha256_hex,
+    AppError, ChannelTarget, ChannelTargetInput, MeasurementReportConditions,
+    ObservationAnalysisOutcome, ProjectId, ProjectStatus, QuestionPurpose,
+    StandaloneMeasurementPlan, TenantScope, effective_observation, sha256_hex,
 };
 use geo_worker::{
     MeasurementModelOption, MeasurementOptionsRequest, MeasurementOptionsResult,
@@ -286,8 +287,8 @@ pub async fn agent_options(
     })
 }
 
-/// This projection has no question text, frozen-evaluation answers or raw
-/// evidence. The scoped persisted target view is the only status authority.
+/// Read the exact scoped plan's current saved evidence. Frozen evaluation and
+/// unclassified historical questions remain metadata-only.
 pub async fn read_agent_plan(
     state: &AppState,
     scope: &TenantScope,
@@ -301,37 +302,107 @@ pub async fn read_agent_plan(
         .get_measurement_plan(scope, request.plan_id)
         .await?
         .ok_or_else(|| AppError::not_found("measurement plan not found"))?;
-    let agent_ad_hoc = is_agent_ad_hoc_plan(&plan);
-    let mut targets = Vec::with_capacity(plan.targets.len());
+    let as_of = Utc::now();
+    let repository = state.channel_job_repository();
+    let mut views = Vec::with_capacity(plan.targets.len());
     for target in &plan.targets {
-        let view = state
-            .channel_job_repository()
-            .get_target(scope, target.target_id)
-            .await?;
+        views.push(repository.get_target(scope, target.target_id).await?);
+    }
+    let readable = |input: &ChannelTargetInput| {
+        matches!(
+            input,
+            ChannelTargetInput::Measure { question_binding, question_set_version, .. }
+                if question_binding.as_ref().map_or(
+                    question_set_version == "ad_hoc.v1",
+                    |binding| binding.purpose == QuestionPurpose::Optimization,
+                )
+        )
+    };
+    let eligible_views = views
+        .iter()
+        .filter(|view| readable(&view.target.input))
+        .cloned()
+        .collect::<Vec<_>>();
+    let analyses = if let Some(resolver) = state.observation_evidence_resolver() {
+        resolver.resolve(scope, &eligible_views, as_of).await?
+    } else {
+        vec![]
+    };
+    let mut targets = Vec::with_capacity(plan.targets.len());
+    for view in &views {
+        let target = &view.target;
         let attempt = view.attempts.last();
         let outcome = attempt.and_then(|item| item.outcome.as_ref());
-        let show_live_answer = agent_ad_hoc
-            && outcome.is_some_and(|item| {
-                !item.fixture
-                    && matches!(
-                        item.status,
-                        geo_domain::ChannelOutcomeStatus::Observed
-                            | geo_domain::ChannelOutcomeStatus::Refused
-                    )
-            });
-        let answer = outcome
-            .filter(|_| show_live_answer)
-            .and_then(|item| item.raw_answer.as_ref());
-        let citations = outcome
-            .filter(|_| show_live_answer)
+        let eligible = readable(&target.input);
+        let observation = (eligible && outcome.is_some_and(|item| !item.fixture))
+            .then(|| {
+                effective_observation(
+                    view,
+                    &analyses,
+                    as_of,
+                    crate::citation_insights::accepted_live_search,
+                )
+            })
+            .flatten();
+        // A refusal is also useful to explain, but is not a successful observation.
+        let refusal = outcome.filter(|item| {
+            eligible && !item.fixture && item.status == geo_domain::ChannelOutcomeStatus::Refused
+        });
+        let answer = observation
+            .as_ref()
+            .map(|item| &item.raw_answer)
+            .or_else(|| refusal.and_then(|item| item.raw_answer.as_ref()));
+        let citations = observation
+            .as_ref()
             .map(|item| item.citations.as_slice())
+            .or_else(|| refusal.map(|item| item.citations.as_slice()))
             .unwrap_or_default();
-        let (surface, _) = match &target.input {
+        let analysis_provenance = observation
+            .as_ref()
+            .and_then(|item| item.provenance.clone());
+        let recommendations = analysis_provenance
+            .as_ref()
+            .and_then(|source| {
+                analyses
+                    .iter()
+                    .find(|revision| revision.request.revision_id == source.revision_id)
+            })
+            .and_then(|revision| revision.result.as_ref())
+            .and_then(|result| match &result.outcome {
+                ObservationAnalysisOutcome::Grounded { audit, .. } => audit
+                    .get("recommendations")
+                    .filter(|value| !value.is_null())
+                    .cloned(),
+                _ => None,
+            });
+        let (surface, conditions) = match &target.input {
             ChannelTargetInput::Measure {
+                question,
+                provider,
+                model,
                 surface,
-                question_binding,
+                search_mode,
+                protocol_version,
+                question_set_version,
+                market,
+                language,
+                sample_ordinal,
                 ..
-            } => (surface.clone(), question_binding),
+            } => (
+                surface.clone(),
+                eligible.then(|| MeasurementReportConditions {
+                    question: question.clone(),
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    surface: surface.clone(),
+                    search_mode: search_mode.clone(),
+                    protocol_version: protocol_version.clone(),
+                    question_set_version: question_set_version.clone(),
+                    market: market.clone(),
+                    language: language.clone(),
+                    sample_ordinal: *sample_ordinal,
+                }),
+            ),
             _ => {
                 return Err(AppError::invalid_request(
                     "standalone plan contains a non-measurement target",
@@ -352,6 +423,9 @@ pub async fn read_agent_plan(
             fixture: outcome.map(|item| item.fixture),
             received_at: outcome.and_then(|_| attempt.and_then(|item| item.received_at)),
             surface,
+            conditions,
+            analysis_provenance,
+            recommendations,
             answer: answer.filter(|text| text.len() <= 16 * 1024).cloned(),
             answer_available: answer.is_some(),
             citations: if citations.len() <= 50 && citations.iter().all(|url| url.len() <= 2048) {
@@ -365,33 +439,6 @@ pub async fn read_agent_plan(
     Ok(MeasurementPlanStatus {
         plan_id: plan.plan_id,
         targets,
-    })
-}
-
-// Only a plan whose persisted input hash matches the narrow Agent command
-// earns answer projection. Legacy ad-hoc and bound frozen-evaluation plans
-// stay metadata-only, even when called through this otherwise readable op.
-fn is_agent_ad_hoc_plan(plan: &StandaloneMeasurementPlan) -> bool {
-    if plan.title != "Ad-hoc question measurement" || plan.targets.len() != 1 {
-        return false;
-    }
-    let ChannelTargetInput::Measure {
-        account_id,
-        question,
-        model,
-        question_binding,
-        question_set_version,
-        ..
-    } = &plan.targets[0].input
-    else {
-        return false;
-    };
-    if question_binding.is_some() || question_set_version != "ad_hoc.v1" {
-        return false;
-    }
-    [None, Some(model.as_str())].into_iter().any(|selected| {
-        serde_json::to_vec(&(account_id, question, selected))
-            .is_ok_and(|bytes| sha256_hex(&bytes) == plan.input_hash)
     })
 }
 
