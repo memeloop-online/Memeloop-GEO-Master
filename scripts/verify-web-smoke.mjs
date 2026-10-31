@@ -1854,6 +1854,10 @@ async function main() {
   );
   await page.keyboard.press("Enter");
   await page.waitForURL((url) => url.searchParams.get("tab") === "records");
+  await measurementNavigation
+    .locator('button[aria-current="page"]')
+    .filter({ hasText: /^测量记录$/ })
+    .waitFor();
   assert(
     (await recordsAction.getAttribute("aria-current")) === "page",
     "Measurement records keyboard navigation did not select its section",
