@@ -1,0 +1,67 @@
+.agent-message-markdown {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+}
+
+.agent-message-markdown p {
+  white-space: pre-wrap;
+  margin-block: 0.65rem;
+}
+
+.agent-message-markdown :is(h1, h2, h3, h4, h5, h6) {
+  margin-block: 1rem 0.5rem;
+  font-size: 1.1em;
+}
+
+.agent-message-markdown :is(ul, ol) {
+  padding-inline-start: 1.5rem;
+}
+
+.agent-message-markdown li > p {
+  margin-block: 0.25rem;
+}
+
+.agent-message-markdown pre,
+.agent-message-table {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.agent-message-markdown pre {
+  padding: 0.65rem;
+  background: var(--colorNeutralBackground3);
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.agent-message-table table {
+  border-collapse: collapse;
+  font-size: 0.95em;
+  overflow-wrap: normal;
+}
+
+.agent-message-table :is(th, td) {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--colorNeutralStroke2);
+  text-align: start;
+}
+
+.agent-message-table th {
+  background: var(--colorNeutralBackground3);
+}
+
+.agent-message-markdown a {
+  color: var(--colorBrandForegroundLink);
+}
+
+.agent-message-markdown > :first-child {
+  margin-block-start: 0;
+}
+
+.agent-message-markdown > :last-child {
+  margin-block-end: 0;
+}
+.agent-chat-surface [data-testid="assistant-message"] {
+  min-width: 0;
+}

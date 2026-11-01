@@ -44,6 +44,7 @@ import {
 } from "../api/agent";
 import { createIdempotencyKey } from "../api/client";
 import { ErrorState, LoadingState } from "../components/AsyncState";
+import { AgentMessageContent } from "../components/AgentMessageContent";
 import {
   MeasurementReportDraftBridge,
   measurementReportReference,
@@ -681,6 +682,9 @@ function AgentChat({
         <ThemeProvider theme={agentTheme}>
           <AgentChatView
             adapter={adapter}
+            renderMessageContent={(message) => (
+              <AgentMessageContent message={message} />
+            )}
             composerToolbar={
               measurementPlanId ? (
                 <MeasurementPlanDraftBridge

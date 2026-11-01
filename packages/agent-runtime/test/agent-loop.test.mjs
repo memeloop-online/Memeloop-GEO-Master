@@ -2988,6 +2988,136 @@ test("standalone measurement discovers live models, accepts one ad-hoc question 
   }
 });
 
+test("saved measurement findings preserve the unknown original receipt and grounded provenance", async () => {
+  const plan = "00000000-0000-4000-8000-000000000224";
+  const calls = [];
+  const requests = [];
+  const receipt = {
+    plan_id: plan,
+    targets: [
+      {
+        target_id: "00000000-0000-4000-8000-000000000225",
+        state: "completed",
+        surface: "consumer_web",
+        outcome_status: "unknown",
+        fixture: false,
+        received_at: "2026-01-02T12:00:00Z",
+        conditions: {
+          question: "Which rain gauge is easy to read?",
+          provider: "synthetic-provider",
+          model: "synthetic-measured-model",
+          surface: "consumer_web",
+          search_mode: "web_search",
+          protocol_version: "synthetic-protocol",
+          question_set_version: "synthetic-question-set",
+          market: "CN",
+          language: "en",
+          sample_ordinal: 1,
+        },
+        analysis_provenance: {
+          revision_id: "00000000-0000-4000-8000-000000000226",
+          source: { kind: "attempt_evidence", evidence_index: 0 },
+          source_sha256: "a".repeat(64),
+          observed_at: "2026-01-02T12:00:00Z",
+          analyzed_at: "2026-01-02T12:01:00Z",
+          actual_model: "synthetic-analysis-model",
+          config_revision: null,
+          prompt_version: "geo.observation.extract.v5",
+          parser_version: "geo.observation.extract.v7",
+        },
+        answer: "1. Example rain gauge: easy to read.",
+        answer_available: true,
+        citations: ["https://example.org/rain-gauges"],
+        citations_available: true,
+        recommendations: {
+          version: "geo.recommendations.v2",
+          status: "verified",
+          items: [
+            {
+              name: "Example rain gauge",
+              kind: "product",
+              rank: 1,
+              mention_order: 1,
+              reason: "easy to read",
+              evidence_quote: "1. Example rain gauge: easy to read.",
+              citation_urls: ["https://example.org/rain-gauges"],
+              brand_attribution: null,
+            },
+          ],
+        },
+      },
+    ],
+  };
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit() {},
+    async measurementPlanRead(input) {
+      calls.push(input);
+      return receipt;
+    },
+    async modelComplete(request) {
+      requests.push(request);
+      return requests.length === 1
+        ? {
+            ...finalModelAnswer(""),
+            finish_reason: "tool_calls",
+            tool_calls: [
+              {
+                id: "saved-measurement-read",
+                type: "function",
+                function: {
+                  name: "measurement_plan_read",
+                  arguments: JSON.stringify({ plan_id: plan }),
+                },
+              },
+            ],
+          }
+        : finalModelAnswer(
+            "The recorded answer recommends Example rain gauge.",
+          );
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?saved-plan=${Date.now()}`
+    );
+    await main({
+      conversation_id: "saved-plan-conversation",
+      prompt: `Explain saved measurement ${plan}.`,
+      run_id: "saved-plan-run",
+      turn_id: "saved-plan-turn",
+    });
+    assert.deepEqual(calls, [{ plan_id: plan }]);
+    assert.deepEqual(JSON.parse(requests[1].messages.at(-1).content), receipt);
+    const description = requests[0].tools.find(
+      ({ function: tool }) => tool.name === "measurement_plan_read",
+    ).function.description;
+    assert.match(description, /grounded saved sample usable for findings/u);
+    assert.match(description, /original outcome_status is unknown/u);
+    assert.match(
+      description,
+      /initial execution receipt rather than the saved answer/u,
+    );
+    const prompt = canonicalSystemContent(requests[0]);
+    assert.match(
+      prompt,
+      /lead with whether the focus was recommended and any explicit rank/u,
+    );
+    assert.match(prompt, /one or two specific content or channel suggestions/u);
+    assert.match(prompt, /Separate recorded findings from suggestions/u);
+    assert.match(
+      prompt,
+      /question, platform and date in one compact context line/u,
+    );
+    assert.match(
+      prompt,
+      /Explain original execution fields when the user asks/u,
+    );
+    assert.match(prompt, /keep conclusions scoped to the recorded sample/u);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
 test("topic prediction offers real model tools and only a saved question-set receipt supports a link", async () => {
   const requests = [];
   const calls = [];

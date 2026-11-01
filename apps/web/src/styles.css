@@ -1896,7 +1896,7 @@ input {
     min-height: 480px;
   }
   .agent-workbench-layout {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .agent-conversation-list {
     max-height: 155px;
