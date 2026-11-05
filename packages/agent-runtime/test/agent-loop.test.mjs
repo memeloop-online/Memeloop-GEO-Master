@@ -349,14 +349,12 @@ for (const conflict of [false, true]) {
         prompt:
           "Convert the comparison into a typed table and preserve the rest.",
       });
-      if (conflict) {
-        await assert.rejects(run, /conflict/u);
-        assert.equal(requests.length, 2);
-      } else {
-        const result = await run;
-        assert.equal(requests.length, 3);
-        assert.match(result.answer, /draft revision/u);
-      }
+      const result = await run;
+      assert.equal(requests.length, 3);
+      assert.match(
+        result.answer,
+        conflict ? /document changed; reread/u : /draft revision/u,
+      );
       assert.deepEqual(calls, [
         ["read", reference],
         ["revise", revision],
@@ -1725,7 +1723,7 @@ test("saved report reads require an explicit kind and preserve the exact report 
   }
 });
 
-test("a required report-kind boundary failure aborts the native loop without a success completion", async () => {
+test("a required report-kind boundary failure reaches the model without inventing a report", async () => {
   const reads = [];
   const events = [];
   let modelCalls = 0;
@@ -1739,7 +1737,13 @@ test("a required report-kind boundary failure aborts the native loop without a s
       // enforces it. Model its strict deserialization failure here.
       throw new Error("invalid_request: missing field kind");
     },
-    async modelComplete() {
+    async modelComplete(request) {
+      if (modelCalls > 0) {
+        assert.match(
+          request.messages.at(-1).content,
+          /invalid_request: missing field kind/u,
+        );
+      }
       return modelCalls++ === 0
         ? {
             ...finalModelAnswer(""),
@@ -1764,15 +1768,16 @@ test("a required report-kind boundary failure aborts the native loop without a s
     const { main } = await import(
       `${bundlePath.href}?missing-report-kind=${Date.now()}`
     );
-    await assert.rejects(
-      main({ ...historyTurn, prompt: "Analyze the saved report." }),
-      /invalid_request: missing field kind/u,
-    );
+    const result = await main({
+      ...historyTurn,
+      prompt: "Analyze the saved report.",
+    });
+    assert.equal(result.answer, "The report type is required.");
     assert.deepEqual(reads, [
       { report_id: "00000000-0000-4000-8000-000000000044" },
     ]);
-    assert.equal(modelCalls, 1);
-    assert.deepEqual(events, []);
+    assert.equal(modelCalls, 2);
+    assert.deepEqual(events, [["loop.completed", JSON.stringify(result)]]);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }
@@ -3102,7 +3107,7 @@ test("accepted measurement references deduplicate replay while the model finishe
   }
 });
 
-test("failed measurement creation emits no successful completion even after an earlier acceptance", async () => {
+test("a failed second measurement is explained without losing or recreating the accepted plan", async () => {
   const events = [];
   let created = 0;
   let modelCalls = 0;
@@ -3119,8 +3124,17 @@ test("failed measurement creation emits no successful completion even after an e
         state: "accepted",
       };
     },
-    async modelComplete() {
+    async modelComplete(request) {
       modelCalls++;
+      if (modelCalls === 3) {
+        assert.match(
+          request.messages.at(-1).content,
+          /capability_missing: measurement unavailable/u,
+        );
+        return finalModelAnswer(
+          "The first measurement was accepted; the second is unavailable.",
+        );
+      }
       return {
         ...finalModelAnswer(""),
         finish_reason: "tool_calls",
@@ -3145,10 +3159,20 @@ test("failed measurement creation emits no successful completion even after an e
     const { main } = await import(
       `${bundlePath.href}?measurementFailure=${Date.now()}`
     );
-    await assert.rejects(main(historyTurn), /measurement unavailable/u);
+    const result = await main(historyTurn);
     assert.equal(created, 2);
-    assert.equal(modelCalls, 2);
-    assert.deepEqual(events, []);
+    assert.equal(modelCalls, 3);
+    assert.equal(
+      result.answer,
+      "The first measurement was accepted; the second is unavailable.",
+    );
+    assert.deepEqual(result.measurement_plans, [
+      {
+        plan_id: "00000000-0000-4000-8000-000000000222",
+        target_id: "00000000-0000-4000-8000-000000000223",
+      },
+    ]);
+    assert.deepEqual(events, [["loop.completed", JSON.stringify(result)]]);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }
@@ -3157,6 +3181,7 @@ test("failed measurement creation emits no successful completion even after an e
 test("a failed focus save does not cancel sibling tool calls in an upstream parallel batch", async () => {
   const events = [];
   const calls = [];
+  let modelCalls = 0;
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit(topic, payload) {
       events.push([topic, payload]);
@@ -3173,7 +3198,26 @@ test("a failed focus save does not cancel sibling tool calls in an upstream para
         state: "accepted",
       };
     },
-    async modelComplete() {
+    async modelComplete(request) {
+      if (++modelCalls === 2) {
+        const results = request.messages.filter(
+          (message) => message.role === "tool",
+        );
+        assert.equal(results.length, 2);
+        assert.ok(
+          results.some((message) =>
+            message.content.includes("focus revision changed"),
+          ),
+        );
+        assert.ok(
+          results.some((message) =>
+            message.content.includes('"state":"accepted"'),
+          ),
+        );
+        return finalModelAnswer(
+          "The measurement was accepted, but the focus was not saved because it changed.",
+        );
+      }
       return {
         ...finalModelAnswer(""),
         finish_reason: "tool_calls",
@@ -3210,13 +3254,181 @@ test("a failed focus save does not cancel sibling tool calls in an upstream para
     const { main } = await import(
       `${bundlePath.href}?parallelFocusFailure=${Date.now()}`
     );
-    await assert.rejects(main(historyTurn), /focus revision changed/u);
+    const result = await main(historyTurn);
     assert.deepEqual(calls, ["save", "create"]);
-    assert.deepEqual(events, []);
+    assert.equal(modelCalls, 2);
+    assert.equal(
+      result.answer,
+      "The measurement was accepted, but the focus was not saved because it changed.",
+    );
+    assert.deepEqual(result.measurement_plans, [
+      {
+        plan_id: "00000000-0000-4000-8000-000000000222",
+        target_id: "00000000-0000-4000-8000-000000000223",
+      },
+    ]);
+    assert.deepEqual(events, [["loop.completed", JSON.stringify(result)]]);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }
 });
+
+test("the model can correct a rejected tool argument and finish from the returned evidence", async () => {
+  const requests = [];
+  const events = [];
+  let modelCalls = 0;
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit(...event) {
+      events.push(event);
+    },
+    async reportGet(request) {
+      requests.push(request);
+      if (!request.kind) throw new Error("invalid_request: missing field kind");
+      return {
+        kind: "standalone_measurement",
+        summary: "One observed sample.",
+      };
+    },
+    async modelComplete(request) {
+      modelCalls++;
+      if (modelCalls === 3) {
+        assert.match(request.messages.at(-1).content, /One observed sample/u);
+        return finalModelAnswer(
+          "The saved report contains one observed sample.",
+        );
+      }
+      if (modelCalls === 2) {
+        assert.match(
+          request.messages.at(-1).content,
+          /invalid_request: missing field kind/u,
+        );
+      }
+      return {
+        ...finalModelAnswer(""),
+        finish_reason: "tool_calls",
+        tool_calls: [
+          {
+            id: `report-${modelCalls}`,
+            type: "function",
+            function: {
+              name: "report_get",
+              arguments: JSON.stringify({
+                report_id: "00000000-0000-4000-8000-000000000044",
+                ...(modelCalls === 2 ? { kind: "standalone_measurement" } : {}),
+              }),
+            },
+          },
+        ],
+      };
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?correctArgument=${Date.now()}`
+    );
+    const result = await main(historyTurn);
+    assert.deepEqual(
+      requests.map((request) => request.kind),
+      [undefined, "standalone_measurement"],
+    );
+    assert.equal(modelCalls, 3);
+    assert.equal(
+      result.answer,
+      "The saved report contains one observed sample.",
+    );
+    assert.deepEqual(events, [["loop.completed", JSON.stringify(result)]]);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+for (const failure of ["provider", "cancelled", "empty", "exhausted"]) {
+  test(`an accepted measurement does not fabricate completion after ${failure}`, async () => {
+    const events = [];
+    let creates = 0;
+    let modelCalls = 0;
+    globalThis.__GEO_AGENT_TEST_HOST__ = {
+      async emit(...event) {
+        events.push(event);
+      },
+      async measurementPlanCreate() {
+        creates++;
+        return {
+          plan_id: "00000000-0000-4000-8000-000000000222",
+          target_id: "00000000-0000-4000-8000-000000000223",
+          state: "accepted",
+        };
+      },
+      async projectCurrent() {
+        return { revision: 1 };
+      },
+      async modelComplete() {
+        modelCalls++;
+        if (modelCalls > 1) {
+          if (failure === "provider")
+            throw new Error("model provider unavailable");
+          // Rust rejects the next model call when its run is cancelled.
+          // Isolate interruption itself is covered by the Rust runtime tests.
+          if (failure === "cancelled") {
+            const error = new Error(
+              JSON.stringify({
+                op: "model.complete.v1",
+                code: "cancelled",
+                message: "run was cancelled",
+                retryable: false,
+              }),
+            );
+            error.name = "GeoHostOpError";
+            throw error;
+          }
+          if (failure === "empty") return finalModelAnswer("");
+        }
+        return {
+          ...finalModelAnswer(""),
+          finish_reason: "tool_calls",
+          tool_calls: [
+            {
+              id: `unfinished-${modelCalls}`,
+              type: "function",
+              function: {
+                name:
+                  modelCalls === 1
+                    ? "measurement_plan_create"
+                    : "project_current",
+                arguments: JSON.stringify(
+                  modelCalls === 1
+                    ? {
+                        account_id: "00000000-0000-4000-8000-000000000221",
+                        question: "Which rain gauge suits a garden?",
+                        idempotency_key: "accepted-once",
+                      }
+                    : {},
+                ),
+              },
+            },
+          ],
+        };
+      },
+    };
+    try {
+      const { main } = await import(
+        `${bundlePath.href}?terminalFailure=${failure}-${Date.now()}`
+      );
+      const expected = {
+        provider: /model provider unavailable/u,
+        cancelled: /run was cancelled/u,
+        empty: /without a final assistant answer/u,
+        exhausted: /iteration budget/u,
+      };
+      await assert.rejects(main(historyTurn), expected[failure]);
+      assert.equal(creates, 1);
+      assert.equal(modelCalls, failure === "exhausted" ? 8 : 2);
+      assert.deepEqual(events, []);
+    } finally {
+      delete globalThis.__GEO_AGENT_TEST_HOST__;
+    }
+  });
+}
 
 test("saved measurement findings preserve the unknown original receipt and grounded provenance", async () => {
   const plan = "00000000-0000-4000-8000-000000000224";
@@ -3487,15 +3699,24 @@ test("topic prediction offers real model tools and only a saved question-set rec
 test("a failed candidate-question write never completes as a saved prediction", async () => {
   const events = [];
   let modelCalls = 0;
+  let writes = 0;
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit(topic, payload) {
       events.push([topic, payload]);
     },
     async questionCreate() {
+      writes++;
       throw new Error("capability_missing: question sets unavailable");
     },
-    async modelComplete() {
+    async modelComplete(request) {
       modelCalls++;
+      if (modelCalls === 2) {
+        assert.match(
+          request.messages.at(-1).content,
+          /capability_missing: question sets unavailable/u,
+        );
+        return finalModelAnswer("Question suggestions could not be saved.");
+      }
       return {
         ...finalModelAnswer(""),
         finish_reason: "tool_calls",
@@ -3530,17 +3751,16 @@ test("a failed candidate-question write never completes as a saved prediction", 
     const { main } = await import(
       `${bundlePath.href}?topicFailure=${Date.now()}`
     );
-    await assert.rejects(
-      main({
-        conversation_id: "failed-candidates",
-        prompt: "Suggest questions",
-        run_id: "failed-candidates-run",
-        turn_id: "failed-candidates-turn",
-      }),
-      /capability_missing/u,
-    );
-    assert.equal(modelCalls, 1);
-    assert.deepEqual(events, []);
+    const result = await main({
+      conversation_id: "failed-candidates",
+      prompt: "Suggest questions",
+      run_id: "failed-candidates-run",
+      turn_id: "failed-candidates-turn",
+    });
+    assert.equal(modelCalls, 2);
+    assert.equal(writes, 1);
+    assert.equal(result.answer, "Question suggestions could not be saved.");
+    assert.deepEqual(events, [["loop.completed", JSON.stringify(result)]]);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }
@@ -4182,7 +4402,7 @@ test("media tools bind only current-turn attachments and return exact host docum
   }
 });
 
-test("media insertion conflict fails without choosing a new base or completing the turn", async () => {
+test("media insertion conflict is explained without choosing a new base", async () => {
   const calls = [];
   const events = [];
   let completions = 0;
@@ -4202,8 +4422,17 @@ test("media insertion conflict fails without choosing a new base or completing t
       calls.push(request);
       throw new Error("revision_conflict: read current document");
     },
-    async modelComplete() {
+    async modelComplete(request) {
       completions++;
+      if (completions === 2) {
+        assert.match(
+          request.messages.at(-1).content,
+          /revision_conflict: read current document/u,
+        );
+        return finalModelAnswer(
+          "The document changed; the image was not inserted.",
+        );
+      }
       return {
         ...finalModelAnswer(""),
         finish_reason: "tool_calls",
@@ -4224,10 +4453,14 @@ test("media insertion conflict fails without choosing a new base or completing t
     const { main } = await import(
       `${bundlePath.href}?mediaConflict=${Date.now()}`
     );
-    await assert.rejects(main(historyTurn), /revision_conflict/u);
+    const result = await main(historyTurn);
     assert.deepEqual(calls, [command]);
-    assert.equal(completions, 1);
-    assert.deepEqual(events, []);
+    assert.equal(completions, 2);
+    assert.equal(
+      result.answer,
+      "The document changed; the image was not inserted.",
+    );
+    assert.deepEqual(events, [["loop.completed", JSON.stringify(result)]]);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }
@@ -4613,16 +4846,26 @@ test("replayed plan returns the same frozen receipt and completed fixture remain
   }
 });
 
-test("a channel capability failure aborts the loop without a completion event", async () => {
+test("a channel capability failure reaches the final model answer as unavailable", async () => {
   const emitted = [];
+  let modelCalls = 0;
+  let plans = 0;
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit(topic, payload) {
       emitted.push({ topic, payload });
     },
     async channelPlan() {
+      plans++;
       throw new Error("capability_missing: channel planner unavailable");
     },
-    async modelComplete() {
+    async modelComplete(request) {
+      if (++modelCalls === 2) {
+        assert.match(
+          request.messages.at(-1).content,
+          /capability_missing: channel planner unavailable/u,
+        );
+        return finalModelAnswer("Channel planning is unavailable.");
+      }
       return {
         text: "",
         tool_calls: [
@@ -4646,31 +4889,45 @@ test("a channel capability failure aborts the loop without a completion event", 
     const { main } = await import(
       `${bundlePath.href}?channelError=${Date.now()}`
     );
-    await assert.rejects(
-      main({
-        conversation_id: "conversation-channel-error",
-        prompt: "Plan the channel",
-        run_id: "run-channel-error",
-        turn_id: "turn-channel-error",
-      }),
-      /capability_missing/u,
-    );
-    assert.equal(emitted.length, 0);
+    const result = await main({
+      conversation_id: "conversation-channel-error",
+      prompt: "Plan the channel",
+      run_id: "run-channel-error",
+      turn_id: "turn-channel-error",
+    });
+    assert.equal(result.answer, "Channel planning is unavailable.");
+    assert.equal(modelCalls, 2);
+    assert.equal(plans, 1);
+    assert.deepEqual(emitted, [
+      { topic: "loop.completed", payload: JSON.stringify(result) },
+    ]);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }
 });
 
-test("a missing knowledge capability fails without a success completion", async () => {
+test("a missing knowledge capability is explained without inventing source evidence", async () => {
   const emitted = [];
+  let modelCalls = 0;
+  let reads = 0;
   globalThis.__GEO_AGENT_TEST_HOST__ = {
     async emit(topic, payload) {
       emitted.push({ topic, payload });
     },
     async knowledgeTextRead() {
+      reads++;
       throw new Error("capability_missing: knowledge text is unavailable");
     },
-    async modelComplete() {
+    async modelComplete(request) {
+      if (++modelCalls === 2) {
+        assert.match(
+          request.messages.at(-1).content,
+          /capability_missing: knowledge text is unavailable/u,
+        );
+        return finalModelAnswer(
+          "The source could not be read, so I cannot verify its warranty.",
+        );
+      }
       return {
         text: "",
         tool_calls: [
@@ -4692,17 +4949,22 @@ test("a missing knowledge capability fails without a success completion", async 
   };
   try {
     const { main } = await import(`${bundlePath.href}?missing=${Date.now()}`);
-    await assert.rejects(
-      main({
-        conversation_id: "conversation-missing-tool-0001",
-        prompt: "What is the warranty?",
-        run_id: "run-missing-tool-0001",
-        timestamp: 1_700_000_000_000,
-        turn_id: "turn-missing-tool-0001",
-      }),
-      /capability_missing/u,
+    const result = await main({
+      conversation_id: "conversation-missing-tool-0001",
+      prompt: "What is the warranty?",
+      run_id: "run-missing-tool-0001",
+      timestamp: 1_700_000_000_000,
+      turn_id: "turn-missing-tool-0001",
+    });
+    assert.equal(
+      result.answer,
+      "The source could not be read, so I cannot verify its warranty.",
     );
-    assert.equal(emitted.length, 0);
+    assert.equal(modelCalls, 2);
+    assert.equal(reads, 1);
+    assert.deepEqual(emitted, [
+      { topic: "loop.completed", payload: JSON.stringify(result) },
+    ]);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }

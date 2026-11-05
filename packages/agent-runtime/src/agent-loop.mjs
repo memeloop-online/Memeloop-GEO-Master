@@ -1028,9 +1028,8 @@ export async function main(input) {
     turn.timestamp,
   );
   const modelId = turn.model ?? DEFAULT_MODEL_ID;
-  const toolFailures = [];
   const measurementPlans = new Map();
-  const provider = createHostProvider(host, modelId, toolFailures);
+  const provider = createHostProvider(host, modelId);
   const toolNames =
     turn.attachments.length > 0
       ? [
@@ -1089,12 +1088,7 @@ export async function main(input) {
     definition,
     provider,
     modelId,
-    tools: createHostTools(
-      host,
-      toolFailures,
-      turn.attachments,
-      measurementPlans,
-    ),
+    tools: createHostTools(host, turn.attachments, measurementPlans),
   });
   const runner = createAgentToolLoopRunner(context);
 
@@ -1133,9 +1127,6 @@ export async function main(input) {
     }
   }
 
-  if (toolFailures.length > 0) {
-    throw toolFailures[0];
-  }
   if (exhausted) {
     throw new Error("MemeLoop exhausted its model-to-tool iteration budget.");
   }
@@ -1396,15 +1387,12 @@ function createDefinition(modelId, toolNames = [KNOWLEDGE_TEXT_READ]) {
   };
 }
 
-function createHostProvider(host, configuredModel, toolFailures) {
+function createHostProvider(host, configuredModel) {
   const provider = {
     lastModel: undefined,
     modelId: configuredModel,
     name: "geo-host-bridge",
     async *chat(request) {
-      if (toolFailures.length > 0) {
-        throw toolFailures[0];
-      }
       const response = await host.modelComplete({
         max_output_tokens: request.maxOutputTokens,
         model:
@@ -2065,59 +2053,34 @@ function messageCursor(message) {
   };
 }
 
-function createHostTools(host, failures, attachments, measurementPlans) {
+function createHostTools(host, attachments, measurementPlans) {
   const importAttachments = async (parameters) => {
-    try {
-      if (!isRecord(parameters) || !Array.isArray(parameters.items)) {
-        throw new TypeError("knowledge.import_attachments requires items.");
-      }
-      return { result: await host.knowledgeImportAttachments(parameters) };
-    } catch (error) {
-      failures.push(error);
-      throw error;
+    if (!isRecord(parameters) || !Array.isArray(parameters.items)) {
+      throw new TypeError("knowledge.import_attachments requires items.");
     }
+    return { result: await host.knowledgeImportAttachments(parameters) };
   };
   const importStatus = async (parameters) => {
-    try {
-      if (!isRecord(parameters)) {
-        throw new TypeError("knowledge.import_status requires an object.");
-      }
-      return { result: await host.knowledgeImportStatus(parameters) };
-    } catch (error) {
-      failures.push(error);
-      throw error;
+    if (!isRecord(parameters)) {
+      throw new TypeError("knowledge.import_status requires an object.");
     }
+    return { result: await host.knowledgeImportStatus(parameters) };
   };
   const textRead = async (parameters) => {
-    try {
-      if (!isRecord(parameters))
-        throw new TypeError("knowledge.text.read requires an object.");
-      return { result: await host.knowledgeTextRead(parameters) };
-    } catch (error) {
-      failures.push(error);
-      throw error;
-    }
+    if (!isRecord(parameters))
+      throw new TypeError("knowledge.text.read requires an object.");
+    return { result: await host.knowledgeTextRead(parameters) };
   };
   const textRevise = async (parameters) => {
-    try {
-      if (!isRecord(parameters))
-        throw new TypeError("knowledge.text.revise requires an object.");
-      return { result: await host.knowledgeTextRevise(parameters) };
-    } catch (error) {
-      failures.push(error);
-      throw error;
-    }
+    if (!isRecord(parameters))
+      throw new TypeError("knowledge.text.revise requires an object.");
+    return { result: await host.knowledgeTextRevise(parameters) };
   };
   const reportTool = (name, method) => async (parameters) => {
-    try {
-      if (!isRecord(parameters)) {
-        throw new TypeError(`${name} requires an object.`);
-      }
-      return { result: await host[method](parameters) };
-    } catch (error) {
-      failures.push(error);
-      throw error;
+    if (!isRecord(parameters)) {
+      throw new TypeError(`${name} requires an object.`);
     }
+    return { result: await host[method](parameters) };
   };
   const reportGet = reportTool(REPORT_GET, "reportGet");
   const reportPreview = reportTool(REPORT_PREVIEW, "reportPreview");
@@ -2132,24 +2095,19 @@ function createHostTools(host, failures, attachments, measurementPlans) {
     "measurementOptions",
   );
   const measurementPlanCreate = async (parameters) => {
-    try {
-      if (!isRecord(parameters)) {
-        throw new TypeError(`${MEASUREMENT_PLAN_CREATE} requires an object.`);
-      }
-      const result = await host.measurementPlanCreate(parameters);
-      // Rust validates the receipt. Only this successful host operation can
-      // attach a plan to the turn; model prose and read results cannot.
-      if (result.state === "accepted") {
-        measurementPlans.set(result.plan_id, {
-          plan_id: result.plan_id,
-          target_id: result.target_id,
-        });
-      }
-      return { result };
-    } catch (error) {
-      failures.push(error);
-      throw error;
+    if (!isRecord(parameters)) {
+      throw new TypeError(`${MEASUREMENT_PLAN_CREATE} requires an object.`);
     }
+    const result = await host.measurementPlanCreate(parameters);
+    // Rust validates the receipt. Only this successful host operation can
+    // attach a plan to the turn; model prose and read results cannot.
+    if (result.state === "accepted") {
+      measurementPlans.set(result.plan_id, {
+        plan_id: result.plan_id,
+        target_id: result.target_id,
+      });
+    }
+    return { result };
   };
   const measurementPlanRead = reportTool(
     MEASUREMENT_PLAN_READ,
