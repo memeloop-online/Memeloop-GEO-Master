@@ -53,7 +53,7 @@ const target: jobs.ChannelTarget = {
     surface: "consumer_web",
     search_mode: "web_search",
     protocol_version: "sample-protocol",
-    question_set_version: "sample-question",
+    question_set_version: "ad_hoc.v1",
     question: "Which purifier is suitable for a small room?",
     market: "CN",
     language: "zh-CN",
@@ -389,7 +389,7 @@ describe("same-measurement outcome summary", () => {
     expect(link).toHaveAttribute("href", "https://example.test/this-answer");
     expect(
       within(
-        screen.getByRole("region", { name: "本次回答引用的来源" }),
+        screen.getByRole("region", { name: "本次引用中的内容线索" }),
       ).getAllByRole("link"),
     ).toHaveLength(1);
     expect(
@@ -503,12 +503,25 @@ describe("same-measurement outcome summary", () => {
           },
         },
       ],
+      revisions: [
+        analysis([
+          { ...item, citation_urls: ["https://example.test/this-answer"] },
+        ]),
+      ],
     });
     expect(
       await screen.findByText("独立评估样本，可查看原文与引用。"),
     ).toBeVisible();
     expect(
-      screen.queryByText("从引用来源了解内容机会，和 AI 制定下一步。"),
+      screen.queryByRole("heading", { name: "本次引用中的内容线索" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "https://example.test/this-answer" }),
+    ).toBeVisible();
+    expect(
+      within(screen.getByRole("region", { name: "example.test" })).queryByText(
+        item.reason!,
+      ),
     ).not.toBeInTheDocument();
   });
 
@@ -530,6 +543,300 @@ describe("same-measurement outcome summary", () => {
       "/app/tenant/project/chat?measurementPlan=11111111-1111-4111-8111-111111111111",
     );
     expect(link.getAttribute("href")).not.toContain("question");
+  });
+
+  it.each(["zh-CN", "en"])(
+    "groups exact cited pages with their extracted recommendation reasons (%s)",
+    async (language) => {
+      await i18n.changeLanguage(language);
+      const cited = "https://example.test/review";
+      const otherPage = "https://example.test/other";
+      setup({
+        revisions: [
+          analysis(
+            [{ ...item, citation_urls: [cited, cited] }],
+            [cited, otherPage, cited],
+          ),
+        ],
+      });
+      const source = await screen.findByRole("region", {
+        name: "example.test",
+      });
+      expect(within(source).getAllByRole("link")).toHaveLength(2);
+      const linkedPage = within(source)
+        .getByRole("link", { name: cited })
+        .closest("li")!;
+      expect(within(linkedPage).getByText(item.name)).toBeVisible();
+      expect(within(linkedPage).getAllByText(item.reason!)).toHaveLength(1);
+      expect(
+        within(linkedPage).queryByText(item.evidence_quote),
+      ).not.toBeVisible();
+      fireEvent.click(
+        within(linkedPage).getByText(
+          i18n.t("evidence", { ns: "measurementOutcome" }),
+        ),
+      );
+      expect(within(linkedPage).getByText(item.evidence_quote)).toBeVisible();
+      const unrelatedPage = within(source)
+        .getByRole("link", { name: otherPage })
+        .closest("li")!;
+      expect(
+        within(unrelatedPage).getByText(
+          i18n.t("citationUnlinked", { ns: "measurementOutcome" }),
+        ),
+      ).toBeVisible();
+      expect(
+        within(unrelatedPage).queryByText(item.reason!),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.getByText(
+          i18n.t("nextWithSources", { ns: "measurementOutcome" }),
+        ),
+      ).toBeVisible();
+    },
+  );
+
+  it("does not promote recommendation-only URLs or unsafe URLs to cited pages", async () => {
+    const valid = "https://example.test/recorded";
+    const unsafe = [
+      "javascript:alert(1)",
+      "data:text/plain,not-a-source",
+      "https://private:secret@example.test/page",
+      "/relative-page",
+      "not a URL",
+    ];
+    setup({
+      revisions: [
+        analysis(
+          [
+            {
+              ...item,
+              citation_urls: ["https://example.test/not-cited", ...unsafe],
+            },
+          ],
+          [valid, ...unsafe],
+        ),
+      ],
+    });
+    const source = await screen.findByRole("region", { name: "example.test" });
+    expect(within(source).getAllByRole("link")).toHaveLength(1);
+    expect(within(source).getByRole("link")).toHaveAttribute("href", valid);
+    expect(within(source).queryByText(item.name)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("https://example.test/not-cited"),
+    ).not.toBeInTheDocument();
+    for (const value of unsafe)
+      expect(screen.queryByText(value)).not.toBeInTheDocument();
+  });
+
+  it("keeps different query strings and fragments separate when linking recommendations", async () => {
+    const cited = "https://example.test/article?variant=a#section";
+    const other = "https://example.test/article?variant=b#section";
+    const fragment = "https://example.test/article?variant=a#other-section";
+    setup({
+      revisions: [
+        analysis(
+          [{ ...item, citation_urls: [other, fragment] }],
+          [cited, other, fragment],
+        ),
+      ],
+    });
+    const source = await screen.findByRole("region", { name: "example.test" });
+    const firstPage = within(source)
+      .getByRole("link", { name: cited })
+      .closest("li")!;
+    expect(within(firstPage).queryByText(item.name)).not.toBeInTheDocument();
+    const secondPage = within(source)
+      .getByRole("link", { name: other })
+      .closest("li")!;
+    expect(within(secondPage).getByText(item.name)).toBeVisible();
+    fireEvent.click(within(source).getByText("展开其余 1 个引用页面"));
+    const fragmentPage = within(source)
+      .getByRole("link", { name: fragment })
+      .closest("li")!;
+    expect(within(fragmentPage).getByText(item.name)).toBeVisible();
+  });
+
+  it("distinguishes unavailable recommendation associations from verified unlinked citations", async () => {
+    setup({ revisions: [analysis(null)] });
+    const source = await screen.findByRole("region", { name: "example.test" });
+    expect(within(source).getByText("暂无可用的推荐关联信息。")).toBeVisible();
+    expect(
+      within(source).queryByText("这条引用未关联具体推荐对象。"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps extra websites, pages and associations behind expandable summaries", async () => {
+    const urls = [
+      "https://one.example.test/a",
+      "https://one.example.test/b",
+      "https://one.example.test/c",
+      "https://two.example.test/a",
+      "https://three.example.test/a",
+      "https://four.example.test/a",
+    ];
+    setup({
+      revisions: [
+        analysis(
+          [1, 2, 3].map((number) => ({
+            ...item,
+            name: `Product ${number}`,
+            mention_order: number,
+            citation_urls: [urls[0]],
+          })),
+          urls,
+        ),
+      ],
+    });
+    const clues = await screen.findByRole("region", {
+      name: "本次引用中的内容线索",
+    });
+    expect(within(clues).getAllByRole("link")).toHaveLength(6);
+    for (const index of [0, 1, 3, 4])
+      expect(
+        within(clues).getByRole("link", { name: urls[index] }),
+      ).toBeVisible();
+    for (const index of [2, 5])
+      expect(
+        within(clues).getByRole("link", { name: urls[index] }),
+      ).not.toBeVisible();
+    fireEvent.click(within(clues).getByText("展开其余 1 个引用网站"));
+    expect(within(clues).getByRole("link", { name: urls[5] })).toBeVisible();
+    fireEvent.click(within(clues).getByText("展开其余 1 个引用页面"));
+    expect(within(clues).getByRole("link", { name: urls[2] })).toBeVisible();
+    expect(within(clues).getByText("Product 3")).not.toBeVisible();
+    fireEvent.click(within(clues).getByText("展开其余 1 项关联推荐"));
+    expect(within(clues).getByText("Product 3")).toBeVisible();
+  });
+
+  it("uses citation associations only from the explicitly selected analysis revision", async () => {
+    const url = "https://example.test/shared-page";
+    setup({
+      route: "/?target=target&attempt=attempt&analysisRevision=selected",
+      revisions: [
+        analysis(
+          [{ ...item, name: "Newer product", citation_urls: [url] }],
+          [url],
+          "latest",
+        ),
+        analysis(
+          [{ ...item, name: "Selected product", citation_urls: [url] }],
+          [url],
+          "selected",
+        ),
+      ],
+    });
+    const source = await screen.findByRole("region", { name: "example.test" });
+    expect(within(source).getByText("Selected product")).toBeVisible();
+    expect(screen.queryByText("Newer product")).not.toBeInTheDocument();
+  });
+
+  it("keeps unclassified historical citations inspectable without content-use guidance", async () => {
+    if (target.input.kind !== "measure")
+      throw new Error("Expected measurement fixture");
+    const url = "https://example.test/history";
+    setup({
+      targets: [
+        {
+          ...target,
+          input: {
+            ...target.input,
+            question_set_version: "unclassified-history",
+          },
+        },
+      ],
+      revisions: [analysis([{ ...item, citation_urls: [url] }], [url])],
+    });
+    const source = await screen.findByRole("region", { name: "example.test" });
+    expect(within(source).getByRole("link", { name: url })).toBeVisible();
+    expect(within(source).queryByText(item.reason!)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "本次引用中的内容线索" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText("这份历史样本的用途尚未确认，可查看原文与引用。"),
+    ).toBeVisible();
+  });
+
+  it("shows content clues for an optimization-bound question", async () => {
+    if (target.input.kind !== "measure")
+      throw new Error("Expected measurement fixture");
+    const url = "https://example.test/optimization";
+    setup({
+      targets: [
+        {
+          ...target,
+          input: {
+            ...target.input,
+            question_set_version: "saved-version",
+            question_binding: {
+              purpose: "optimization",
+              split_policy_version: "sample-split",
+              reference: {
+                question_id: "question",
+                question_revision_id: "question-revision",
+                question_set_id: "set",
+                question_set_version_id: "version",
+              },
+            },
+          },
+        },
+      ],
+      revisions: [analysis([{ ...item, citation_urls: [url] }], [url])],
+    });
+    const source = await screen.findByRole("region", { name: "example.test" });
+    expect(within(source).getByText(item.name)).toBeVisible();
+    expect(within(source).getByText(item.reason!)).toBeVisible();
+  });
+
+  it.each([
+    { citations: [] },
+    { citations: ["javascript:alert(1)", "/relative"] },
+  ])(
+    "does not invent sources when no usable citation is recorded: %j",
+    async ({ citations }) => {
+      setup({ revisions: [analysis([item], citations)] });
+      expect(
+        await screen.findByText("本次回答没有记录可打开的引用来源。"),
+      ).toBeVisible();
+      expect(
+        screen.queryByRole("heading", { name: "本次引用中的内容线索" }),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("link", { name: /example\.test/ }),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it("preserves first-citation website order without ranking channels or merging subdomains", async () => {
+    const urls = [
+      "https://z.example.test/first",
+      "https://a.example.test/second",
+      "https://z.example.test/third",
+      "https://example.test/fourth",
+    ];
+    setup({ revisions: [analysis([], urls)] });
+    const clues = await screen.findByRole("region", {
+      name: "本次引用中的内容线索",
+    });
+    expect(
+      within(clues)
+        .getAllByRole("heading")
+        .map((heading) => heading.textContent),
+    ).toEqual([
+      "本次引用中的内容线索",
+      "z.example.test",
+      "a.example.test",
+      "example.test",
+    ]);
+    expect(
+      within(clues)
+        .getAllByRole("link")
+        .map((link) => link.getAttribute("href")),
+    ).toEqual([urls[0], urls[2], urls[1], urls[3]]);
+    expect(
+      within(clues).queryByText(/优先级|排名|权重|份额/),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps saved results visible when a background refresh fails", async () => {

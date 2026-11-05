@@ -9,11 +9,21 @@ const translations = {
     descriptionTitle: "AI 如何描述",
     alternativesTitle: "还推荐了谁",
     citationsTitle: "本次回答引用的来源",
+    citationCluesTitle: "本次引用中的内容线索",
+    citationCluesHint:
+      "查看引用页面及其关联的推荐理由，寻找值得核对和补充的内容。",
+    citationReasons: "本次回答中关联的推荐理由",
+    citationUnlinked: "这条引用未关联具体推荐对象。",
+    citationAssociationUnknown: "暂无可用的推荐关联信息。",
+    moreCitationReasons: "展开其余 {{count}} 项关联推荐",
+    moreCitationPages: "展开其余 {{count}} 个引用页面",
+    moreCitationSources: "展开其余 {{count}} 个引用网站",
     nextTitle: "内容下一步",
     discuss: "与 AI 讨论本次测量",
-    nextWithSources: "从引用来源了解内容机会，和 AI 制定下一步。",
+    nextWithSources: "结合本次引用和推荐理由，与 AI 制定内容补充计划。",
     nextWithoutSources: "查看回答中的推荐理由，与 AI 讨论内容方向。",
     evaluationOnly: "独立评估样本，可查看原文与引用。",
+    unclassifiedOnly: "这份历史样本的用途尚未确认，可查看原文与引用。",
     noConclusion: "暂无可用的推荐结果。",
     noRecommendations: "这次回答没有明确推荐对象。",
     noAlternatives: "这次回答没有其他明确推荐对象。",
@@ -65,14 +75,27 @@ const translations = {
     descriptionTitle: "How AI described them",
     alternativesTitle: "Who else was recommended?",
     citationsTitle: "Sources cited in this answer",
+    citationCluesTitle: "Content clues from this answer's citations",
+    citationCluesHint:
+      "Explore the cited pages and their associated recommendation reasons to identify content worth checking or adding.",
+    citationReasons: "Associated recommendation reasons in this answer",
+    citationUnlinked:
+      "This citation is not linked to a specific recommendation.",
+    citationAssociationUnknown:
+      "Recommendation associations are not available yet.",
+    moreCitationReasons: "Show {{count}} more associated recommendations",
+    moreCitationPages: "Show {{count}} more cited pages",
+    moreCitationSources: "Show {{count}} more cited websites",
     nextTitle: "Next steps for your content",
     discuss: "Discuss this measurement with AI",
     nextWithSources:
-      "Explore content opportunities in these sources and plan next steps with AI.",
+      "Discuss these citations and recommendation reasons with AI to plan content additions.",
     nextWithoutSources:
       "Review the recommendation reasons and discuss content ideas with AI.",
     evaluationOnly:
       "Independent evaluation sample. View its answer and citations.",
+    unclassifiedOnly:
+      "This historical sample's purpose is unconfirmed. View its answer and citations.",
     noConclusion: "Recommendation results are not available yet.",
     noRecommendations: "This answer did not explicitly recommend any items.",
     noAlternatives: "This answer did not explicitly recommend any other items.",
