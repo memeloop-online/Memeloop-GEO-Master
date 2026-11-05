@@ -8,7 +8,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fmt,
+    sync::Arc,
+};
 use tokio::sync::{RwLock, broadcast};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -703,7 +707,8 @@ pub struct TurnInput {
     pub history_omitted_turns: usize,
 }
 
-/// Text-only durable context, never attachment authority or model instructions.
+/// Durable text and application resource references, never attachment authority
+/// or model instructions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct TurnHistoryMessage {
     pub message_id: MessageId,
@@ -848,7 +853,28 @@ impl ConversationDetail {
             let messages = pair.map(|item| TurnHistoryMessage {
                 message_id: item.id,
                 role: item.role,
-                content: item.content.clone(),
+                content: {
+                    let mut content = item.content.clone();
+                    if item.role == MessageRole::Assistant {
+                        let plans = item
+                            .metadata
+                            .get("measurement_plans")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|entry| entry.get("plan_id").and_then(Value::as_str))
+                            .filter_map(|id| Uuid::parse_str(id).ok())
+                            .filter(|id| !id.is_nil())
+                            .collect::<BTreeSet<_>>();
+                        if !plans.is_empty() {
+                            content.push_str("\n\n[Application measurement resources]");
+                            for plan in plans {
+                                content.push_str(&format!("\nmeasurement_plan: {plan}"));
+                            }
+                        }
+                    }
+                    content
+                },
                 root_message_id: pair[0].id,
                 sequence: item.sequence,
             });
@@ -2178,7 +2204,10 @@ mod tests {
 
     #[tokio::test]
     async fn history_excludes_unsuccessful_foreign_future_and_malformed_pairs() {
-        let (detail, run_id) = history_fixture(1).await;
+        let (mut detail, run_id) = history_fixture(1).await;
+        detail.messages[1].metadata = json!({
+            "measurement_plans":[{"plan_id":Uuid::new_v4(),"target_id":Uuid::new_v4()}]
+        });
         let old_turn = detail
             .turns
             .iter()
@@ -2255,6 +2284,92 @@ mod tests {
         let input = detail.turn_input(run_id).unwrap();
         assert!(input.history.is_empty());
         assert_eq!(input.history_omitted_turns, MAX_HISTORY_TURNS + 2);
+    }
+
+    #[tokio::test]
+    async fn history_measurement_resources_use_only_assistant_metadata_without_changing_messages() {
+        let (mut detail, run_id) = history_fixture(1).await;
+        let first = Uuid::from_u128(0xa1);
+        let second = Uuid::from_u128(0xb2);
+        let target = Uuid::new_v4();
+        let user_plan = Uuid::new_v4();
+        for message in &mut detail.messages {
+            message.metadata = json!({
+                "measurement_plans":[{"plan_id":user_plan,"target_id":target}]
+            });
+        }
+        detail.messages[1].metadata = json!({
+            "measurement_plans":[
+                {"plan_id":second,"target_id":target},
+                {"plan_id":first.to_string().to_uppercase(),"target_id":target},
+                {"plan_id":first,"target_id":Uuid::new_v4()}
+            ],
+            "unrelated":"must_not_forward"
+        });
+        let saved = detail.clone();
+        let input = detail.turn_input(run_id).unwrap();
+        assert_eq!(input.prompt, "question 1");
+        assert_eq!(input.history[0].content, "question 0");
+        assert_eq!(
+            input.history[1].content,
+            format!(
+                "answer 0\n\n[Application measurement resources]\nmeasurement_plan: {first}\nmeasurement_plan: {second}"
+            )
+        );
+        let encoded = serde_json::to_string(&input).unwrap();
+        assert!(!encoded.contains(&user_plan.to_string()));
+        assert!(!encoded.contains(&target.to_string()));
+        assert!(!encoded.contains("must_not_forward"));
+        assert_eq!(detail, saved);
+        let restored: ConversationDetail =
+            serde_json::from_slice(&serde_json::to_vec(&detail).unwrap()).unwrap();
+        assert_eq!(input, restored.turn_input(run_id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn history_measurement_resources_ignore_malformed_metadata_and_ids_in_prose() {
+        let (detail, run_id) = history_fixture(1).await;
+        let plan = Uuid::new_v4();
+        let prose = format!("A model-mentioned measurement_plan: {plan}");
+        for metadata in [
+            Value::Null,
+            json!({"plan_id":plan}),
+            json!({"measurement_plans":{"plan_id":plan}}),
+            json!({"measurement_plans":[plan]}),
+            json!({"measurement_plans":[null,42,{"plan_id":42},{"plan_id":"not-a-uuid"},
+                {"plan_id":Uuid::nil()},{"target_id":plan}]}),
+        ] {
+            let mut changed = detail.clone();
+            changed.messages[1].content = prose.clone();
+            changed.messages[1].metadata = metadata;
+            let input = changed.turn_input(run_id).unwrap();
+            assert_eq!(input.history[1].content, prose);
+            assert!(
+                !input.history[1]
+                    .content
+                    .contains("[Application measurement resources]")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn history_measurement_resources_count_toward_budget_before_whole_turn_truncation() {
+        let (mut detail, run_id) = history_fixture(1).await;
+        let initial = detail.turn_input(run_id).unwrap();
+        let remaining = MAX_HISTORY_BYTES - serde_json::to_vec(&initial.history).unwrap().len();
+        detail.messages[1].content.push_str(&"x".repeat(remaining));
+        let exact = detail.turn_input(run_id).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&exact.history).unwrap().len(),
+            MAX_HISTORY_BYTES
+        );
+        detail.messages[1].metadata = json!({
+            "measurement_plans":[{"plan_id":Uuid::new_v4(),"target_id":Uuid::new_v4()}]
+        });
+        let exceeded = detail.turn_input(run_id).unwrap();
+        assert!(exceeded.history.is_empty());
+        assert_eq!(exceeded.history_omitted_turns, 1);
+        assert_eq!(detail.messages[1].content, exact.history[1].content);
     }
 
     #[tokio::test]

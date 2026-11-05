@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, type ReactNode } from "react";
 import { Button, Spinner } from "@fluentui/react-components";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
@@ -597,11 +597,13 @@ export function MeasurementOutcomeSummary({
   projectId,
   plan,
   active = true,
+  discussionAction,
 }: {
   tenantId: string;
   projectId: string;
   plan: StandaloneMeasurementPlan;
   active?: boolean;
+  discussionAction?: ReactNode;
 }) {
   const { t } = useTranslation("measurementOutcome");
   const project = useProjectQuery(tenantId, projectId);
@@ -612,12 +614,14 @@ export function MeasurementOutcomeSummary({
     <section className="measurement-outcome" aria-label={t("title")}>
       <div className="measurement-outcome-heading">
         <h3>{t("title")}</h3>
-        <Link
-          className="measurement-outcome-discuss"
-          to={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/chat?${new URLSearchParams({ measurementPlan: plan.plan_id })}`}
-        >
-          {t("discuss")}
-        </Link>
+        {discussionAction ?? (
+          <Link
+            className="measurement-outcome-discuss"
+            to={`/app/${encodeURIComponent(tenantId)}/${encodeURIComponent(projectId)}/chat?${new URLSearchParams({ measurementPlan: plan.plan_id })}`}
+          >
+            {t("discuss")}
+          </Link>
+        )}
       </div>
       <p className="measurement-outcome-scope">{t("scope")}</p>
       {project.isPending && <p role="status">{t("focusLoading")}</p>}

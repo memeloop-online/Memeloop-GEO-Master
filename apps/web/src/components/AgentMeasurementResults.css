@@ -1,0 +1,23 @@
+.agent-measurement-results,
+.agent-measurement-result {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.agent-measurement-results:empty {
+  display: none;
+}
+
+.agent-measurement-results {
+  margin-top: 16px;
+  white-space: normal;
+}
+
+.agent-measurement-result {
+  overflow-wrap: anywhere;
+  font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}

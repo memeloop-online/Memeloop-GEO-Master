@@ -652,6 +652,7 @@ test("the generated ESM bundle runs a real MemeLoop loop through the host comple
       answer: "The warranty lasts two years.",
       conversation_id: "conversation-smoke-0001",
       history_omitted_turns: 0,
+      measurement_plans: [],
       model: "stub-model",
       run_id: "run-smoke-0001",
       turn_id: "turn-smoke-0001",
@@ -2952,6 +2953,9 @@ test("standalone measurement discovers live models, accepts one ad-hoc question 
       turn_id: "standalone-turn",
     });
     assert.match(answer.answer, /queued/u);
+    assert.deepEqual(answer.measurement_plans, [
+      { plan_id: plan, target_id: target },
+    ]);
     assert.deepEqual(
       seen.map(([name]) => name),
       ["options", "create", "read"],
@@ -2983,6 +2987,232 @@ test("standalone measurement discovers live models, accepts one ad-hoc question 
       undefined,
       "Rust chooses the observed default",
     );
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("accepted measurement references deduplicate replay while the model finishes the remaining tools", async () => {
+  const account = "00000000-0000-4000-8000-000000000221";
+  const plans = [
+    {
+      plan_id: "00000000-0000-4000-8000-000000000222",
+      target_id: "00000000-0000-4000-8000-000000000223",
+    },
+    {
+      plan_id: "00000000-0000-4000-8000-000000000224",
+      target_id: "00000000-0000-4000-8000-000000000225",
+    },
+  ];
+  const commands = [
+    [
+      "measurement_plan_create",
+      {
+        account_id: account,
+        question: "Which rain gauges are suitable for a garden?",
+        idempotency_key: "first",
+      },
+    ],
+    [
+      "measurement_plan_create",
+      {
+        account_id: account,
+        question: "Which rain gauges are suitable for a garden?",
+        idempotency_key: "first",
+      },
+    ],
+    ["measurement_plan_read", { plan_id: plans[0].plan_id }],
+    [
+      "measurement_plan_create",
+      {
+        account_id: account,
+        question: "Which rain gauges are suitable for a balcony?",
+        idempotency_key: "second",
+      },
+    ],
+    ["project_current", {}],
+  ];
+  const seen = [];
+  const events = [];
+  let modelCalls = 0;
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit(topic, payload) {
+      events.push([topic, JSON.parse(payload)]);
+    },
+    async measurementPlanCreate(input) {
+      seen.push(["measurement_plan_create", input]);
+      return {
+        ...plans[input.idempotency_key === "first" ? 0 : 1],
+        account_id: account,
+        model: "observed-model",
+        state: "accepted",
+      };
+    },
+    async measurementPlanRead(input) {
+      seen.push(["measurement_plan_read", input]);
+      return {
+        plan_id: input.plan_id,
+        targets: [{ target_id: plans[0].target_id, state: "queued" }],
+      };
+    },
+    async projectCurrent(input) {
+      seen.push(["project_current", input]);
+      return { project: { revision: 1 } };
+    },
+    async modelComplete() {
+      const command = commands[modelCalls++];
+      return command
+        ? {
+            ...finalModelAnswer(""),
+            finish_reason: "tool_calls",
+            tool_calls: [
+              {
+                id: `measurement-followup-${modelCalls}`,
+                type: "function",
+                function: {
+                  name: command[0],
+                  arguments: JSON.stringify(command[1]),
+                },
+              },
+            ],
+          }
+        : finalModelAnswer(
+            "Both measurements were accepted. The first is queued.",
+          );
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?measurementReferences=${Date.now()}`
+    );
+    const completion = await main({
+      ...historyTurn,
+      prompt: "Measure these two questions, then read the project.",
+    });
+    assert.deepEqual(seen, commands);
+    assert.equal(modelCalls, commands.length + 1);
+    assert.deepEqual(completion.measurement_plans, plans);
+    assert.equal(
+      completion.answer,
+      "Both measurements were accepted. The first is queued.",
+    );
+    assert.deepEqual(events, [["loop.completed", completion]]);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("failed measurement creation emits no successful completion even after an earlier acceptance", async () => {
+  const events = [];
+  let created = 0;
+  let modelCalls = 0;
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit(topic, payload) {
+      events.push([topic, payload]);
+    },
+    async measurementPlanCreate() {
+      if (++created === 2)
+        throw new Error("capability_missing: measurement unavailable");
+      return {
+        plan_id: "00000000-0000-4000-8000-000000000222",
+        target_id: "00000000-0000-4000-8000-000000000223",
+        state: "accepted",
+      };
+    },
+    async modelComplete() {
+      modelCalls++;
+      return {
+        ...finalModelAnswer(""),
+        finish_reason: "tool_calls",
+        tool_calls: [
+          {
+            id: `measurement-failure-${modelCalls}`,
+            type: "function",
+            function: {
+              name: "measurement_plan_create",
+              arguments: JSON.stringify({
+                account_id: "00000000-0000-4000-8000-000000000221",
+                question: `Which rain gauge suits scenario ${modelCalls}?`,
+                idempotency_key: `request-${modelCalls}`,
+              }),
+            },
+          },
+        ],
+      };
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?measurementFailure=${Date.now()}`
+    );
+    await assert.rejects(main(historyTurn), /measurement unavailable/u);
+    assert.equal(created, 2);
+    assert.equal(modelCalls, 2);
+    assert.deepEqual(events, []);
+  } finally {
+    delete globalThis.__GEO_AGENT_TEST_HOST__;
+  }
+});
+
+test("a failed focus save does not cancel sibling tool calls in an upstream parallel batch", async () => {
+  const events = [];
+  const calls = [];
+  globalThis.__GEO_AGENT_TEST_HOST__ = {
+    async emit(topic, payload) {
+      events.push([topic, payload]);
+    },
+    async projectRevise() {
+      calls.push("save");
+      throw new Error("conflict: focus revision changed");
+    },
+    async measurementPlanCreate() {
+      calls.push("create");
+      return {
+        plan_id: "00000000-0000-4000-8000-000000000222",
+        target_id: "00000000-0000-4000-8000-000000000223",
+        state: "accepted",
+      };
+    },
+    async modelComplete() {
+      return {
+        ...finalModelAnswer(""),
+        finish_reason: "tool_calls",
+        tool_calls: [
+          [
+            "project_revise",
+            {
+              expected_revision: 1,
+              idempotency_key: "focus-save",
+              patch: {
+                measurement_targets: [
+                  { name: "Example rain gauge", kind: "product", aliases: [] },
+                ],
+              },
+            },
+          ],
+          [
+            "measurement_plan_create",
+            {
+              account_id: "00000000-0000-4000-8000-000000000221",
+              question: "Which rain gauges are suitable for a garden?",
+              idempotency_key: "parallel-measurement",
+            },
+          ],
+        ].map(([name, parameters], index) => ({
+          id: `parallel-focus-${index}`,
+          type: "function",
+          function: { name, arguments: JSON.stringify(parameters) },
+        })),
+      };
+    },
+  };
+  try {
+    const { main } = await import(
+      `${bundlePath.href}?parallelFocusFailure=${Date.now()}`
+    );
+    await assert.rejects(main(historyTurn), /focus revision changed/u);
+    assert.deepEqual(calls, ["save", "create"]);
+    assert.deepEqual(events, []);
   } finally {
     delete globalThis.__GEO_AGENT_TEST_HOST__;
   }
@@ -3071,21 +3301,35 @@ test("saved measurement findings preserve the unknown original receipt and groun
               },
             ],
           }
-        : finalModelAnswer(
-            "The recorded answer recommends Example rain gauge.",
-          );
+        : {
+            ...finalModelAnswer(
+              "The recorded answer recommends Example rain gauge.",
+            ),
+            measurement_plans: [
+              { plan_id: plan, target_id: receipt.targets[0].target_id },
+            ],
+            metadata: {
+              measurement_plans: [
+                { plan_id: plan, target_id: receipt.targets[0].target_id },
+              ],
+            },
+          };
     },
   };
   try {
     const { main } = await import(
       `${bundlePath.href}?saved-plan=${Date.now()}`
     );
-    await main({
+    const completion = await main({
       conversation_id: "saved-plan-conversation",
       prompt: `Explain saved measurement ${plan}.`,
       run_id: "saved-plan-run",
       turn_id: "saved-plan-turn",
+      measurement_plans: [
+        { plan_id: plan, target_id: receipt.targets[0].target_id },
+      ],
     });
+    assert.deepEqual(completion.measurement_plans, []);
     assert.deepEqual(calls, [{ plan_id: plan }]);
     assert.deepEqual(JSON.parse(requests[1].messages.at(-1).content), receipt);
     const description = requests[0].tools.find(
@@ -3200,6 +3444,34 @@ test("topic prediction offers real model tools and only a saved question-set rec
       canonicalSystemContent(requests[0]),
       /Start with one relevant question on one available account/u,
     );
+    const prompt = canonicalSystemContent(requests[0]);
+    assert.match(
+      prompt,
+      /ask one concise clarification combining only the necessary missing details/u,
+    );
+    assert.match(
+      prompt,
+      /Once those details are available, call project_current, then project_revise.*only after that successful save discover an available account and create the measurement/u,
+    );
+    assert.match(
+      prompt,
+      /preserving existing unrelated targets, exact names, kinds and only explicit aliases/u,
+    );
+    assert.match(
+      prompt,
+      /If saving the focus fails, do not submit a measurement/u,
+    );
+    assert.match(prompt, /without naming the focus/u);
+    assert.match(
+      prompt,
+      /Honor explicit multi-question or multi-platform requests/u,
+    );
+    assert.match(prompt, /read each plan at most once in this turn/u);
+    assert.match(
+      prompt,
+      /finish the current reply after any other requested work/u,
+    );
+    assert.match(prompt, /without another model turn/u);
     assert.match(
       canonicalSystemContent(requests[0]),
       /When the user supplies a measurement plan reference, read that exact plan/u,
