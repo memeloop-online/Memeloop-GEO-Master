@@ -62,6 +62,41 @@
   border-radius: 8px;
 }
 
+.measurement-citation-source {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--colorNeutralStroke2);
+  border-radius: 8px;
+}
+
+.measurement-citation-source ul,
+.measurement-citation-page,
+.measurement-citation-associations,
+.measurement-citation-recommendation {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.measurement-outcome .measurement-citation-source ul {
+  gap: 16px;
+  padding: 0;
+  list-style: none;
+}
+
+.measurement-citation-associations {
+  padding-inline-start: 12px;
+  border-inline-start: 2px solid var(--colorNeutralStroke2);
+}
+
+.measurement-citation-source details > .measurement-outcome-column,
+.measurement-citation-source details > ul,
+.measurement-citation-source details > .measurement-citation-recommendation {
+  margin-top: 12px;
+}
+
 .measurement-outcome summary {
   cursor: pointer;
 }

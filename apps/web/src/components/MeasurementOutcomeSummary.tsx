@@ -87,6 +87,119 @@ function Recommendations({ items }: { items: RecommendationItem[] }) {
   );
 }
 
+function CitationSources({
+  citations,
+  items,
+  showContentClues,
+}: {
+  citations: string[];
+  items: RecommendationItem[] | null;
+  showContentClues: boolean;
+}) {
+  const { t } = useTranslation("measurementOutcome");
+  const sources = new Map<string, string[]>();
+  for (const url of citations) {
+    const host = new URL(url).hostname;
+    sources.set(host, [...(sources.get(host) ?? []), url]);
+  }
+  const associated = new Map<string, RecommendationItem[]>();
+  if (showContentClues) {
+    for (const item of items ?? []) {
+      for (const url of new Set(
+        item.citation_urls.map(safeOriginalPublicUrl),
+      )) {
+        if (url && citations.includes(url))
+          associated.set(url, [...(associated.get(url) ?? []), item]);
+      }
+    }
+  }
+  const association = (item: RecommendationItem, index: number) => (
+    <div
+      key={`${item.kind}-${item.mention_order}-${index}`}
+      className="measurement-citation-recommendation"
+    >
+      <strong>{item.name}</strong>
+      <p>{item.reason || t("reasonMissing")}</p>
+      {item.evidence_quote && (
+        <details>
+          <summary>{t("evidence")}</summary>
+          <blockquote>{item.evidence_quote}</blockquote>
+        </details>
+      )}
+    </div>
+  );
+  const page = (url: string) => {
+    const matches = associated.get(url) ?? [];
+    return (
+      <li key={url} className="measurement-citation-page">
+        <a href={url} target="_blank" rel="noopener noreferrer">
+          {url}
+        </a>
+        {showContentClues &&
+          (matches.length ? (
+            <div className="measurement-citation-associations">
+              <p className="measurement-outcome-scope">
+                {t("citationReasons")}
+              </p>
+              {matches.slice(0, 2).map(association)}
+              {matches.length > 2 && (
+                <details>
+                  <summary>
+                    {t("moreCitationReasons", { count: matches.length - 2 })}
+                  </summary>
+                  {matches.slice(2).map(association)}
+                </details>
+              )}
+            </div>
+          ) : (
+            <p className="measurement-outcome-scope">
+              {t(
+                items === null
+                  ? "citationAssociationUnknown"
+                  : "citationUnlinked",
+              )}
+            </p>
+          ))}
+      </li>
+    );
+  };
+  const source = ([host, urls]: [string, string[]]) => (
+    <section
+      key={host}
+      className="measurement-citation-source"
+      aria-label={host}
+    >
+      <h5>{host}</h5>
+      <ul>{urls.slice(0, 2).map(page)}</ul>
+      {urls.length > 2 && (
+        <details>
+          <summary>
+            {t("moreCitationPages", { count: urls.length - 2 })}
+          </summary>
+          <ul>{urls.slice(2).map(page)}</ul>
+        </details>
+      )}
+    </section>
+  );
+  const entries = [...sources];
+  return (
+    <div className="measurement-outcome-column">
+      {showContentClues && <p>{t("citationCluesHint")}</p>}
+      {entries.slice(0, 3).map(source)}
+      {entries.length > 3 && (
+        <details>
+          <summary>
+            {t("moreCitationSources", { count: entries.length - 3 })}
+          </summary>
+          <div className="measurement-outcome-column">
+            {entries.slice(3).map(source)}
+          </div>
+        </details>
+      )}
+    </div>
+  );
+}
+
 function AttemptSummary({
   tenantId,
   projectId,
@@ -95,6 +208,7 @@ function AttemptSummary({
   focusTargets,
   active,
   evaluationOnly,
+  canSuggestContent,
 }: {
   tenantId: string;
   projectId: string;
@@ -103,6 +217,7 @@ function AttemptSummary({
   focusTargets: readonly MeasurementTarget[];
   active: boolean;
   evaluationOnly: boolean;
+  canSuggestContent: boolean;
 }) {
   const { session } = useAuth();
   const { t, i18n } = useTranslation("measurementOutcome");
@@ -331,35 +446,43 @@ function AttemptSummary({
           )}
           <section
             className="measurement-outcome-column"
-            aria-label={t("citationsTitle")}
+            aria-label={t(
+              canSuggestContent && citations.length
+                ? "citationCluesTitle"
+                : "citationsTitle",
+            )}
           >
-            <h4>{t("citationsTitle")}</h4>
+            <h4>
+              {t(
+                canSuggestContent && citations.length
+                  ? "citationCluesTitle"
+                  : "citationsTitle",
+              )}
+            </h4>
             {citations.length ? (
-              <ul>
-                {citations.map((url) => (
-                  <li key={url}>
-                    <a href={url} target="_blank" rel="noopener noreferrer">
-                      {url}
-                    </a>
-                  </li>
-                ))}
-              </ul>
+              <CitationSources
+                citations={citations}
+                items={items === null ? null : ordered}
+                showContentClues={canSuggestContent}
+              />
             ) : (
               <p>{t("sourceMissing")}</p>
             )}
           </section>
           <section
             className="measurement-outcome-column"
-            aria-label={t("nextTitle")}
+            aria-label={t(canSuggestContent ? "nextTitle" : "evidence")}
           >
-            <h4>{t("nextTitle")}</h4>
+            <h4>{t(canSuggestContent ? "nextTitle" : "evidence")}</h4>
             <p>
               {t(
                 evaluationOnly
                   ? "evaluationOnly"
-                  : citations.length
-                    ? "nextWithSources"
-                    : "nextWithoutSources",
+                  : !canSuggestContent
+                    ? "unclassifiedOnly"
+                    : citations.length
+                      ? "nextWithSources"
+                      : "nextWithoutSources",
               )}
             </p>
           </section>
@@ -455,6 +578,11 @@ function TargetSummary({
             attempt={attempt}
             evaluationOnly={
               input.question_binding?.purpose === "frozen_evaluation"
+            }
+            canSuggestContent={
+              input.question_binding
+                ? input.question_binding.purpose === "optimization"
+                : input.question_set_version === "ad_hoc.v1"
             }
           />
         ))
