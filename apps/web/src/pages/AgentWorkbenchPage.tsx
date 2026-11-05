@@ -46,6 +46,10 @@ import { createIdempotencyKey } from "../api/client";
 import { ErrorState, LoadingState } from "../components/AsyncState";
 import { AgentMessageContent } from "../components/AgentMessageContent";
 import {
+  AgentMeasurementResults,
+  measurementReferencesByMessage,
+} from "../components/AgentMeasurementResults";
+import {
   MeasurementReportDraftBridge,
   measurementReportReference,
   measurementQuestionTargetReference,
@@ -336,6 +340,10 @@ function AgentChat({
   const latestAnswer = [...conversation.messages]
     .filter((message) => message.role === "assistant")
     .sort((a, b) => b.sequence - a.sequence)[0];
+  const measurementReferences = useMemo(
+    () => measurementReferencesByMessage(conversation.messages),
+    [conversation.messages],
+  );
   const omittedHistory =
     latestAnswer?.metadata &&
     typeof latestAnswer.metadata === "object" &&
@@ -683,7 +691,21 @@ function AgentChat({
           <AgentChatView
             adapter={adapter}
             renderMessageContent={(message) => (
-              <AgentMessageContent message={message} />
+              <>
+                <AgentMessageContent message={message} />
+                {measurementReferences.has(message.messageId) && (
+                  <AgentMeasurementResults
+                    tenantId={tenantId}
+                    projectId={projectId}
+                    references={measurementReferences.get(message.messageId)!}
+                    onFocus={() =>
+                      chatColumn.current
+                        ?.querySelector<HTMLTextAreaElement>("textarea")
+                        ?.focus()
+                    }
+                  />
+                )}
+              </>
             )}
             composerToolbar={
               measurementPlanId ? (
@@ -865,7 +887,7 @@ export function AgentWorkbenchPage() {
           )}
           {conversation.data && tenantId && projectId && (
             <AgentChat
-              key={conversation.data.conversation.id}
+              key={`${tenantId}:${projectId}:${conversation.data.conversation.id}`}
               conversation={conversation.data}
               tenantId={tenantId}
               projectId={projectId}

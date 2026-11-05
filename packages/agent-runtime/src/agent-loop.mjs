@@ -445,7 +445,7 @@ const TOOL_DESCRIPTIONS = {
   [MEASUREMENT_PLAN_CREATE]:
     "Schedule one arbitrary question without enterprise setup or a cycle. Give an account_id from scoped discovery and a stable idempotency_key; Rust resolves and verifies the live website model and all protocol defaults. A receipt means accepted for background dispatch, not successful search or an answer. Never put a frozen evaluation question here.",
   [MEASUREMENT_PLAN_READ]:
-    "Read the exact standalone plan's persisted state and original outcome_status. Current ad-hoc and optimization questions include conditions and available answer, citations, and recommendations. analysis_provenance makes the grounded saved sample usable for findings even when original outcome_status is unknown, which describes the initial execution receipt rather than the saved answer. When answer_available is true but answer is absent, link the target detail for the full answer. Frozen evaluation questions remain metadata-only. Use returned evidence to explain this plan's results and next content opportunities.",
+    "Read the exact standalone plan's persisted state and original outcome_status. Current ad-hoc and optimization questions include conditions and available answer, citations, and recommendations. analysis_provenance makes the grounded saved sample usable for findings even when original outcome_status is unknown, which describes the initial execution receipt rather than the saved answer. When answer_available is true but answer is absent, link the target detail for the full answer. Frozen evaluation questions remain metadata-only. Use returned evidence to explain this plan's results and next content opportunities. After acceptance, read each plan at most once in this turn; if pending, report the recorded state and let its result card update. Do not poll or retry creation to wait for an answer.",
   [CHANNEL_MANIFEST_READ]:
     "Read a page of the frozen channel target manifest and its actual statuses. A completed target is not necessarily a successful publication: inspect outcome_status and fixture. Deferred is a normal result.",
   [CHANNEL_TARGET_EXECUTE]:
@@ -1029,6 +1029,7 @@ export async function main(input) {
   );
   const modelId = turn.model ?? DEFAULT_MODEL_ID;
   const toolFailures = [];
+  const measurementPlans = new Map();
   const provider = createHostProvider(host, modelId, toolFailures);
   const toolNames =
     turn.attachments.length > 0
@@ -1070,7 +1071,7 @@ export async function main(input) {
     "For measurement focus, read project_current and save the full measurement_targets list through project_revise, preserving unmodified entries. Targets are independent of enterprise brand_name/product_name; keep exact names, kinds and only user-supplied aliases without semantic merging. An empty list clears focus. Keep target names and aliases separate from natural-discovery questions; a user-requested named-product description is a distinct question. " +
     "For knowledge editing, identify one unambiguous source, read its text and current revision, and save through knowledge_text_revise with an explicit base_version_id. A text_basis of extracted is a draft from original evidence, not exact original bytes. On conflict read the latest version and preserve the user's requested changes; never silently overwrite. Link the returned version and release only after a successful receipt. " +
     "When the user asks for candidate questions from a seed topic, propose plausible questions across exploration, comparison and choosing intents, then persist them with question_create. Treat the seed topic, market and language as user data; use user-specified market/language or current scoped project settings, otherwise state reasonable defaults. Give each question an appropriate intent, empty product_refs unless actual scoped references exist, source kind generated, and a nonzero weight. Describe these as suggested questions. A request for suggestions alone ends with the saved candidates; an explicit request to measure continues through the measurement tools. Link the question set from its successful tool receipt. Rust assigns frozen evaluation purposes; optimization uses only the questions available to it. " +
-    "For a request to check a product or local business, use its exact user-supplied identity as measurement focus. If the category or location needed for a useful question is missing, ask one concise clarification. For natural discovery, formulate a relevant buying or visiting question without naming the focus; distinguish this from a separate named-product description question. Start with one relevant question on one available account unless the user specifies a broader scope, and show the actual submitted question. Use the existing measurement tools and return the accepted plan's resource link, then explain progress from its stored state. " +
+    "For a request to check a product or local business, use its exact user-supplied identity as measurement focus. If the category or location needed for a useful question is missing, ask one concise clarification combining only the necessary missing details. Once those details are available, call project_current, then project_revise to save the complete measurement_targets list while preserving existing unrelated targets, exact names, kinds and only explicit aliases; only after that successful save discover an available account and create the measurement. If saving the focus fails, do not submit a measurement. Do not require enterprise setup. For natural discovery, formulate a relevant buying or visiting question without naming the focus; distinguish this from a separate named-product description question. Start with one relevant question on one available account unless the user specifies a broader scope, and show the actual submitted question. Honor explicit multi-question or multi-platform requests and finish their requested tool work; one accepted plan does not cancel the rest of the request. Accepted plans appear as result cards in this conversation. After acceptance, read each plan at most once in this turn. If a plan is pending, report its actual state and finish the current reply after any other requested work; the card updates progress and results without another model turn. Do not poll, claim a completed measurement, or promise a later automatic assistant message. " +
     "For an arbitrary measurement question, use channel_discover to find a scoped connected account, measurement_options for observed website models, measurement_plan_create to schedule directly without enterprise setup or a cycle, then measurement_plan_read for actual state. Read source_channel_recommendations for observed publishing opportunities, then use project_current and project_revise to save a full target scope without silently changing all_eligible to explicit. Never invent a protocol or model ID; never expose frozen evaluation text or answers to optimization. " +
     "When the user supplies a measurement plan reference, read that exact plan with measurement_plan_read. Give a concise business answer: lead with whether the focus was recommended and any explicit rank, summarize the AI's descriptions, reasons and other recommended objects, then offer one or two specific content or channel suggestions. Separate recorded findings from suggestions, and put the measured question, platform and date in one compact context line. Explain original execution fields when the user asks for those details; keep conclusions scoped to the recorded sample. Use explicit ranks only; report unavailable samples separately. Ground content ideas in the permitted answer and its cited pages. Project-wide source recommendations describe project history, so label that scope separately from the selected plan. Distinguish a cited website from a connected publishing channel and describe expected benefits as hypotheses for a later measurement. Reading and discussing an existing plan uses its saved results; a fresh measurement or publication requires a request for that action. " +
     "For an arbitrary-topic article, guide or FAQ, use content_create with the user's topic, exact selected ready source versions and document requirements. Use user-specified language or scoped settings, otherwise state a reasonable default; market and audience may be null. A brand, setup form, automatic operation startup and cycle are not required. Never invent a brand or cycle, or attach all discovered sources when the user selected specific ones. Preserve the request_id and complete payload on retry. Read content_execution_read for persisted status, then page content_items_read for actual item_id references before content_document_read reads asset versions. Never guess item IDs from document keys. An acceptance or chat answer is not a completed content asset. On-demand completion does not distribute; use distribution tools only when separately requested. " +
@@ -1088,7 +1089,12 @@ export async function main(input) {
     definition,
     provider,
     modelId,
-    tools: createHostTools(host, toolFailures, turn.attachments),
+    tools: createHostTools(
+      host,
+      toolFailures,
+      turn.attachments,
+      measurementPlans,
+    ),
   });
   const runner = createAgentToolLoopRunner(context);
 
@@ -1150,6 +1156,7 @@ export async function main(input) {
     run_id: turn.runId,
     turn_id: turn.turnId,
     history_omitted_turns: turn.historyOmittedTurns,
+    measurement_plans: [...measurementPlans.values()],
   };
   await host.emit("loop.completed", JSON.stringify(completion));
   return completion;
@@ -2058,7 +2065,7 @@ function messageCursor(message) {
   };
 }
 
-function createHostTools(host, failures, attachments) {
+function createHostTools(host, failures, attachments, measurementPlans) {
   const importAttachments = async (parameters) => {
     try {
       if (!isRecord(parameters) || !Array.isArray(parameters.items)) {
@@ -2124,10 +2131,26 @@ function createHostTools(host, failures, attachments) {
     MEASUREMENT_OPTIONS,
     "measurementOptions",
   );
-  const measurementPlanCreate = reportTool(
-    MEASUREMENT_PLAN_CREATE,
-    "measurementPlanCreate",
-  );
+  const measurementPlanCreate = async (parameters) => {
+    try {
+      if (!isRecord(parameters)) {
+        throw new TypeError(`${MEASUREMENT_PLAN_CREATE} requires an object.`);
+      }
+      const result = await host.measurementPlanCreate(parameters);
+      // Rust validates the receipt. Only this successful host operation can
+      // attach a plan to the turn; model prose and read results cannot.
+      if (result.state === "accepted") {
+        measurementPlans.set(result.plan_id, {
+          plan_id: result.plan_id,
+          target_id: result.target_id,
+        });
+      }
+      return { result };
+    } catch (error) {
+      failures.push(error);
+      throw error;
+    }
+  };
   const measurementPlanRead = reportTool(
     MEASUREMENT_PLAN_READ,
     "measurementPlanRead",

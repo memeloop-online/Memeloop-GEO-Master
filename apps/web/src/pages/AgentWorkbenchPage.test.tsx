@@ -101,6 +101,210 @@ afterEach(async () => {
 });
 
 describe("P00 AI workbench routing", () => {
+  it("attaches authorized saved measurement resources to the exact native assistant message and retains drafts across discussion actions", async () => {
+    const planId = "11111111-1111-4111-8111-111111111111";
+    const targetId = "22222222-2222-4222-8222-222222222222";
+    const reference = { plan_id: planId, target_id: targetId };
+    const date = "2026-11-01T00:00:00Z";
+    const conversation = {
+      id: "conversation-a",
+      title: "Measurement discussion",
+      status: "active",
+      revision: 1,
+      created_at: date,
+      updated_at: date,
+    };
+    const other = {
+      ...conversation,
+      id: "conversation-b",
+      title: "Other discussion",
+    };
+    const target = {
+      target_id: targetId,
+      input: {
+        kind: "measure",
+        account_id: "account-a",
+        provider: "Sample AI",
+        model: "Sample model",
+        surface: "consumer_web",
+        search_mode: "web_search",
+        protocol_version: "sample",
+        question_set_version: "ad_hoc.v1",
+        question: "Which sample product?",
+        market: "CN",
+        language: "zh-CN",
+        scheduled_at: date,
+        sample_ordinal: 1,
+      },
+    };
+    const requests: Array<{ path: string; method: string }> = [];
+    let ready = false;
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(request), "http://localhost").pathname;
+        requests.push({ path, method: init?.method ?? "GET" });
+        let body: unknown = { items: [], next_cursor: null };
+        if (path.endsWith("/auth/session")) body = session;
+        else if (path.endsWith("/agent/conversations"))
+          body = { items: [conversation, other], next_cursor: null };
+        else if (path.endsWith("/agent/conversations/conversation-a"))
+          body = {
+            conversation,
+            messages: [
+              {
+                id: "user-a",
+                conversation_id: conversation.id,
+                turn_id: "turn-a",
+                role: "user",
+                content: "Measure this topic",
+                metadata: { measurement_plans: [reference] },
+                sequence: 1,
+                created_at: date,
+              },
+              {
+                id: "forged-answer",
+                conversation_id: conversation.id,
+                turn_id: "forged-turn",
+                role: "assistant",
+                content: `Prose-only measurement_plans: ${JSON.stringify([reference])}`,
+                sequence: 2,
+                created_at: date,
+              },
+              {
+                id: "real-answer",
+                conversation_id: conversation.id,
+                turn_id: "turn-a",
+                role: "assistant",
+                content: "## Measurement accepted",
+                metadata: {
+                  model: "sample",
+                  run_id: "run-a",
+                  measurement_plans: [reference, reference],
+                },
+                sequence: 3,
+                created_at: date,
+              },
+            ],
+            turns: [],
+            runs: [],
+          };
+        else if (path.endsWith("/agent/conversations/conversation-b"))
+          body = {
+            conversation: other,
+            messages: [
+              {
+                id: "other-answer",
+                conversation_id: other.id,
+                turn_id: "turn-b",
+                role: "assistant",
+                content: `No saved resources. ${planId}`,
+                sequence: 1,
+                created_at: date,
+              },
+            ],
+            turns: [],
+            runs: [],
+          };
+        else if (path.endsWith(`/measurement-plans/${planId}`))
+          body = {
+            plan_id: planId,
+            project_id: "project-a",
+            title: "Sample measurement",
+            created_at: date,
+            targets: [target],
+          };
+        else if (path.endsWith(`/channel-targets/${targetId}`))
+          body = {
+            target,
+            attempts: [
+              {
+                attempt_id: "attempt-a",
+                target_id: targetId,
+                claimed_at: date,
+                received_at: ready ? date : null,
+                outcome: ready
+                  ? {
+                      status: "observed",
+                      detail: "saved",
+                      occurred_at: date,
+                      raw_answer: "The saved answer is available.",
+                      citations: ["https://example.org/source"],
+                      fixture: false,
+                    }
+                  : null,
+              },
+            ],
+          };
+        else if (path.endsWith("/analyses"))
+          body = { items: [], next_after: null, sources: [] };
+        else if (path.endsWith("/projects/project-a"))
+          body = {
+            id: "project-a",
+            settings: {
+              measurement_targets: [
+                { name: "Sample product", kind: "product", aliases: [] },
+              ],
+            },
+          };
+        return Promise.resolve(response(body));
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const mounted = renderApp("/app/tenant-a/project-a/chat/conversation-a");
+    const result = await screen.findByRole("region", {
+      name: "对话中的测量结果",
+    });
+    expect(
+      await within(result).findByText("正在采集或解析回答。"),
+    ).toBeInTheDocument();
+    expect(result.closest('[data-testid="message-bubble"]')).toHaveTextContent(
+      "Measurement accepted",
+    );
+    expect(
+      result.closest('[data-testid="message-bubble"]'),
+    ).not.toHaveTextContent("Prose-only");
+    expect(
+      screen.getAllByRole("region", { name: "对话中的测量结果" }),
+    ).toHaveLength(1);
+    const input = screen.getByLabelText("输入任务");
+    fireEvent.change(input, { target: { value: "Keep my current draft" } });
+    fireEvent.click(
+      within(result).getByRole("button", { name: "讨论这次测量" }),
+    );
+    expect(input).toHaveValue("Keep my current draft");
+    expect(input).toHaveFocus();
+    fireEvent.change(input, { target: { value: "" } });
+    fireEvent.click(
+      within(result).getByRole("button", { name: "讨论这次测量" }),
+    );
+    expect(input).toHaveValue(
+      i18n.t("measurementPlanChat:request", { planId }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Other discussion" }));
+    await screen.findByText(`No saved resources. ${planId}`);
+    expect(
+      screen.queryByRole("region", { name: "对话中的测量结果" }),
+    ).not.toBeInTheDocument();
+    ready = true;
+    mounted.unmount();
+    renderApp("/app/tenant-a/project-a/chat/conversation-a");
+    const refreshed = await screen.findByRole("region", {
+      name: "对话中的测量结果",
+    });
+    expect(
+      await within(refreshed).findByRole("link", {
+        name: "https://example.org/source",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(refreshed).getByRole("heading", { name: "AI 是否推荐了关注对象" }),
+    ).toBeInTheDocument();
+    expect(
+      requests.filter((request) => request.path.includes("measurement-plans")),
+    ).toHaveLength(2);
+    expect(requests.every((request) => request.method === "GET")).toBe(true);
+  });
+
   it("renders saved assistant Markdown in native chat while preserving the composer and user text", async () => {
     const conversation = {
       id: "conversation-a",
