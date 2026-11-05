@@ -14,6 +14,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
@@ -100,6 +101,112 @@ afterEach(async () => {
 });
 
 describe("P00 AI workbench routing", () => {
+  it("renders saved assistant Markdown in native chat while preserving the composer and user text", async () => {
+    const conversation = {
+      id: "conversation-a",
+      title: "Saved discussion",
+      status: "active",
+      revision: 1,
+      created_at: "2026-09-19T00:00:00Z",
+      updated_at: "2026-09-19T00:00:00Z",
+    };
+    const draft = "## Keep my [draft](https://example.org/draft)";
+    const fetchMock = vi.fn(
+      (request: RequestInfo | URL, _init?: RequestInit) => {
+        const path = new URL(String(request), "http://localhost").pathname;
+        if (path.endsWith("/auth/session"))
+          return Promise.resolve(response(session));
+        if (path.endsWith("/agent/conversations/conversation-a")) {
+          return Promise.resolve(
+            response({
+              conversation,
+              messages: [
+                {
+                  id: "question-a",
+                  conversation_id: conversation.id,
+                  turn_id: "turn-a",
+                  role: "user",
+                  content: draft,
+                  sequence: 1,
+                  created_at: conversation.created_at,
+                },
+                {
+                  id: "answer-a",
+                  conversation_id: conversation.id,
+                  turn_id: "turn-a",
+                  role: "assistant",
+                  content:
+                    "## Recommendation summary\n\n| Option | Evidence |\n| --- | --- |\n| First | [Source one](https://example.org/one) |\n| Second | [Source two](https://example.org/two) |\n| Third | [Source three](https://example.org/three) |\n\n[View project](/app/tenant-a/project-a) · [View measurements](/app/tenant-a/project-a/measurement) · [unsafe](javascript:alert%281%29)",
+                  sequence: 2,
+                  metadata: {
+                    model: "test-model",
+                    run_id: "run-a",
+                    turn_id: "turn-a",
+                    conversation_id: conversation.id,
+                    history_omitted_turns: 0,
+                  },
+                  created_at: conversation.created_at,
+                },
+              ],
+              turns: [],
+              runs: [],
+            }),
+          );
+        }
+        if (path.endsWith("/agent/conversations")) {
+          return Promise.resolve(
+            response({ items: [conversation], next_cursor: null }),
+          );
+        }
+        return Promise.resolve(response({ items: [], next_cursor: null }));
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderApp("/app/tenant-a/project-a/chat/conversation-a");
+    const chat = await screen.findByTestId("memeloop-agent-chat");
+    expect(
+      await within(chat).findByRole("heading", {
+        name: "Recommendation summary",
+        level: 2,
+      }),
+    ).toBeInTheDocument();
+    const table = within(chat).getByRole("table");
+    expect(within(table).getAllByRole("row")).toHaveLength(4);
+    const links = within(table).getAllByRole("link");
+    expect(links.map((link) => link.getAttribute("href"))).toEqual([
+      "https://example.org/one",
+      "https://example.org/two",
+      "https://example.org/three",
+    ]);
+    for (const link of links) {
+      expect(link).toHaveAttribute("target", "_blank");
+      expect(link).toHaveAttribute("rel", "noopener noreferrer");
+    }
+    expect(
+      within(chat).getByRole("link", { name: "View project" }),
+    ).toHaveAttribute("href", "/app/tenant-a/project-a");
+    const measurementLink = within(chat).getByRole("link", {
+      name: "View measurements",
+    });
+    expect(measurementLink).toHaveAttribute(
+      "href",
+      "/app/tenant-a/project-a/measurement",
+    );
+    expect(measurementLink).not.toHaveAttribute("target");
+    expect(within(chat).getByText("unsafe")).not.toHaveAttribute("href");
+    expect(within(chat).getByText(draft)).toBeInTheDocument();
+    const input = screen.getByLabelText("输入任务");
+    await userEvent.setup().type(input, "## Editable draft");
+    expect(input).toHaveValue("## Editable draft");
+    expect(
+      screen.getByRole("button", { name: "添加文件" }),
+    ).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(([, init]) => init?.method === "POST"),
+    ).toHaveLength(0);
+  });
+
   it.each(["zh-CN", "en"])(
     "offers editable measurement examples without overwriting or sending drafts (%s)",
     async (language) => {
